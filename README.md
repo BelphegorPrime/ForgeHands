@@ -196,11 +196,12 @@ Set `OPENHANDS_API_URL` (for example `http://openhands:8000`) and `OPENHANDS_API
 | `MAX_CONCURRENT_PER_TIER` / `MAX_CONCURRENT` | Runs at once per `tier` (default 2) and in total (default 4). The rest wait in the queue. |
 | `MAX_RUNS_PER_HOUR` | Hard cap on started runs per hour (default 30), a guard against runaway fan-out. |
 | `MAX_RUN_MINUTES` | After this long a run stops holding its slot (default 120). The conversation itself is not touched. |
+| `AGENT_SECRETS` | Comma separated names of environment variables (for example `FORGEJO_TOKEN,FORGEJO_URL`) whose values are handed to every started conversation as secrets. OpenHands exposes its saved secrets only to callers that pass them in the start request, so without this the agent has no Forgejo access. The values stay in ForgeHands' environment and are never written to the ledger. |
 | `WORKSPACE_DIR` | Working directory of the conversations (default `/projects`). The agent clones the repository there. |
 | `JOBS_FILE` | Issue ledger next to `DATA_FILE` by default. |
 
 - The ledger keeps `repo#issue:label` to conversation id. The same label on an issue that still has a queued or running run does not start a second one; a re-label after the run ended does.
-- The issue text goes into the first message between markers and is marked as untrusted. ForgeHands still holds no Forgejo or LLM credentials; the agents use their own secrets.
+- The issue text goes into the first message between markers and is marked as untrusted. In direct mode ForgeHands holds the secrets named in `AGENT_SECRETS` (and the backend key) and passes them to the agents; in webhook mode it still holds no Forgejo or LLM credentials.
 - `OPENHANDS_API_KEY` is a backend key. Keep it out of the repository; give it to the container through its secret store.
 
 ## License

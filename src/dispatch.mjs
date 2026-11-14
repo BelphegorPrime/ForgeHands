@@ -86,6 +86,11 @@ export class Dispatcher {
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
+    // Built per start from the environment; never stored in the ledger.
+    const secrets = Object.entries(this.config.agentSecrets || {});
+    if (secrets.length) {
+      body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
+    }
     try {
       const response = await this.api('POST', '/api/conversations', body);
       if (!response.ok) throw new Error('HTTP ' + response.status);

@@ -88,12 +88,21 @@ export function loadConfig(env = process.env) {
 
   // Direct mode: start an OpenHands conversation with the agent profile that belongs to the label.
   if (!env.OPENHANDS_API_KEY) throw new Error('OPENHANDS_API_KEY is required with OPENHANDS_API_URL');
+  // AGENT_SECRETS: names of environment variables whose values every started conversation receives as secrets
+  // (OpenHands exposes saved secrets only to callers that pass them in the start request).
+  const agentSecrets = {};
+  for (const name of (env.AGENT_SECRETS || '').split(',').map((value) => value.trim()).filter(Boolean)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(name)) throw new Error('Invalid AGENT_SECRETS name: ' + name);
+    if (!env[name]) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
+    agentSecrets[name] = env[name];
+  }
   return {
     ...common,
     mode: 'direct',
     apiUrl: httpUrl(env.OPENHANDS_API_URL, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
     routes: parseRoutes(env.LABEL_ROUTES || ''),
+    agentSecrets,
     workspaceDir: env.WORKSPACE_DIR || '/projects',
     maxConcurrent: positiveInt(env.MAX_CONCURRENT, 4, 'MAX_CONCURRENT', 100),
     maxConcurrentPerTier: positiveInt(env.MAX_CONCURRENT_PER_TIER, 2, 'MAX_CONCURRENT_PER_TIER', 100),
