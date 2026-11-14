@@ -1,10 +1,12 @@
 {
   "name": "forgehands",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Forgejo to OpenHands Automation webhook bridge",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node src/index.mjs",
     "test": "node --test --test-concurrency=1",

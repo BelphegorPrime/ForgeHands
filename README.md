@@ -195,6 +195,7 @@ Set `OPENHANDS_API_URL` (for example `http://openhands:8000`) and `OPENHANDS_API
 | `ALLOWED_SENDERS` | Optional, comma separated Forgejo logins that may trigger runs. |
 | `MAX_CONCURRENT_PER_TIER` / `MAX_CONCURRENT` | Runs at once per `tier` (default 2) and in total (default 4). The rest wait in the queue. |
 | `MAX_RUNS_PER_HOUR` | Hard cap on started runs per hour (default 30), a guard against runaway fan-out. |
+| `TIER_WEEKLY_BUDGETS` | JSON, tier to USD per 7 days, for example `{"strong": 5}`. ForgeHands reads the accumulated LLM cost of every run from OpenHands (running runs with their latest cost); once the runs of a tier started within 7 days add up to the budget, further runs of that tier wait in the queue. Tiers without an entry are not limited. `max_budget` of a route stays the cap of a single run. |
 | `MAX_RUN_MINUTES` | After this long a run stops holding its slot (default 120). The conversation itself is not touched. |
 | `AGENT_SECRETS` | Comma separated names of environment variables (for example `FORGEJO_TOKEN,FORGEJO_URL`) whose values are handed to every started conversation as secrets. OpenHands exposes its saved secrets only to callers that pass them in the start request, so without this the agent has no Forgejo access. The values stay in ForgeHands' environment and are never written to the ledger. |
 | `WORKSPACE_DIR` | Working directory of the conversations (default `/projects`). The agent clones the repository there. |

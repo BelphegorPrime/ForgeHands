@@ -96,9 +96,21 @@ export function loadConfig(env = process.env) {
     if (!env[name]) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
     agentSecrets[name] = env[name];
   }
+  // TIER_WEEKLY_BUDGETS: {"strong": 5} caps the LLM cost (USD) that runs of a tier may add up to within 7 days.
+  const tierBudgets = new Map();
+  if (env.TIER_WEEKLY_BUDGETS) {
+    let parsed;
+    try { parsed = JSON.parse(env.TIER_WEEKLY_BUDGETS); } catch { throw new Error('TIER_WEEKLY_BUDGETS must be valid JSON'); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('TIER_WEEKLY_BUDGETS must be a JSON object');
+    for (const [tier, amount] of Object.entries(parsed)) {
+      if (!(Number(amount) > 0)) throw new Error('TIER_WEEKLY_BUDGETS: ' + tier + ' must be a number > 0');
+      tierBudgets.set(tier, Number(amount));
+    }
+  }
   return {
     ...common,
     mode: 'direct',
+    tierBudgets,
     apiUrl: httpUrl(env.OPENHANDS_API_URL, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
     routes: parseRoutes(env.LABEL_ROUTES || ''),
