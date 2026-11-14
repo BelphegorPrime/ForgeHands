@@ -22,7 +22,8 @@ async function readBody(req, limit) {
   return Buffer.concat(chunks);
 }
 
-export function createApp(config, store, send = fetch, logger = console) {
+export function createApp(config, store, send = fetch, logger = console, dispatcher = null) {
+  if (config.mode === 'direct' && !dispatcher) throw new Error('direct mode needs a dispatcher');
   return createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       return json(res, 200, { status: 'ok' });
@@ -43,14 +44,29 @@ export function createApp(config, store, send = fetch, logger = console) {
     try { body = JSON.parse(raw.toString('utf8')); }
     catch { return json(res, 400, { error: 'invalid_json' }); }
     const event = req.headers['x-forgejo-event'];
-    const normalized = normalizeEvent(event, body, config.allowedRepos);
+    const normalized = normalizeEvent(event, body, config.allowedRepos, config.routes.keys());
     if (!normalized) return json(res, 202, { status: 'ignored' });
+    if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
+      return json(res, 202, { status: 'ignored' });
+    }
     const id = deliveryId(req.headers, raw, event);
     const key = normalized.repository.full_name.toLowerCase() + ':' + id;
     const state = store.acquire(key);
     if (state === 'completed') return json(res, 200, { status: 'duplicate', delivery_id: id });
     if (state === 'inflight') return json(res, 503, { error: 'delivery_in_progress' });
     normalized.delivery_id = id;
+    if (config.mode === 'direct') {
+      try {
+        const result = await dispatcher.enqueue(normalized);
+        await store.mark(key);
+        return json(res, 202, { status: result.status, delivery_id: id });
+      } catch (error) {
+        logger.error('Enqueue failed:', error.message);
+        return json(res, 500, { error: 'enqueue_failed' });
+      } finally {
+        store.release(key);
+      }
+    }
     const outgoing = Buffer.from(JSON.stringify(normalized));
     try {
       const response = await send(config.endpoint, {
