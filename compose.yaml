@@ -1,6 +1,6 @@
 services:
   forgehands:
-    build: .
+    image: ${FORGEHANDS_IMAGE:-ghcr.io/belphegorprime/forgehands:latest}
     restart: unless-stopped
     init: true
     env_file: .env

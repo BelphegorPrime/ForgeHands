@@ -17,16 +17,59 @@ ForgeHands connects **Forgejo issues** to **OpenHands Automation custom webhooks
 
 No Git credentials or LLM API keys are required by ForgeHands. OpenHands handles coding and PR creation via its own automation.
 
-## Quick start
+## Container images (GHCR)
 
-Prerequisites: Node.js 22+ or Docker.
+GitHub Actions builds and publishes multi-platform OCI images (`linux/amd64`, `linux/arm64`) to:
+
+```text
+ghcr.io/belphegorprime/forgehands
+```
+
+The workflow is in [`.github/workflows/ghcr.yml`](.github/workflows/ghcr.yml).
+
+| Source | Tags | Publish? |
+| --- | --- | --- |
+| Pull request | Test + Docker build | No |
+| Temporary feature branch `feat/forgejo-webhook-adapter` | `edge`, `sha-<full-commit-sha>` | Yes, for MVP testing only |
+| `master` | `latest`, `sha-<full-commit-sha>` | Yes |
+| Git tag `v1.2.3` | `v1.2.3`, `sha-<full-commit-sha>` | Yes |
+
+Publishing uses the scoped `GITHUB_TOKEN` with `packages: write`. No personal access token or registry password is needed in GitHub repository secrets. The initial package may be private even when the repository is public: the owner can enable public visibility in GitHub → Packages → ForgeHands → Package settings.
+
+The feature-branch `edge` publish rule is temporary; remove it after the MVP has been merged and use `latest` for normal deployments.
+
+## Quick start (Docker Compose)
+
+Prerequisites: Docker with the Compose plugin.
 
 ```sh
 cp .env.example .env
 # Update both independent secrets, allowlist and OpenHands webhook URL.
-npm start
-# Or: docker compose up -d --build
+
+# While the MVP is on the feature branch:
+FORGEHANDS_IMAGE=ghcr.io/belphegorprime/forgehands:edge docker compose up -d
+
+# After merging to master:
+docker compose up -d
 ```
+
+`compose.yaml` pulls a published GHCR image by default; it does not build from source. To run without Docker, use Node.js 22+ and `npm start`. To build a local image for development, run `docker build -t forgehands:local .`, then `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`.
+
+A public GHCR image can be pulled anonymously. For a private package, authenticate the Docker client with a token that has `read:packages` privileges before pulling:
+
+```sh
+echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+```
+
+Do not put registry or webhook secrets in committed files.
+
+```sh
+docker compose ps
+docker compose logs --tail=100 forgehands
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+The Compose example binds the published port to `127.0.0.1`. To accept Forgejo webhooks from another host, use a secured reverse proxy and explicit network policy, not an unprotected public port.
 
 ## Forgejo setup
 
