@@ -44,7 +44,7 @@ function fakeApi() {
     }
     const id = path.split('/').pop();
     return { ok: true, status: 200, json: async () => ({ execution_status: states[id] || 'running',
-      metrics: { usage_to_metrics: { default: { accumulated_cost: costs[id] || 0 } } } }) };
+      metrics: null, stats: { usage_to_metrics: { default: { accumulated_cost: costs[id] || 0 } } } }) };
   };
 }
 async function build(extra) {

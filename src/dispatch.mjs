@@ -7,7 +7,8 @@ const WEEK_MS = 7 * 24 * 3600 * 1000;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data) {
-  const usage = data?.metrics?.usage_to_metrics;
+  // OpenHands reports it under `stats`; `metrics` is null in the conversation response.
+  const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
   if (!usage || typeof usage !== 'object') return null;
   return Object.values(usage).reduce((sum, entry) => sum + (Number(entry?.accumulated_cost) || 0), 0);
 }
