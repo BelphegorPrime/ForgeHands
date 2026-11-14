@@ -30,6 +30,9 @@ export class Dispatcher {
     if (!route) throw new Error('no route for label ' + event.label);
     const key = event.repository.full_name.toLowerCase() + '#' + event.issue.number + ':' + event.label;
     if (this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
+    // An issue_label event does not say which label was added: any later label change would look like a new trigger.
+    // So it never starts a run for a key that already ran (a re-run is a deliberate new label via `issues` events).
+    if (event.label_event && this.jobs.list().some((job) => job.key === key)) return { status: 'duplicate_job' };
     this.jobs.add({ key, label: event.label, event, status: 'queued', created: this.now() });
     await this.jobs.persist(this.now());
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));

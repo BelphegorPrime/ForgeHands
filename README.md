@@ -201,6 +201,7 @@ Set `OPENHANDS_API_URL` (for example `http://openhands:8000`) and `OPENHANDS_API
 | `WORKSPACE_DIR` | Working directory of the conversations (default `/projects`). The agent clones the repository there. |
 | `JOBS_FILE` | Issue ledger next to `DATA_FILE` by default. |
 
+- In direct mode a label added to an existing issue arrives from Forgejo as an `issue_label` event, which lists the current labels but not the added one. ForgeHands starts a run when a trigger label is present and that issue/label has not run before; a repeat (for example an unrelated label added later) is ignored. To run an issue again, use another trigger label (`ai:escalate`) or open a new issue.
 - The ledger keeps `repo#issue:label` to conversation id. The same label on an issue that still has a queued or running run does not start a second one; a re-label after the run ended does.
 - The issue text goes into the first message between markers and is marked as untrusted. In direct mode ForgeHands holds the secrets named in `AGENT_SECRETS` (and the backend key) and passes them to the agents; in webhook mode it still holds no Forgejo or LLM credentials.
 - `OPENHANDS_API_KEY` is a backend key. Keep it out of the repository; give it to the container through its secret store.
