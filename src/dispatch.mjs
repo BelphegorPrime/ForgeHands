@@ -25,16 +25,61 @@ export class Dispatcher {
     this.timer = null;
   }
 
+  issueKey(event) {
+    return event.repository.full_name.toLowerCase() + '#' + event.issue.number;
+  }
+
+  static labelsOf(payload, allowedRepos) {
+    const name = payload?.repository?.full_name;
+    const number = payload?.issue?.number;
+    if (typeof name !== 'string' || !allowedRepos.has(name.toLowerCase()) || !Number.isSafeInteger(number)) return null;
+    if (!Array.isArray(payload.issue.labels)) return null;
+    return {
+      key: name.toLowerCase() + '#' + number,
+      labels: payload.issue.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((value) => typeof value === 'string')
+    };
+  }
+
+  // The labels last seen on the issue of this payload (null when unknown). Read only.
+  labelsBefore(payload, allowedRepos) {
+    const seen = Dispatcher.labelsOf(payload, allowedRepos);
+    return seen ? this.jobs.getLabels(seen.key) : null;
+  }
+
+  // Remember the labels of this payload. Called once an event has been handled, never when handling failed, so that a
+  // retried delivery still sees what changed.
+  recordLabels(payload, allowedRepos) {
+    const seen = Dispatcher.labelsOf(payload, allowedRepos);
+    if (seen && this.jobs.setLabels(seen.key, seen.labels, this.now())) {
+      this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
+    }
+  }
+
+  // Which trigger label does this event start a run for? A label change on an existing issue does not say which label
+  // was added, so it is the trigger labels that are new compared with the last labels seen on the issue. Without that
+  // knowledge it is the first trigger label that never ran.
+  pickLabel(event) {
+    if (!event.label_event) return event.label;
+    const base = this.issueKey(event);
+    const present = [...this.config.routes.keys()].filter((label) => event.issue.labels.includes(label));
+    const previous = event.previous_labels;
+    if (Array.isArray(previous)) return present.find((label) => !previous.includes(label));
+    return present.find((label) => !this.jobs.list().some((job) => job.key === base + ':' + label));
+  }
+
   async enqueue(event) {
-    const route = this.config.routes.get(event.label);
-    if (!route) throw new Error('no route for label ' + event.label);
-    const key = event.repository.full_name.toLowerCase() + '#' + event.issue.number + ':' + event.label;
+    const label = this.pickLabel(event);
+    if (!label) return { status: 'duplicate_job' };
+    if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
+    const key = this.issueKey(event) + ':' + label;
     if (this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
-    // An issue_label event does not say which label was added: any later label change would look like a new trigger.
-    // So it never starts a run for a key that already ran (a re-run is a deliberate new label via `issues` events).
-    if (event.label_event && this.jobs.list().some((job) => job.key === key)) return { status: 'duplicate_job' };
-    this.jobs.add({ key, label: event.label, event, status: 'queued', created: this.now() });
-    await this.jobs.persist(this.now());
+    const job = this.jobs.add({ key, label, event: { ...event, label }, status: 'queued', created: this.now() });
+    try {
+      await this.jobs.persist(this.now());
+    } catch (error) {
+      this.jobs.remove(job.id); // not durable: the retried delivery must be able to enqueue it again
+      throw error;
+    }
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
   }

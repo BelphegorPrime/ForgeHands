@@ -13,6 +13,7 @@ import { buildPrompt } from '../src/prompt.mjs';
 
 const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
+const ESCALATE = '33333333-3333-4333-8333-333333333333';
 const repo = 'owner/hello';
 const quiet = { error() {} };
 let dir; let clock; let calls; let states; let failStarts; let costs;
@@ -24,7 +25,8 @@ const env = (extra = {}) => ({
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify({
     'ai:plan': { profile: PLANNER, tier: 'strong', max_iterations: 80, max_budget: 1.5 },
-    'ai:ready': { profile: WORKER, tier: 'free' }
+    'ai:ready': { profile: WORKER, tier: 'free' },
+    'ai:escalate': { profile: ESCALATE, tier: 'strong' }
   }),
   MAX_CONCURRENT_PER_TIER: '2',
   AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
@@ -273,4 +275,89 @@ test('label added to an existing issue (real Forgejo event: issues/label_updated
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+async function webhook(config, dispatcher) {
+  const store = new DeliveryStore(config.dataFile);
+  const server = createApp(config, store, undefined, quiet, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = 'http://127.0.0.1:' + server.address().port + '/webhooks/forgejo';
+  let n = 0;
+  const post = async (number, action, labels, delivery = 'w' + ++n) => {
+    const raw = JSON.stringify({ action, sender: { login: 'marcel' }, repository: { full_name: repo }, number,
+      issue: { number, labels: labels.map((name) => ({ name })) } });
+    const response = await fetch(url, { method: 'POST', body: raw, headers: {
+      'content-type': 'application/json', 'x-forgejo-event': 'issues', 'x-gitea-delivery': delivery,
+      'x-forgejo-signature': createHmac('sha256', config.forgejoSecret).update(raw).digest('hex') } });
+    return { code: response.status, status: (await response.json()).status };
+  };
+  return { post, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+const finishAll = async (dispatcher, jobs) => {
+  for (const job of jobs.list('running')) states[job.conversation_id] = 'finished';
+  await dispatcher.tick();
+};
+
+test('escalation: ai:escalate added next to ai:ready starts the escalation run', async () => {
+  const { config, dispatcher, jobs } = await build({ MAX_CONCURRENT_PER_TIER: '5' });
+  const hook = await webhook(config, dispatcher);
+  try {
+    assert.equal((await hook.post(10, 'opened', ['ai:ready'])).status, 'queued');
+    await dispatcher.tick(); await finishAll(dispatcher, jobs);
+    assert.equal((await hook.post(10, 'label_updated', ['ai:ready', 'ai:escalate'])).status, 'queued');
+    await dispatcher.tick();
+    assert.deepEqual(jobs.list().map((job) => job.label), ['ai:ready', 'ai:escalate']);
+    assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE);
+  } finally { await hook.close(); }
+});
+
+test('re-adding a trigger label after the run starts it again; unrelated labels do not', async () => {
+  const { config, dispatcher, jobs } = await build({ MAX_CONCURRENT_PER_TIER: '5' });
+  const hook = await webhook(config, dispatcher);
+  try {
+    assert.equal((await hook.post(11, 'label_updated', ['ai:plan'])).status, 'queued');
+    await dispatcher.tick(); await finishAll(dispatcher, jobs);
+    assert.equal((await hook.post(11, 'label_updated', ['ai:plan', 'docs'])).status, 'duplicate_job');
+    assert.equal((await hook.post(11, 'label_updated', ['docs'])).status, 'ignored');
+    assert.equal((await hook.post(11, 'label_updated', ['docs', 'ai:plan'])).status, 'queued');
+    await dispatcher.tick();
+    assert.equal(starts().length, 2);
+  } finally { await hook.close(); }
+});
+
+test('without known earlier labels the first trigger label that never ran wins', async () => {
+  const { config, dispatcher, jobs } = await build({ MAX_CONCURRENT_PER_TIER: '5' });
+  const hook = await webhook(config, dispatcher);
+  try {
+    assert.equal((await hook.post(12, 'label_updated', ['ai:ready', 'ai:escalate'])).status, 'queued');
+    assert.equal(jobs.list()[0].label, 'ai:ready');
+  } finally { await hook.close(); }
+});
+
+test('a failed delivery does not swallow the label change: the retry still starts the run', async () => {
+  const { config, dispatcher, jobs } = await build();
+  const hook = await webhook(config, dispatcher);
+  const original = jobs.persist.bind(jobs);
+  let failures = 1;
+  jobs.persist = async (...args) => { if (failures-- > 0) throw new Error('disk full'); return original(...args); };
+  try {
+    assert.equal((await hook.post(13, 'label_updated', ['ai:ready'], 'same')).code, 500);
+    assert.equal(jobs.getLabels('owner/hello#13'), null, 'labels not recorded after a failure');
+    assert.equal(jobs.list().length, 0, 'the half-created job was rolled back');
+    assert.equal((await hook.post(13, 'label_updated', ['ai:ready'], 'same')).status, 'queued');
+  } finally { await hook.close(); }
+});
+
+test('job store reads the v0.2.0 array format and keeps label state across a reload', async () => {
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(join(dir, 'jobs.json'), JSON.stringify([{ id: 'old', key: 'owner/hello#1:ai:ready', label: 'ai:ready', status: 'done', created: Date.now(), event: {} }]));
+  const first = new JobStore(join(dir, 'jobs.json'));
+  await first.load();
+  assert.equal(first.list().length, 1);
+  first.setLabels('owner/hello#1', ['ai:ready']);
+  await first.persist();
+  const second = new JobStore(join(dir, 'jobs.json'));
+  await second.load();
+  assert.deepEqual(second.getLabels('owner/hello#1'), ['ai:ready']);
+  assert.equal(second.list().length, 1);
 });

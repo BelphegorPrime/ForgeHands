@@ -44,9 +44,14 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     try { body = JSON.parse(raw.toString('utf8')); }
     catch { return json(res, 400, { error: 'invalid_json' }); }
     const event = req.headers['x-forgejo-event'];
+    const direct = config.mode === 'direct';
+    const previousLabels = direct ? dispatcher.labelsBefore(body, config.allowedRepos) : null;
+    const remember = () => { if (direct) dispatcher.recordLabels(body, config.allowedRepos); };
     const normalized = normalizeEvent(event, body, config.allowedRepos, config.routes.keys(), { labelEvents: config.mode === 'direct' });
-    if (!normalized) return json(res, 202, { status: 'ignored' });
+    if (!normalized) { remember(); return json(res, 202, { status: 'ignored' }); }
+    if (direct) normalized.previous_labels = previousLabels;
     if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
+      remember();
       return json(res, 202, { status: 'ignored' });
     }
     const id = deliveryId(req.headers, raw, event);
@@ -58,6 +63,7 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     if (config.mode === 'direct') {
       try {
         const result = await dispatcher.enqueue(normalized);
+        remember();
         await store.mark(key);
         return json(res, 202, { status: result.status, delivery_id: id });
       } catch (error) {
