@@ -15,7 +15,7 @@ const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
 const repo = 'owner/hello';
 const quiet = { error() {} };
-let dir; let clock; let calls; let states; let failStarts;
+let dir; let clock; let calls; let states; let failStarts; let costs;
 
 const env = (extra = {}) => ({
   FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
@@ -43,7 +43,8 @@ function fakeApi() {
       return { ok: true, status: 201, json: async () => ({ id: 'conv-' + calls.length }) };
     }
     const id = path.split('/').pop();
-    return { ok: true, status: 200, json: async () => ({ execution_status: states[id] || 'running' }) };
+    return { ok: true, status: 200, json: async () => ({ execution_status: states[id] || 'running',
+      metrics: { usage_to_metrics: { default: { accumulated_cost: costs[id] || 0 } } } }) };
   };
 }
 async function build(extra) {
@@ -61,7 +62,7 @@ const event = (label, number = 1, extra = {}) => ({
 });
 const starts = () => calls.filter((c) => c.method === 'POST');
 
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-direct-')); clock = 1_000_000; calls = []; states = {}; failStarts = false; });
+beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-direct-')); clock = 1_000_000; calls = []; states = {}; costs = {}; failStarts = false; });
 afterEach(() => rm(dir, { recursive: true, force: true }));
 
 test('routes each label to its own agent profile with caps', async () => {
@@ -207,4 +208,39 @@ test('config rejects broken routes and missing key', () => {
   assert.throws(() => loadConfig(env({ AGENT_SECRETS: 'bad-name' })), /Invalid AGENT_SECRETS/);
   assert.equal(loadConfig(env()).apiUrl, 'http://openhands:8000');
   assert.equal(loadConfig(env()).jobsFile, join(dir, 'jobs.json'));
+});
+
+test('weekly tier budget stops new starts until the spend leaves the 7-day window', async () => {
+  const { dispatcher, jobs } = await build({ TIER_WEEKLY_BUDGETS: '{"strong": 5}', MAX_CONCURRENT_PER_TIER: '5' });
+  await dispatcher.enqueue(event('ai:plan', 1));
+  await dispatcher.tick();
+  const id = jobs.list('running')[0].conversation_id;
+  costs[id] = 5.2; states[id] = 'finished';
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].cost, 5.2);
+  await dispatcher.enqueue(event('ai:plan', 2));
+  await dispatcher.enqueue(event('ai:ready', 3));
+  await dispatcher.tick();
+  assert.equal(starts().length, 2, 'free tier still starts, strong tier is held back');
+  assert.equal(jobs.list('queued').length, 1);
+  clock += 7 * 24 * 3600 * 1000 + 1;
+  await dispatcher.tick();
+  assert.equal(starts().length, 3);
+});
+
+test('running job cost counts toward the weekly budget', async () => {
+  const { dispatcher, jobs } = await build({ TIER_WEEKLY_BUDGETS: '{"strong": 5}', MAX_CONCURRENT_PER_TIER: '5' });
+  await dispatcher.enqueue(event('ai:plan', 1));
+  await dispatcher.tick();
+  costs[jobs.list('running')[0].conversation_id] = 5;
+  await dispatcher.tick();
+  await dispatcher.enqueue(event('ai:plan', 2));
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+});
+
+test('config validates TIER_WEEKLY_BUDGETS', () => {
+  assert.throws(() => loadConfig(env({ TIER_WEEKLY_BUDGETS: 'x' })), /valid JSON/);
+  assert.throws(() => loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 0}' })), /> 0/);
+  assert.equal(loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 5}' })).tierBudgets.get('strong'), 5);
 });

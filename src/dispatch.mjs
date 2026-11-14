@@ -3,6 +3,14 @@ import { buildPrompt } from './prompt.mjs';
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
+const WEEK_MS = 7 * 24 * 3600 * 1000;
+
+// Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
+export function conversationCost(data) {
+  const usage = data?.metrics?.usage_to_metrics;
+  if (!usage || typeof usage !== 'object') return null;
+  return Object.values(usage).reduce((sum, entry) => sum + (Number(entry?.accumulated_cost) || 0), 0);
+}
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
 export class Dispatcher {
@@ -73,7 +81,16 @@ export class Dispatcher {
     const tierLimit = route.maxConcurrent ?? this.config.maxConcurrentPerTier;
     if (running.filter((other) => this.config.routes.get(other.label)?.tier === route.tier).length >= tierLimit) return false;
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
-    return startedLastHour < this.config.maxRunsPerHour;
+    if (startedLastHour >= this.config.maxRunsPerHour) return false;
+    const budget = this.config.tierBudgets?.get(route.tier);
+    return budget === undefined || this.weeklySpend(route.tier, now) < budget;
+  }
+
+  // Cost of the runs of a tier started within the last 7 days (running ones count with their latest known cost).
+  weeklySpend(tier, now) {
+    return this.jobs.list()
+      .filter((job) => job.started && job.started > now - WEEK_MS && this.config.routes.get(job.label)?.tier === tier)
+      .reduce((sum, job) => sum + (job.cost || 0), 0);
   }
 
   async startJob(job, now) {
@@ -109,10 +126,16 @@ export class Dispatcher {
 
   async poll(job, now) {
     let state = null;
+    let costChanged = false;
     try {
       const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id));
       if (response.status === 404) state = 'deleted';
-      else if (response.ok) { const data = await response.json(); state = data.execution_status || data.status; }
+      else if (response.ok) {
+        const data = await response.json();
+        state = data.execution_status || data.status;
+        const cost = conversationCost(data);
+        if (cost !== null && cost !== job.cost) { job.cost = cost; costChanged = true; }
+      }
     } catch (error) {
       this.logger.error('polling ' + job.key + ' failed:', error.message);
     }
@@ -120,6 +143,7 @@ export class Dispatcher {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       return true;
     }
+    if (costChanged) return true;
     // Free the slot of a run that never ends; the conversation itself is left alone.
     if (job.started && job.started + this.config.maxRunMs < now) {
       Object.assign(job, { status: 'failed', result: 'timeout', finished: now });
