@@ -245,17 +245,17 @@ test('config validates TIER_WEEKLY_BUDGETS', () => {
   assert.equal(loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 5}' })).tierBudgets.get('strong'), 5);
 });
 
-test('label added to an existing issue (issue_label) starts one run and never a repeat', async () => {
+test('label added to an existing issue (real Forgejo event: issues/label_updated) starts one run and never a repeat', async () => {
   const { config, dispatcher, jobs } = await build();
   const store = new DeliveryStore(config.dataFile);
   const server = createApp(config, store, undefined, quiet, dispatcher);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const url = 'http://127.0.0.1:' + server.address().port + '/webhooks/forgejo';
-  const post = async (delivery, labels, action = 'label_updated') => {
-    const raw = JSON.stringify({ action, sender: { login: 'marcel' }, repository: { full_name: repo },
+  const post = async (delivery, labels, action = 'label_updated', kind = 'issues') => {
+    const raw = JSON.stringify({ action, sender: { login: 'marcel' }, repository: { full_name: repo }, number: 4, commit_id: '',
       issue: { number: 4, labels: labels.map((name) => ({ name })) } });
     const response = await fetch(url, { method: 'POST', body: raw, headers: {
-      'content-type': 'application/json', 'x-forgejo-event': 'issue_label', 'x-gitea-delivery': delivery,
+      'content-type': 'application/json', 'x-forgejo-event': kind, 'x-gitea-delivery': delivery,
       'x-forgejo-signature': createHmac('sha256', config.forgejoSecret).update(raw).digest('hex') } });
     return (await response.json()).status;
   };
@@ -269,6 +269,7 @@ test('label added to an existing issue (issue_label) starts one run and never a 
     assert.equal(jobs.list()[0].status, 'done');
     assert.equal(await post('l4', ['bug', 'ai:ready', 'docs']), 'duplicate_job', 'unrelated label change after the run');
     assert.equal(starts().length, 1);
+    assert.equal(await post('l5', ['ai:plan'], 'label_updated', 'issue_label'), 'queued', 'issue_label header works too');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

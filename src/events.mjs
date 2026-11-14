@@ -1,10 +1,12 @@
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
 // `labels` are the trigger labels in priority order; the first one that applies wins.
-// With `labelEvents`, Forgejo's `issue_label` event (a label added to an existing issue) is accepted too. It carries the
-// current labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
+// With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
+// action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
+// labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
 export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false } = {}) {
-  const isLabelEvent = labelEvents && event === 'issue_label';
-  if ((event !== 'issues' && !isLabelEvent) || !payload || typeof payload !== 'object') return null;
+  if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
+  const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
+  if (event === 'issue_label' && !isLabelEvent) return null;
   const fullName = payload.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   const issue = payload.issue;
