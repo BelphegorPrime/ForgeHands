@@ -27,6 +27,9 @@ const env = (extra = {}) => ({
     'ai:ready': { profile: WORKER, tier: 'free' }
   }),
   MAX_CONCURRENT_PER_TIER: '2',
+  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
+  FORGEJO_TOKEN: 'tok-secret-value',
+  FORGEJO_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });
@@ -75,6 +78,20 @@ test('routes each label to its own agent profile with caps', async () => {
   assert.equal(plan.headers['X-Session-API-Key'], 'k'.repeat(24));
   assert.equal(plan.path, '/api/conversations');
   assert.equal(plan.body.initial_message.run, true);
+});
+
+test('conversations get the agent secrets, and the ledger never stores them', async () => {
+  const { dispatcher, jobs } = await build();
+  await dispatcher.enqueue(event('ai:ready', 3));
+  await dispatcher.tick();
+  const { body } = starts()[0];
+  assert.deepEqual(Object.keys(body.secrets), ['FORGEJO_TOKEN', 'FORGEJO_URL']);
+  assert.equal(body.secrets.FORGEJO_TOKEN.kind, 'StaticSecret');
+  assert.equal(body.secrets.FORGEJO_TOKEN.value, 'tok-secret-value');
+  assert.doesNotMatch(body.initial_message.content[0].text, /tok-secret-value/);
+  await jobs.persist();
+  const { readFile } = await import('node:fs/promises');
+  assert.doesNotMatch(await readFile(join(dir, 'jobs.json'), 'utf8'), /tok-secret-value/);
 });
 
 test('prompt marks issue text as untrusted and neutralises the end marker', () => {
@@ -186,6 +203,8 @@ test('config rejects broken routes and missing key', () => {
   assert.throws(() => loadConfig(env({ LABEL_ROUTES: '' })), /LABEL_ROUTES/);
   assert.throws(() => loadConfig(env({ LABEL_ROUTES: '{"ai:x":{"profile":"nope"}}' })), /profile/);
   assert.throws(() => loadConfig(env({ OPENHANDS_API_KEY: '' })), /OPENHANDS_API_KEY/);
+  assert.throws(() => loadConfig(env({ AGENT_SECRETS: 'MISSING_ONE' })), /not set/);
+  assert.throws(() => loadConfig(env({ AGENT_SECRETS: 'bad-name' })), /Invalid AGENT_SECRETS/);
   assert.equal(loadConfig(env()).apiUrl, 'http://openhands:8000');
   assert.equal(loadConfig(env()).jobsFile, join(dir, 'jobs.json'));
 });
