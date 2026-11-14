@@ -1,30 +1,26 @@
-name: Build and publish GHCR image
+name: Test and publish GHCR image
 
 on:
   push:
     branches:
-      - master
-      # Publish :edge from the original integration branch while testing.
-      # Remove this branch entry and its edge tag after the PR is merged.
-      - feat/forgejo-webhook-adapter
+      - '**'
     tags:
-      - 'v*'
+      - '**'
   pull_request:
     branches:
-      - master
+      - '**'
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image:
-    name: Test, build and publish
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -37,6 +33,18 @@ jobs:
 
       - name: Test
         run: npm test
+
+  image:
+    name: Build and publish
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'master') || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
 
       - name: Enable ARM64 emulation
         if: github.event_name != 'pull_request'
@@ -53,7 +61,6 @@ jobs:
           flavor: latest=false
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/feat/forgejo-webhook-adapter' }}
             type=semver,pattern=v{{version}}
             type=sha,format=long
             type=ref,event=pr
