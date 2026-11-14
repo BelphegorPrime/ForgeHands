@@ -185,6 +185,24 @@ No external dependencies are installed. CI runs tests on Node.js 22.
 - Repository URLs provided by webhook events are **not fetched by this service**.
 - Restrict public access, use TLS termination, avoid exposing secrets in logs, and restrict outbound networking to your OpenHands deployment.
 
+## Direct mode (v0.2.0): one agent profile per label
+
+Set `OPENHANDS_API_URL` (for example `http://openhands:8000`) and `OPENHANDS_API_KEY` and ForgeHands starts an OpenHands conversation itself, with the agent profile that belongs to the label. Without `OPENHANDS_API_URL` it works as before (signed webhook to an automation, label `ai:ready`).
+
+| Variable | Meaning |
+| --- | --- |
+| `LABEL_ROUTES` | JSON, label to route: `{"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, "ai:ready": {"profile": "<uuid>", "tier": "free"}}`. Optional per route: `max_concurrent`. First label listed wins when an issue is opened with several. |
+| `ALLOWED_SENDERS` | Optional, comma separated Forgejo logins that may trigger runs. |
+| `MAX_CONCURRENT_PER_TIER` / `MAX_CONCURRENT` | Runs at once per `tier` (default 2) and in total (default 4). The rest wait in the queue. |
+| `MAX_RUNS_PER_HOUR` | Hard cap on started runs per hour (default 30), a guard against runaway fan-out. |
+| `MAX_RUN_MINUTES` | After this long a run stops holding its slot (default 120). The conversation itself is not touched. |
+| `WORKSPACE_DIR` | Working directory of the conversations (default `/projects`). The agent clones the repository there. |
+| `JOBS_FILE` | Issue ledger next to `DATA_FILE` by default. |
+
+- The ledger keeps `repo#issue:label` to conversation id. The same label on an issue that still has a queued or running run does not start a second one; a re-label after the run ended does.
+- The issue text goes into the first message between markers and is marked as untrusted. ForgeHands still holds no Forgejo or LLM credentials; the agents use their own secrets.
+- `OPENHANDS_API_KEY` is a backend key. Keep it out of the repository; give it to the container through its secret store.
+
 ## License
 
 MIT (see LICENSE).
