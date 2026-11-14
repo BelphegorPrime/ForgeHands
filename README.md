@@ -42,7 +42,42 @@ Never configure an empty Forgejo webhook secret.
 
 ## OpenHands setup
 
-This service targets the **OpenHands Automation custom webhook** API, not the generic Agent Server directly. Register a source through the Automation API (substitute actual host and credentials):
+This service targets the **OpenHands Automation custom webhook** API, not the generic Agent Server directly.
+
+### Self-hosted Agent Canvas (Docker)
+
+The official `ghcr.io/openhands/agent-canvas` Docker image bundles Canvas, Agent Server, and Automation Server. In Canvas, look for **Automate → Events** to register a custom source if supported by your deployed version. The incoming source should use `forgehands` as the source, `type` as the event key expression, `X-Signature-256` as the signature header and a dedicated secret shared with ForgeHands.
+
+Check that the automation API exists before configuring the bridge (replace the port with your published port):
+
+```sh
+curl -i http://127.0.0.1:8000/api/automation/v1/webhooks
+```
+
+A 401/403 can indicate the endpoint exists but requires the backend session key. A 404 suggests the wrong image, path or version; a 502/503 may indicate an unhealthy automation backend. **Do not paste or publish session keys or webhook secrets.**
+
+For a self-hosted API request, use `X-Session-API-Key` with the backend/session key (`LOCAL_BACKEND_API_KEY`), **not** your model provider API key. The following example expects `OPENHANDS_HOST`, `OPENHANDS_SESSION_API_KEY`, and `OPENHANDS_WEBHOOK_SECRET` to be set in your shell:
+
+```sh
+curl -X POST "$OPENHANDS_HOST/api/automation/v1/webhooks" \\
+  -H "X-Session-API-Key: $OPENHANDS_SESSION_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "name": "ForgeHands Forgejo Issues",
+    "source": "forgehands",
+    "event_key_expr": "type",
+    "signature_header": "X-Signature-256",
+    "signature_scheme": "hmac_sha256_hex",
+    "event_id_header": "X-ForgeHands-Delivery",
+    "webhook_secret": "REPLACE_WITH_OPENHANDS_WEBHOOK_SECRET"
+  }'
+```
+
+The literal secret placeholder in the JSON above must be replaced securely. Prefer registration through the Canvas UI or a locally generated JSON request to avoid leaking secrets to shell history. For **OpenHands Cloud**, use `Authorization: Bearer $OPENHANDS_API_KEY` instead.
+
+### Automation source registration
+
+Alternatively, register a source through the Automation API with the appropriate authentication for your deployment:
 
 ```sh
 curl -X POST "$OPENHANDS_HOST/api/automation/v1/webhooks" \
@@ -61,7 +96,7 @@ curl -X POST "$OPENHANDS_HOST/api/automation/v1/webhooks" \
 
 Use the returned `webhook_url` as `OPENHANDS_WEBHOOK_URL`. Configure an OpenHands event automation for source `forgehands` and event keys `issues.labeled` and/or `issues.opened`. Agent prompts should treat issue text as **untrusted user input** and only open draft PRs without merging.
 
-The registered custom webhook must be reachable from this service; the OpenHands automation backend must be deployed and configured separately. The Automation API may not be part of every OpenHands deployment; check that the endpoint actually exists before configuring this bridge.
+The registered custom webhook must be reachable from ForgeHands. The official Agent Canvas Docker distribution includes the automation backend, but other OpenHands image variants or older deployments may not. Confirm endpoint availability before configuring this bridge. For a LAN-only Forgejo deployment, ForgeHands and OpenHands can remain on private networking; public internet ingress is not required.
 
 ## Configuration
 
