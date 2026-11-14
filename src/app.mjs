@@ -44,7 +44,7 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     try { body = JSON.parse(raw.toString('utf8')); }
     catch { return json(res, 400, { error: 'invalid_json' }); }
     const event = req.headers['x-forgejo-event'];
-    const normalized = normalizeEvent(event, body, config.allowedRepos, config.routes.keys());
+    const normalized = normalizeEvent(event, body, config.allowedRepos, config.routes.keys(), { labelEvents: config.mode === 'direct' });
     if (!normalized) return json(res, 202, { status: 'ignored' });
     if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
       return json(res, 202, { status: 'ignored' });
