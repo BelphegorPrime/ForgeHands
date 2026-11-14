@@ -3,12 +3,12 @@ name: Test and publish GHCR image
 on:
   push:
     branches:
-      - '**'
+      - "**"
     tags:
-      - '**'
+      - "**"
   pull_request:
     branches:
-      - '**'
+      - "**"
   workflow_dispatch:
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       - name: Test
         run: npm test
