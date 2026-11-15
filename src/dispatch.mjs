@@ -1,4 +1,6 @@
 import { buildPrompt } from './prompt.mjs';
+import { forgejoCall } from './forgejo.mjs';
+import { Merger } from './merge.mjs';
 
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted']);
 const RETRY_BASE_MS = 60000;
@@ -25,6 +27,7 @@ export class Dispatcher {
     this.now = now;
     this.current = null;
     this.timer = null;
+    this.merger = new Merger(config, send, logger);
   }
 
   issueKey(event) {
@@ -93,6 +96,8 @@ export class Dispatcher {
       this.jobs.remove(job.id); // not durable: the retried delivery must be able to enqueue it again
       throw error;
     }
+    // The earlier approval does not cover what this run will push or review.
+    if (event.pull_request) await this.merger.clearApproval(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
   }
@@ -104,18 +109,14 @@ export class Dispatcher {
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
   }
 
-  // One Forgejo call as the configured Forgejo user (null body for none).
-  async forgejoCall(event, method, path, body) {
-    const { url, token } = this.config.forgejo;
-    const response = await this.send(url + '/api/v1/repos/' + event.repository.full_name + path, {
-      method,
-      headers: { authorization: 'token ' + token, 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(this.config.timeoutMs),
-      redirect: 'error'
-    });
-    if (!response.ok) throw new Error(method + ' ' + path + ' -> HTTP ' + response.status);
-    return response.json().catch(() => null);
+  forgejoCall(event, method, path, body) {
+    return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body);
+  }
+
+  // The reviewer approved the pull request (label): merge it when the operator's policy for the repository allows.
+  async approve(event) {
+    if (Array.isArray(event.previous_labels) && event.previous_labels.includes(this.config.approvedLabel)) return 'already_approved';
+    return this.merger.handle(event);
   }
 
   // Forgejo sends one event per finished workflow run. All workflows of the commit have to be green: the combined commit
