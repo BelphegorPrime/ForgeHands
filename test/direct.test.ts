@@ -916,12 +916,30 @@ async function buildCiWithHead(head, status = { state: 'success', total_count: 1
   return { jobs, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
 }
 
+test('a failed CI run whose commit is pending or green again starts nothing', async () => {
+  for (const state of ['pending', 'success']) {
+    const { dispatcher, jobs } = await buildCi({ state, total_count: 1 });
+    assert.equal((await dispatcher.enqueue(ciEvent('failure'))).status, 'ci_not_red');
+    assert.equal(jobs.list().length, 0);
+  }
+  const red = await buildCi({ state: 'failure', total_count: 1 });
+  assert.equal((await red.dispatcher.enqueue(ciEvent('failure'))).status, 'queued');
+  // the commit recovers while the job is queued: dropped right before it starts
+  const green = await buildCi({ state: 'success', total_count: 1 });
+  const event = ciEvent('failure');
+  const job = green.jobs.add({ key: 'owner/hello#26:ci:failure:abcdef01', label: 'ci:failure', event, status: 'queued', created: clock });
+  const before = starts().length;
+  await green.dispatcher.startJob(job, clock);
+  assert.equal(starts().length, before);
+  assert.equal(green.jobs.list().some((entry) => entry.id === job.id), false);
+});
+
 test('a CI outcome of a commit that is no longer the head of the pull request starts nothing', async () => {
   const stale = await buildCiWithHead('ffffffff00000000');
   assert.equal((await stale.dispatcher.enqueue(ciEvent('failure'))).status, 'stale_run');
   assert.equal((await stale.dispatcher.enqueue(ciEvent('success'))).status, 'stale_run');
   assert.equal(starts().length, 0);
-  const current = await buildCiWithHead('abcdef0123456789');
+  const current = await buildCiWithHead('abcdef0123456789', { state: 'failure', total_count: 1 });
   assert.equal((await current.dispatcher.enqueue(ciEvent('failure'))).status, 'queued');
 });
 

@@ -117,6 +117,8 @@ export class Dispatcher {
       if (await this.isStale(event)) return { status: 'stale_run' };
     }
     if (kind === 'ci_success' && !(await this.commitGreen(event))) return { status: 'ci_not_green' };
+    // A run killed from outside is reported as failure; if the commit is pending or green again there is nothing to fix.
+    if (kind === 'ci_failure' && (await this.commitRecovered(event))) return { status: 'ci_not_red' };
     if (event.pull_request && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
       await this.roundsUsedUp(event);
       return { status: 'rounds_exceeded' };
@@ -227,6 +229,7 @@ export class Dispatcher {
     const kind = this.config.routes.get(job.label)?.kind;
     let start = !(await this.isStale(event));
     if (start && kind === 'ci_success') start = await this.commitGreen(event);
+    if (start && kind === 'ci_failure') start = !(await this.commitRecovered(event));
     if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
       await this.roundsUsedUp(event);
       start = false;
@@ -260,6 +263,18 @@ export class Dispatcher {
     try {
       const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(event.ci!.commit_sha) + '/status');
       return status?.state === 'success' && status.total_count > 0;
+    } catch (error) {
+      this.logger.error('commit status failed:', error.message);
+      return false;
+    }
+  }
+
+  // Is the commit of a failed CI run pending (a re-run is under way) or green? Then there is nothing to fix. Unknown counts as still red.
+  async commitRecovered(event: ForgeEvent): Promise<boolean> {
+    if (!this.config.forgejo) return false;
+    try {
+      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(event.ci!.commit_sha) + '/status');
+      return status?.state === 'pending' || status?.state === 'success';
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
       return false;
@@ -545,6 +560,10 @@ export class Dispatcher {
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {
+    if (job.event.ci && this.config.routes.get(job.label)?.kind === 'ci_failure' && (await this.commitRecovered(job.event))) {
+      this.jobs.remove(job.id);
+      return true;
+    }
     const route = this.route(job.label);
     const body: Json = {
       workspace: { working_dir: this.config.workspaceDir },
