@@ -1,6 +1,10 @@
+import type { Fetch, ForgejoAccess, Json } from '../types.ts';
+
+export interface ForgejoConfig { forgejo: ForgejoAccess | null; timeoutMs: number }
+
 // One call to the Forgejo API of a repository, as the Forgejo user whose token ForgeHands holds.
-export async function forgejoCall(config, send, repository, method, path, body) {
-  const { url, token } = config.forgejo;
+export async function forgejoCall(config: ForgejoConfig, send: Fetch, repository: string, method: string, path: string, body?: unknown): Promise<Json> {
+  const { url, token } = config.forgejo as ForgejoAccess;
   const response = await send(url + '/api/v1/repos/' + repository + path, {
     method,
     headers: { authorization: 'token ' + token, 'content-type': 'application/json' },

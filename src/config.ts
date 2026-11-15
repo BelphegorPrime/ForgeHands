@@ -1,11 +1,12 @@
 import { URL } from 'node:url';
-import { globToRegExp } from './merge.mjs';
+import { globToRegExp } from './forgejo/glob.ts';
+import type { Config, Json, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
 
-function httpUrl(value, name) {
-  let url;
+function httpUrl(value: string, name: string): URL {
+  let url: URL;
   try { url = new URL(value); } catch { throw new Error(name + ' must be a valid URL'); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
     throw new Error(name + ' requires http(s) and no embedded credentials');
@@ -13,7 +14,7 @@ function httpUrl(value, name) {
   return url;
 }
 
-function positiveInt(value, fallback, name, max = 100000) {
+function positiveInt<F extends number | null>(value: unknown, fallback: F, name: string, max = 100000): number | F {
   if (value === undefined || value === '') return fallback;
   const number = Number(value);
   if (!Number.isInteger(number) || number < 1 || number > max) throw new Error(name + ' must be an integer between 1 and ' + max);
@@ -21,14 +22,14 @@ function positiveInt(value, fallback, name, max = 100000) {
 }
 
 // LABEL_ROUTES ("on": "pull_request" for a label on a pull request, a follow-up round): {"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, ...}
-function parseRoutes(text) {
-  let parsed;
+function parseRoutes(text: string): Map<string, Route> {
+  let parsed: Json;
   try { parsed = JSON.parse(text); } catch { throw new Error('LABEL_ROUTES must be valid JSON'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
     throw new Error('LABEL_ROUTES must be a non-empty JSON object');
   }
-  const routes = new Map();
-  for (const [label, route] of Object.entries(parsed)) {
+  const routes = new Map<string, Route>();
+  for (const [label, route] of Object.entries(parsed as Record<string, Json>)) {
     if (!route || typeof route !== 'object' || !UUID.test(String(route.profile || ''))) {
       throw new Error('LABEL_ROUTES entry ' + label + ' needs a "profile" agent profile UUID');
     }
@@ -37,11 +38,11 @@ function parseRoutes(text) {
     routes.set(label, {
       profile: route.profile,
       tier: String(route.tier || 'default'),
-      maxIterations: positiveInt(route.max_iterations, 100, 'max_iterations of ' + label, 1000),
+      maxIterations: positiveInt(route.max_iterations, 100, 'max_iterations of ' + label, 1000) as number,
       maxBudget: budget,
-      maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100),
+      maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100) as number,
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: ['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict'].includes(route.on) ? route.on : 'issue'
+      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict'].includes(route.on) ? route.on : 'issue') as RouteKind
     });
   }
   return routes;
@@ -49,36 +50,36 @@ function parseRoutes(text) {
 
 // MERGE_POLICY: {"owner/repo": {"deny": ["stacks/**", "compose.yaml"]}}. Only the repositories named here are merged by ForgeHands,
 // and only when none of the changed files matches a deny pattern. A repository without an entry is never merged automatically.
-function parseMergePolicy(text) {
-  const policy = new Map();
+function parseMergePolicy(text: string | undefined): Map<string, { deny: RegExp[] }> {
+  const policy = new Map<string, { deny: RegExp[] }>();
   if (!text) return policy;
-  let parsed;
+  let parsed: Json;
   try { parsed = JSON.parse(text); } catch { throw new Error('MERGE_POLICY must be valid JSON'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('MERGE_POLICY must be a JSON object');
-  for (const [name, rule] of Object.entries(parsed)) {
+  for (const [name, rule] of Object.entries(parsed as Record<string, Json>)) {
     if (!REPO.test(name.toLowerCase())) throw new Error('MERGE_POLICY: ' + name + ' is not owner/repository');
     const deny = rule?.deny ?? [];
-    if (!Array.isArray(deny) || deny.some((glob) => typeof glob !== 'string' || !glob)) throw new Error('MERGE_POLICY: deny of ' + name + ' must be a list of patterns');
+    if (!Array.isArray(deny) || deny.some((glob: unknown) => typeof glob !== 'string' || !glob)) throw new Error('MERGE_POLICY: deny of ' + name + ' must be a list of patterns');
     policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp) });
   }
   return policy;
 }
 
-function archiveDays(value) {
+function archiveDays(value: string | undefined): number {
   if (value === undefined || value === '') return 7;
   const days = Number(value);
   if (!Number.isInteger(days) || days < 0 || days > 3650) throw new Error('ARCHIVE_AFTER_DAYS must be an integer between 0 and 3650');
   return days;
 }
 
-function parseHumanLogin(value) {
+function parseHumanLogin(value: string | undefined): string | null {
   const login = String(value || '').trim().replace(/^@/, '');
   if (!login) return null;
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(login)) throw new Error('HUMAN_LOGIN must be a Forgejo login');
   return login;
 }
 
-export function loadConfig(env = process.env) {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const forgejoSecret = env.FORGEJO_WEBHOOK_SECRET || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
   const allowedRepos = new Set((env.ALLOWED_REPOS || '')
@@ -124,19 +125,19 @@ export function loadConfig(env = process.env) {
   if (!env.OPENHANDS_API_KEY) throw new Error('OPENHANDS_API_KEY is required with OPENHANDS_API_URL');
   // AGENT_SECRETS: names of environment variables whose values every started conversation receives as secrets
   // (OpenHands exposes saved secrets only to callers that pass them in the start request).
-  const agentSecrets = {};
+  const agentSecrets: Record<string, string> = {};
   for (const name of (env.AGENT_SECRETS || '').split(',').map((value) => value.trim()).filter(Boolean)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(name)) throw new Error('Invalid AGENT_SECRETS name: ' + name);
     if (!env[name]) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
-    agentSecrets[name] = env[name];
+    agentSecrets[name] = env[name]!;
   }
   // TIER_WEEKLY_BUDGETS: {"strong": 5} caps the LLM cost (USD) that runs of a tier may add up to within 7 days.
-  const tierBudgets = new Map();
+  const tierBudgets = new Map<string, number>();
   if (env.TIER_WEEKLY_BUDGETS) {
-    let parsed;
+    let parsed: Json;
     try { parsed = JSON.parse(env.TIER_WEEKLY_BUDGETS); } catch { throw new Error('TIER_WEEKLY_BUDGETS must be valid JSON'); }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('TIER_WEEKLY_BUDGETS must be a JSON object');
-    for (const [tier, amount] of Object.entries(parsed)) {
+    for (const [tier, amount] of Object.entries(parsed as Record<string, Json>)) {
       if (!(Number(amount) > 0)) throw new Error('TIER_WEEKLY_BUDGETS: ' + tier + ' must be a number > 0');
       tierBudgets.set(tier, Number(amount));
     }
@@ -150,7 +151,7 @@ export function loadConfig(env = process.env) {
     ...common,
     mode: 'direct',
     tierBudgets,
-    apiUrl: httpUrl(env.OPENHANDS_API_URL, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
+    apiUrl: httpUrl(env.OPENHANDS_API_URL!, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
     routes,
     mergePolicy,

@@ -1,9 +1,19 @@
+import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
+
+export interface NormalizeOptions {
+  labelEvents?: boolean;
+  prLabels?: string[];
+  ci?: { failure?: string; success?: string };
+  approved?: string;
+  pushes?: boolean;
+}
+
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
 // `labels` are the trigger labels in priority order; the first one that applies wins.
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false } = {}) {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return pushes ? normalizePush(payload, allowedRepos) : null;
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
@@ -17,10 +27,10 @@ export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready
   if (!issue || !Number.isSafeInteger(issue.number) || issue.number <= 0) return null;
   if (isLabelEvent ? payload.action !== 'label_updated' : (payload.action !== 'opened' && payload.action !== 'labeled')) return null;
   const present = Array.isArray(issue.labels)
-    ? issue.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((name) => typeof name === 'string')
+    ? issue.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
     : [];
   const triggers = [...labels];
-  let matched;
+  let matched: string | undefined;
   if (isLabelEvent) {
     matched = triggers.find((name) => present.includes(name));
   } else if (payload.action === 'labeled') {
@@ -58,7 +68,7 @@ export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready
 // A label on the pull request of an agent issue (branch ai/issue-<n>) starts a follow-up round for that issue. As with issues,
 // Forgejo reports a label change as action `label_updated` with the current labels only, so the event is flagged and the
 // dispatcher compares it with the labels it saw before. `labeled` (with the added label) is accepted as well.
-function normalizePullRequest(payload, allowedRepos, labels, approved) {
+function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string): ForgeEvent | null {
   const pr = payload?.pull_request;
   if (!pr || typeof pr !== 'object' || (!labels.length && !approved)) return null;
   if (payload.action !== 'label_updated' && payload.action !== 'labeled') return null;
@@ -69,10 +79,10 @@ function normalizePullRequest(payload, allowedRepos, labels, approved) {
   const issueNumber = match ? Number(match[1]) : 0;
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
   const present = Array.isArray(pr.labels)
-    ? pr.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((name) => typeof name === 'string')
+    ? pr.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
     : [];
   const isLabelEvent = payload.action === 'label_updated';
-  let matched;
+  let matched: string | undefined;
   if (isLabelEvent) matched = labels.find((name) => present.includes(name));
   else matched = labels.includes(payload.label?.name) && present.includes(payload.label.name) ? payload.label.name : undefined;
   // The approval label asks ForgeHands to merge (a round label takes precedence when both are there).
@@ -110,7 +120,7 @@ function normalizePullRequest(payload, allowedRepos, labels, approved) {
 // A finished Forgejo Actions run of a pull request of an agent issue. Forgejo sends one event per workflow run (header
 // `action_run_failure` or `action_run_success`); `run.event_payload` is the pull request payload that started the run as a
 // JSON string. `ci.failure` and `ci.success` are the route names that handle each outcome (absent: not handled).
-function normalizeCiRun(event, payload, allowedRepos, ci) {
+function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>, ci: { failure?: string; success?: string }): ForgeEvent | null {
   const label = event === 'action_run_failure' ? ci.failure : ci.success;
   const run = payload?.run;
   if (!label || !run || typeof run !== 'object' || run.event !== 'pull_request' || typeof run.event_payload !== 'string') return null;
@@ -118,7 +128,7 @@ function normalizeCiRun(event, payload, allowedRepos, ci) {
   if (run.status !== (event === 'action_run_failure' ? 'failure' : 'success')) return null;
   const fullName = run.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
-  let data;
+  let data: Json;
   try { data = JSON.parse(run.event_payload); } catch { return null; }
   const pr = data?.pull_request;
   if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
@@ -151,7 +161,7 @@ function normalizeCiRun(event, payload, allowedRepos, ci) {
 }
 
 // A closed issue: the issues that depend on it may be ready now (see the dispatcher).
-function normalizeClosed(payload, allowedRepos) {
+function normalizeClosed(payload: Json, allowedRepos: Set<string>): ForgeEvent | null {
   const fullName = payload.repository?.full_name;
   const issue = payload.issue;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
@@ -167,7 +177,7 @@ function normalizeClosed(payload, allowedRepos) {
 }
 
 // A push to the default branch: the open pull requests may have fallen behind (see the dispatcher). Other branches and deletions do not count.
-function normalizePush(payload, allowedRepos) {
+function normalizePush(payload: Json, allowedRepos: Set<string>): PushEvent | null {
   const fullName = payload?.repository?.full_name;
   const branch = payload?.repository?.default_branch;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase()) || typeof branch !== 'string' || !branch) return null;

@@ -1,16 +1,30 @@
+import type { DirectConfig } from '../types.ts';
+import type { JobStore } from '../store/jobs.ts';
+
+interface Run {
+  label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
+  started: string | null; finished: string | null; cost: number | null; retry_at: number | undefined; waiting_for: number[] | undefined;
+  waiting_for_run: true | undefined; created: number;
+}
+export interface Status {
+  generated: string;
+  limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
+  issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; runs: Omit<Run, 'created'>[] }[];
+}
+
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
 // Read only, no event text beyond the issue title; it says nothing about Forgejo's side (the pull request itself).
-const KIND_TEXT = {
+const KIND_TEXT: Record<string, string> = {
   issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round'
 };
 
 // One line for the current state of an issue, from its newest relevant run.
-function stateOf(runs, maxRounds, rounds) {
+function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   const active = runs.find((run) => run.status === 'running' || run.status === 'queued');
   if (active && active.retry_at && active.status === 'queued') return 'model quota used up, ' + KIND_TEXT[active.kind] + ' tries again after ' + new Date(active.retry_at).toISOString().slice(11, 16) + ' UTC';
   if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running';
   const waiting = runs.find((run) => run.status === 'waiting');
-  if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n) => '#' + n).join(', ');
+  if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n: number) => '#' + n).join(', ');
   const last = runs[0];
   if (!last) return 'idle';
   if (last.status === 'failed') return KIND_TEXT[last.kind] + ' failed' + (last.result ? ' (' + last.result + ')' : '');
@@ -18,12 +32,12 @@ function stateOf(runs, maxRounds, rounds) {
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config, jobs, now = Date.now()) {
-  const byIssue = new Map();
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now()): Status {
+  const byIssue = new Map<string, { key: string; title: string; runs: Run[] }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
     const route = config.routes.get(job.label);
-    const run = {
+    const run: Run = {
       label: job.label, kind: route?.kind || 'issue', status: job.status, result: job.result,
       conversation: job.conversation_id || null, pr: job.event?.pull_request?.number || null,
       started: job.started ? new Date(job.started).toISOString() : null,
@@ -41,7 +55,7 @@ export function buildStatus(config, jobs, now = Date.now()) {
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
       issue: entry.key, title: entry.title, pr, rounds, state: stateOf(entry.runs, config.maxRounds, rounds),
-      runs: entry.runs.map(({ created, ...run }) => run)
+      runs: entry.runs.map(({ created: _created, ...run }) => run)
     };
   });
   issues.sort((a, b) => (b.runs[0]?.started || '').localeCompare(a.runs[0]?.started || ''));
@@ -53,9 +67,9 @@ export function buildStatus(config, jobs, now = Date.now()) {
   };
 }
 
-const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+const escape = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char] as string));
 
-export function renderStatus(status) {
+export function renderStatus(status: Status): string {
   const rows = status.issues.map((issue) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
     + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>').join('\n');
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ForgeHands status</title>'

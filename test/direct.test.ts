@@ -1,16 +1,17 @@
+// @ts-nocheck -- fixtures and fakes are deliberately loose; typing them is a follow-up (src/ is checked strictly).
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac } from 'node:crypto';
-import { createApp } from '../src/app.mjs';
-import { DeliveryStore } from '../src/store.mjs';
-import { JobStore } from '../src/jobs.mjs';
-import { Dispatcher } from '../src/dispatch.mjs';
-import { loadConfig } from '../src/config.mjs';
-import { buildPrompt } from '../src/prompt.mjs';
-import { normalizeEvent } from '../src/events.mjs';
+import { createApp } from '../src/server/app.ts';
+import { DeliveryStore } from '../src/store/deliveries.ts';
+import { JobStore } from '../src/store/jobs.ts';
+import { Dispatcher } from '../src/agent/dispatch.ts';
+import { loadConfig } from '../src/config.ts';
+import { buildPrompt } from '../src/agent/prompt.ts';
+import { normalizeEvent } from '../src/webhook/events.ts';
 
 const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -684,7 +685,8 @@ test('the webhook delivers a CI outcome of an agent pull request', async () => {
 });
 
 // ---- auto-merge of an approved pull request, by the operator's per-repository policy
-import { Merger, globToRegExp } from '../src/merge.mjs';
+import { Merger } from '../src/forgejo/merge.ts';
+import { globToRegExp } from '../src/forgejo/glob.ts';
 const MERGE = { 'owner/hello': { deny: ['compose.yaml', '.github/**', 'docs/**/*.secret'] } };
 const withMerge = (extra = {}) => withCi({ MERGE_POLICY: JSON.stringify(MERGE), ...extra });
 const API = '/api/v1/repos/owner/hello';
@@ -1117,7 +1119,7 @@ test('the webhook turns a closed issue into the start of what waited for it', as
 });
 
 // ---- status page
-import { buildStatus, renderStatus } from '../src/status.mjs';
+import { buildStatus, renderStatus } from '../src/server/status.ts';
 
 test('the status says per issue what runs and what it waits for, without event text', async () => {
   const { config, jobs } = await build(withChanges({ MAX_ROUNDS: "2" }));

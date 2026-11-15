@@ -1,14 +1,15 @@
+// @ts-nocheck -- fixtures and fakes are deliberately loose; typing them is a follow-up (src/ is checked strictly).
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac } from 'node:crypto';
-import { createApp } from '../src/app.mjs';
-import { DeliveryStore } from '../src/store.mjs';
-import { loadConfig } from '../src/config.mjs';
-import { normalizeEvent } from '../src/events.mjs';
-import { verifyForgejoSignature } from '../src/security.mjs';
+import { createApp } from '../src/server/app.ts';
+import { DeliveryStore } from '../src/store/deliveries.ts';
+import { loadConfig } from '../src/config.ts';
+import { normalizeEvent } from '../src/webhook/events.ts';
+import { verifyForgejoSignature } from '../src/webhook/security.ts';
 
 let server;
 let base;

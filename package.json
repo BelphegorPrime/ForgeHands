@@ -5,12 +5,17 @@
   "type": "module",
   "private": true,
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   },
   "scripts": {
-    "start": "node src/index.mjs",
-    "test": "node --test --test-concurrency=1",
-    "test:coverage": "node --test --experimental-test-coverage"
+    "start": "node src/index.ts",
+    "typecheck": "tsc",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "test:coverage": "node --test --experimental-test-coverage \"test/**/*.test.ts\""
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
 }

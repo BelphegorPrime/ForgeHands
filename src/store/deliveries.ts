@@ -4,13 +4,15 @@ import { dirname } from 'node:path';
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export class DeliveryStore {
-  constructor(file) {
+  file: string;
+  records = new Map<string, number>();
+  inflight = new Set<string>();
+  writes: Promise<void> = Promise.resolve();
+
+  constructor(file: string) {
     this.file = file;
-    this.records = new Map();
-    this.inflight = new Set();
-    this.writes = Promise.resolve();
   }
-  async load() {
+  async load(): Promise<void> {
     try {
       const content = JSON.parse(await readFile(this.file, 'utf8'));
       if (!content || typeof content !== 'object' || Array.isArray(content)) throw Error('Invalid delivery store');
@@ -18,23 +20,23 @@ export class DeliveryStore {
         if (typeof value === 'number' && value > Date.now() - TTL_MS) this.records.set(key, value);
       }
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
-  has(key) {
+  has(key: string): boolean {
     const timestamp = this.records.get(key);
     if (timestamp && timestamp > Date.now() - TTL_MS) return true;
     if (timestamp) this.records.delete(key);
     return false;
   }
-  acquire(key) {
+  acquire(key: string): 'completed' | 'inflight' | 'new' {
     if (this.has(key)) return 'completed';
     if (this.inflight.has(key)) return 'inflight';
     this.inflight.add(key);
     return 'new';
   }
-  release(key) { this.inflight.delete(key); }
-  async mark(key) {
+  release(key: string): void { this.inflight.delete(key); }
+  async mark(key: string): Promise<void> {
     this.records.set(key, Date.now());
     this.writes = this.writes.catch(() => {}).then(async () => {
       const cutoff = Date.now() - TTL_MS;

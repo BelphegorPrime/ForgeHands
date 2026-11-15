@@ -1,29 +1,40 @@
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
-import { deliveryId, signPayload, verifyForgejoSignature } from './security.mjs';
-import { normalizeEvent } from './events.mjs';
-import { buildStatus, renderStatus } from './status.mjs';
+import { deliveryId, signPayload, verifyForgejoSignature } from '../webhook/security.ts';
+import { normalizeEvent } from '../webhook/events.ts';
+import { buildStatus, renderStatus } from './status.ts';
+import { isPushEvent } from '../types.ts';
+import type { Config, DirectConfig, Fetch, ForgeEvent, Logger } from '../types.ts';
+import type { DeliveryStore } from '../store/deliveries.ts';
+import type { Dispatcher } from '../agent/dispatch.ts';
 
-const json = (res, status, body) => {
+const json = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
 };
 
-async function readBody(req, limit) {
-  const chunks = [];
+class HttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
     if (size > limit) {
-      const error = new Error('Payload too large');
-      error.status = 413;
-      throw error;
+      throw new HttpError('Payload too large', 413);
     }
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
 
-export function createApp(config, store, send = fetch, logger = console, dispatcher = null) {
+export function createApp(config: Config, store: DeliveryStore, send: Fetch = fetch, logger: Logger = console, dispatcher: Dispatcher | null = null): Server {
   if (config.mode === 'direct' && !dispatcher) throw new Error('direct mode needs a dispatcher');
   return createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
@@ -31,7 +42,7 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     }
     // Read only view of the work in flight (direct mode): /status for people, /status.json for tools.
     if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json') && dispatcher) {
-      const status = buildStatus(config, dispatcher.jobs);
+      const status = buildStatus(config as DirectConfig, dispatcher.jobs);
       if (req.url === '/status.json') return json(res, 200, status);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(renderStatus(status));
@@ -53,9 +64,9 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     catch { return json(res, 400, { error: 'invalid_json' }); }
     const event = req.headers['x-forgejo-event'];
     const direct = config.mode === 'direct';
-    const previousLabels = direct ? dispatcher.labelsBefore(body, config.allowedRepos) : null;
-    const remember = () => { if (direct) dispatcher.recordLabels(body, config.allowedRepos); };
-    const routeLabels = (kind) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
+    const previousLabels = direct ? dispatcher!.labelsBefore(body, config.allowedRepos) : null;
+    const remember = () => { if (direct) dispatcher!.recordLabels(body, config.allowedRepos); };
+    const routeLabels = (kind: string) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
     const normalized = normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
@@ -74,10 +85,10 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     normalized.delivery_id = id;
     if (config.mode === 'direct') {
       try {
-        const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher.approve(normalized) }
-          : normalized.type === 'issues.closed' ? { status: await dispatcher.onClosed(normalized) }
-          : normalized.type === 'push.default' ? { status: dispatcher.onMainMoved(normalized) }
-          : await dispatcher.enqueue(normalized);
+        const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher!.approve(normalized as ForgeEvent) }
+          : normalized.type === 'issues.closed' ? { status: await dispatcher!.onClosed(normalized as ForgeEvent) }
+          : isPushEvent(normalized) ? { status: dispatcher!.onMainMoved(normalized) }
+          : await dispatcher!.enqueue(normalized);
         remember();
         await store.mark(key);
         return json(res, 202, { status: result.status, delivery_id: id });

@@ -1,8 +1,8 @@
-import { loadConfig } from './config.mjs';
-import { DeliveryStore } from './store.mjs';
-import { JobStore } from './jobs.mjs';
-import { Dispatcher } from './dispatch.mjs';
-import { createApp } from './app.mjs';
+import { loadConfig } from './config.ts';
+import { DeliveryStore } from './store/deliveries.ts';
+import { JobStore } from './store/jobs.ts';
+import { Dispatcher } from './agent/dispatch.ts';
+import { createApp } from './server/app.ts';
 
 const config = loadConfig();
 const store = new DeliveryStore(config.dataFile);

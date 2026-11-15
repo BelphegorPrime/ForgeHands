@@ -1,20 +1,5 @@
-import { forgejoCall } from './forgejo.mjs';
-
-// `*` matches within a path segment, `**` across segments, `?` one character; a pattern without wildcards is an exact path.
-export function globToRegExp(glob) {
-  let source = '';
-  for (let i = 0; i < glob.length; i++) {
-    const char = glob[i];
-    if (char === '*') {
-      if (glob[i + 1] === '*') {
-        i++;
-        if (glob[i + 1] === '/') { i++; source += '(?:.*/)?'; } else source += '.*';
-      } else source += '[^/]*';
-    } else if (char === '?') source += '[^/]';
-    else source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp('^' + source + '$');
-}
+import { forgejoCall } from './client.ts';
+import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 
 const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
 const PAGE = 50;
@@ -23,18 +8,22 @@ const MAX_FILES = 1000;
 // Merges the pull request of an agent issue once the reviewer approved it, CI is green and it touches no protected path.
 // What may merge is the operator's decision (MERGE_POLICY, per repository), never the repository's or the agent's.
 export class Merger {
-  constructor(config, send = fetch, logger = console) {
+  config: DirectConfig;
+  send: Fetch;
+  logger: Logger;
+
+  constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console) {
     this.config = config;
     this.send = send;
     this.logger = logger;
   }
 
-  call(repository, method, path, body) {
+  call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
     return forgejoCall(this.config, this.send, repository, method, path, body);
   }
 
-  async changedFiles(repository, number) {
-    const names = [];
+  async changedFiles(repository: string, number: number): Promise<string[]> {
+    const names: string[] = [];
     for (let page = 1; names.length < MAX_FILES; page++) {
       const files = await this.call(repository, 'GET', '/pulls/' + number + '/files?limit=' + PAGE + '&page=' + page);
       if (!Array.isArray(files) || !files.length) break;
@@ -45,24 +34,24 @@ export class Merger {
   }
 
   // `human`: the comment hands the pull request to a human, so it mentions him (and is the only kind that does).
-  async remark(repository, number, text, human = false) {
+  async remark(repository: string, number: number, text: string, human = false): Promise<void> {
     const mention = human && this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '';
     try { await this.call(repository, 'POST', '/issues/' + number + '/comments', { body: mention + 'ForgeHands: ' + text }); }
     catch (error) { this.logger.error('could not comment on #' + number + ':', error.message); }
   }
 
   // Returns the outcome as a status string; nothing here throws.
-  async handle(event) {
+  async handle(event: ForgeEvent): Promise<string> {
     const repository = event.repository.full_name;
     const policy = this.config.mergePolicy.get(repository.toLowerCase());
     if (!policy || !this.config.forgejo) return 'no_merge_policy';
-    const number = event.pull_request.number;
+    const number = event.pull_request!.number;
     try {
       const pr = await this.call(repository, 'GET', '/pulls/' + number);
       if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
       if (!/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
-      const labels = (pr.labels || []).map((label) => label.name);
+      const labels = (pr.labels || []).map((label: Json) => label.name);
       if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
       if (labels.includes(this.config.blockedLabel)) return 'blocked';
       // The approval label is a claim; the review comment is the proof. Without a verdict for this very commit nothing is merged.
@@ -94,7 +83,7 @@ export class Merger {
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
         Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
       });
-      const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)[1]);
+      const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
       await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
       try { await this.call(repository, 'PATCH', '/issues/' + issue, { state: 'closed' }); }
       catch (error) { this.logger.error('could not close issue #' + issue + ':', error.message); }
@@ -108,7 +97,7 @@ export class Merger {
 
   // The latest review comment of the current commit: written after the commit, long enough to hold evidence, and starting with
   // "Verdict: OK" or "Verdict: NOT OK". A comment of anybody counts (a human may review too); the latest one decides.
-  async reviewOf(repository, number, sha) {
+  async reviewOf(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
     let since = 0;
     try {
       const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
@@ -119,17 +108,17 @@ export class Merger {
     }
     const comments = await this.call(repository, 'GET', '/issues/' + number + '/comments?limit=100');
     const verdicts = (Array.isArray(comments) ? comments : [])
-      .filter((comment) => Date.parse(comment.created_at) >= since && String(comment.body || '').length >= this.config.minReviewChars)
-      .map((comment) => ({ at: Date.parse(comment.created_at), match: /verdict\s*:\s*(not\s+ok|ok)\b/i.exec(String(comment.body).slice(0, 300)) }))
+      .filter((comment: Json) => Date.parse(comment.created_at) >= since && String(comment.body || '').length >= this.config.minReviewChars)
+      .map((comment: Json) => ({ at: Date.parse(comment.created_at), match: /verdict\s*:\s*(not\s+ok|ok)\b/i.exec(String(comment.body).slice(0, 300)) }))
       .filter((entry) => entry.match)
       .sort((a, b) => a.at - b.at);
     const last = verdicts.at(-1);
     if (!last) return { ok: false, reason: 'none' };
-    return /^not/i.test(last.match[1]) ? { ok: false, reason: 'not_ok' } : { ok: true };
+    return /^not/i.test(last.match![1]) ? { ok: false, reason: 'not_ok' } : { ok: true };
   }
 
   // An approval without a review behind it: take it off, say so, hand the pull request to a human. Best effort.
-  async rejectApproval(repository, number, sha, reason) {
+  async rejectApproval(repository: string, number: number, sha: string, reason?: string): Promise<void> {
     const event = { repository: { full_name: repository }, pull_request: { number } };
     await this.clearApproval(event);
     const what = reason === 'not_ok'
@@ -138,7 +127,7 @@ export class Merger {
     await this.remark(repository, number, 'the label ' + this.config.approvedLabel + ' was set, but ' + what + '. The approval is not trusted and was taken off. A human has to look at this pull request, or push a commit to run the review again.', true);
     try {
       const known = await this.call(repository, 'GET', '/labels?limit=100');
-      let label = (known || []).find((entry) => entry.name === this.config.blockedLabel);
+      let label = (known || []).find((entry: Json) => entry.name === this.config.blockedLabel);
       if (!label) label = await this.call(repository, 'POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
       await this.call(repository, 'POST', '/issues/' + number + '/labels', { labels: [label.id] });
     } catch (error) {
@@ -147,13 +136,13 @@ export class Merger {
   }
 
   // A new round or review means the earlier approval no longer covers the branch. Best effort.
-  async clearApproval(event) {
+  async clearApproval(event: { repository: { full_name: string }; pull_request?: { number: number } }): Promise<void> {
     if (!this.config.forgejo) return;
     const repository = event.repository.full_name;
-    const number = event.pull_request.number;
+    const number = event.pull_request!.number;
     try {
       const labels = await this.call(repository, 'GET', '/issues/' + number + '/labels');
-      const approved = (labels || []).find((label) => label.name === this.config.approvedLabel);
+      const approved = (labels || []).find((label: Json) => label.name === this.config.approvedLabel);
       if (approved) await this.call(repository, 'DELETE', '/issues/' + number + '/labels/' + approved.id);
     } catch (error) {
       this.logger.error('could not clear the approval of #' + number + ':', error.message);

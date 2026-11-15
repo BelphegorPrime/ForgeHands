@@ -1,9 +1,10 @@
+// @ts-nocheck -- fixtures and fakes are deliberately loose; typing them is a follow-up (src/ is checked strictly).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createHmac } from 'node:crypto';
-import { createApp } from '../src/app.mjs';
-import { DeliveryStore } from '../src/store.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { createApp } from '../src/server/app.ts';
+import { DeliveryStore } from '../src/store/deliveries.ts';
+import { loadConfig } from '../src/config.ts';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
