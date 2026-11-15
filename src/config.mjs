@@ -19,7 +19,7 @@ function positiveInt(value, fallback, name, max = 100000) {
   return number;
 }
 
-// LABEL_ROUTES: {"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, ...}
+// LABEL_ROUTES ("on": "pull_request" for a label on a pull request, a follow-up round): {"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, ...}
 function parseRoutes(text) {
   let parsed;
   try { parsed = JSON.parse(text); } catch { throw new Error('LABEL_ROUTES must be valid JSON'); }
@@ -38,7 +38,9 @@ function parseRoutes(text) {
       tier: String(route.tier || 'default'),
       maxIterations: positiveInt(route.max_iterations, 100, 'max_iterations of ' + label, 1000),
       maxBudget: budget,
-      maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100)
+      maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100),
+      // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
+      kind: route.on === 'pull_request' ? 'pull_request' : 'issue'
     });
   }
   return routes;
@@ -120,6 +122,11 @@ export function loadConfig(env = process.env) {
     maxConcurrentPerTier: positiveInt(env.MAX_CONCURRENT_PER_TIER, 2, 'MAX_CONCURRENT_PER_TIER', 100),
     maxRunsPerHour: positiveInt(env.MAX_RUNS_PER_HOUR, 30, 'MAX_RUNS_PER_HOUR', 10000),
     maxRunMs: positiveInt(env.MAX_RUN_MINUTES, 120, 'MAX_RUN_MINUTES', 1440) * 60000,
+    // Follow-up runs (routes on pull requests) per issue before ForgeHands stops and asks a human.
+    maxRounds: positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100),
+    // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
+    forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
+    blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };

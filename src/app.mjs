@@ -47,7 +47,8 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     const direct = config.mode === 'direct';
     const previousLabels = direct ? dispatcher.labelsBefore(body, config.allowedRepos) : null;
     const remember = () => { if (direct) dispatcher.recordLabels(body, config.allowedRepos); };
-    const normalized = normalizeEvent(event, body, config.allowedRepos, config.routes.keys(), { labelEvents: config.mode === 'direct' });
+    const routeLabels = (kind) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
+    const normalized = normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [] });
     if (!normalized) { remember(); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {

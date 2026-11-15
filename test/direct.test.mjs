@@ -66,7 +66,7 @@ const event = (label, number = 1, extra = {}) => ({
 const starts = () => calls.filter((c) => c.method === 'POST');
 
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-direct-')); clock = 1_000_000; calls = []; states = {}; costs = {}; failStarts = false; });
-afterEach(() => rm(dir, { recursive: true, force: true }));
+afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })); // background saves may still be writing
 
 test('routes each label to its own agent profile with caps', async () => {
   const { dispatcher } = await build();
@@ -387,4 +387,156 @@ test('job store reads the v0.2.0 array format and keeps label state across a rel
   await second.load();
   assert.deepEqual(second.getLabels('owner/hello#1'), ['ai:ready']);
   assert.equal(second.list().length, 1);
+});
+
+// ---- follow-up rounds: a label on the pull request of an agent issue
+const CHANGES = '44444444-4444-4444-8444-444444444444';
+const withChanges = (extra = {}) => ({
+  LABEL_ROUTES: JSON.stringify({
+    'ai:ready': { profile: WORKER, tier: 'free' },
+    'ai:changes': { profile: CHANGES, tier: 'free', max_iterations: 90, on: 'pull_request' }
+  }),
+  ...extra
+});
+const prPayload = (labels, { ref = 'ai/issue-26', number = 34, state = 'open', merged = false, action = 'label_updated' } = {}) => ({
+  action, repository: { full_name: repo, clone_url: 'https://forge.example/owner/hello.git', default_branch: 'main' },
+  pull_request: { number, state, merged, title: 'Fix it', body: 'Closes #26', comments: 2, html_url: 'https://forge.example/owner/hello/pulls/' + number,
+    head: { ref }, labels: labels.map((name) => ({ name })) },
+  sender: { login: 'marcel' }
+});
+const prEvent = (previous = [], extra = {}) => {
+  const e = normalizeEvent('pull_request', prPayload(['ai:changes']), new Set([repo]), ['ai:ready'], { labelEvents: true, prLabels: ['ai:changes'] });
+  return { ...e, previous_labels: previous, ...extra };
+};
+
+test('route kind: only "on": "pull_request" makes a pull request route', () => {
+  const routes = loadConfig(env(withChanges())).routes;
+  assert.equal(routes.get('ai:changes').kind, 'pull_request');
+  assert.equal(routes.get('ai:ready').kind, 'issue');
+});
+
+test('a label on the pull request of ai/issue-<n> becomes an event for that issue', () => {
+  const e = prEvent();
+  assert.equal(e.issue.number, 26);
+  assert.equal(e.pull_request.number, 34);
+  assert.equal(e.pull_request.head_ref, 'ai/issue-26');
+  assert.equal(e.label, 'ai:changes');
+  assert.equal(e.label_event, true);
+  assert.equal(e.issue.comments, 2);
+});
+
+test('pull request events that must not start a round are ignored', () => {
+  const norm = (payload, prLabels = ['ai:changes']) => normalizeEvent('pull_request', payload, new Set([repo]), [], { labelEvents: true, prLabels });
+  assert.equal(norm(prPayload(['ai:changes'], { ref: 'feature/x' })), null);
+  assert.equal(norm(prPayload(['ai:changes'], { state: 'closed' })), null);
+  assert.equal(norm(prPayload(['ai:changes'], { merged: true })), null);
+  assert.equal(norm(prPayload(['bug'])), null);
+  assert.equal(norm(prPayload(['ai:changes'], { action: 'opened' })), null);
+  assert.equal(norm(prPayload(['ai:changes']), []), null);
+  assert.equal(normalizeEvent('pull_request', prPayload(['ai:changes']), new Set(['other/repo']), [], { prLabels: ['ai:changes'] }), null);
+});
+
+test('labels of a pull request are tracked apart from the issue with the same number', async () => {
+  const { dispatcher, jobs } = await build(withChanges());
+  const allowed = new Set([repo]);
+  dispatcher.recordLabels(prPayload(['ai:changes'], { number: 26 }), allowed);
+  await jobs.persist(clock); // recordLabels saves in the background; do not leave it running into the cleanup
+  assert.deepEqual(dispatcher.labelsBefore(prPayload(['ai:changes'], { number: 26 }), allowed), ['ai:changes']);
+  assert.equal(dispatcher.labelsBefore({ repository: { full_name: repo }, issue: { number: 26, labels: [] } }, allowed), null);
+});
+
+test('a round starts the pull request route on the same branch and says so in its prompt', async () => {
+  const { dispatcher, jobs } = await build(withChanges());
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  await dispatcher.tick();
+  const { body } = starts()[0];
+  assert.equal(body.agent_profile_id, CHANGES);
+  assert.equal(body.max_iterations, 90);
+  assert.deepEqual(body.tags, { source: 'forgehands', issue: '26', pr: '34' });
+  const text = body.initial_message.content[0].text;
+  assert.match(text, /pull request #34/);
+  assert.match(text, /Check out the branch ai\/issue-26/);
+  assert.match(text, /pulls\/34\/reviews/);
+  assert.match(text, /issues\/34\/comments/);
+  assert.match(text, /Never open another pull request/);
+  assert.match(text, /remove the label ai:changes/);
+  assert.match(text, /written by marcel/);
+  assert.equal(jobs.list()[0].key, 'owner/hello#26:ai:changes');
+});
+
+test('the same label while a round runs starts no second round, a re-label after it ended does', async () => {
+  const { dispatcher } = await build(withChanges());
+  await dispatcher.enqueue(prEvent());
+  await dispatcher.tick();
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'duplicate_job');
+  states['conv-1'] = 'finished';
+  await dispatcher.tick();
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+});
+
+test('rounds are limited per issue; the pull request is told and marked when they are used up', async () => {
+  const forgejo = [];
+  const config = loadConfig(env(withChanges({ MAX_ROUNDS: '2' })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    forgejo.push({ method: request.method, path: new URL(url).pathname, body: request.body && JSON.parse(request.body), auth: request.headers.authorization });
+    const body = request.method === 'GET' ? [] : { id: 77 };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  for (let round = 0; round < 2; round++) {
+    assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+    await dispatcher.tick();
+    states[jobs.list().at(-1).conversation_id] = 'finished';
+    await dispatcher.tick();
+  }
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'rounds_exceeded');
+  assert.equal(starts().length, 2);
+  const paths = forgejo.map((call) => call.method + ' ' + call.path);
+  assert.deepEqual(paths, [
+    'POST /api/v1/repos/owner/hello/issues/34/comments',
+    'GET /api/v1/repos/owner/hello/labels',
+    'POST /api/v1/repos/owner/hello/labels',
+    'POST /api/v1/repos/owner/hello/issues/34/labels'
+  ]);
+  assert.match(forgejo[0].body.body, /2 follow-up rounds for issue #26/);
+  assert.equal(forgejo[2].body.name, 'ai:blocked');
+  assert.deepEqual(forgejo[3].body, { labels: [77] });
+  assert.equal(forgejo[0].auth, 'token tok-secret-value');
+});
+
+test('rounds of another issue do not count', async () => {
+  const { dispatcher } = await build(withChanges({ MAX_ROUNDS: '1' }));
+  const other = prEvent();
+  other.issue = { ...other.issue, number: 27 };
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  assert.equal((await dispatcher.enqueue(other)).status, 'queued');
+});
+
+test('the webhook delivers a label on a pull request to a round', async () => {
+  const config = loadConfig(env(withChanges()));
+  const store = new DeliveryStore(config.dataFile);
+  await store.load();
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => clock);
+  const server = createApp(config, store, undefined, quiet, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const raw = Buffer.from(JSON.stringify(prPayload(['ai:changes'])));
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/webhooks/forgejo', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forgejo-event': 'pull_request', 'x-forgejo-delivery': 'd-pr-1',
+        'x-forgejo-signature': createHmac('sha256', config.forgejoSecret).update(raw).digest('hex') },
+      body: raw
+    });
+    assert.equal(response.status, 202);
+    assert.equal((await response.json()).status, 'queued');
+    assert.equal(jobs.list()[0].key, 'owner/hello#26:ai:changes');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

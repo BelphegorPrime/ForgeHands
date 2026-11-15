@@ -3,7 +3,8 @@
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false } = {}) {
+export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [] } = {}) {
+  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
   const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
   if (event === 'issue_label' && !isLabelEvent) return null;
@@ -47,6 +48,53 @@ export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready
       comments: Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0,
       labels: present
     },
+    sender: { login: payload.sender?.login || null }
+  };
+}
+
+// A label on the pull request of an agent issue (branch ai/issue-<n>) starts a follow-up round for that issue. As with issues,
+// Forgejo reports a label change as action `label_updated` with the current labels only, so the event is flagged and the
+// dispatcher compares it with the labels it saw before. `labeled` (with the added label) is accepted as well.
+function normalizePullRequest(payload, allowedRepos, labels) {
+  const pr = payload?.pull_request;
+  if (!pr || typeof pr !== 'object' || !labels.length) return null;
+  if (payload.action !== 'label_updated' && payload.action !== 'labeled') return null;
+  const fullName = payload.repository?.full_name;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
+  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const issueNumber = match ? Number(match[1]) : 0;
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+  const present = Array.isArray(pr.labels)
+    ? pr.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((name) => typeof name === 'string')
+    : [];
+  const isLabelEvent = payload.action === 'label_updated';
+  let matched;
+  if (isLabelEvent) matched = labels.find((name) => present.includes(name));
+  else matched = labels.includes(payload.label?.name) && present.includes(payload.label.name) ? payload.label.name : undefined;
+  if (!matched) return null;
+  return {
+    type: 'pull_request.labeled',
+    source: 'forgejo',
+    action: 'labeled',
+    ...(isLabelEvent ? { label_event: true } : {}),
+    label: matched,
+    repository: {
+      full_name: fullName,
+      clone_url: payload.repository.clone_url || null,
+      html_url: payload.repository.html_url || null,
+      default_branch: payload.repository.default_branch || null
+    },
+    // The issue the pull request belongs to; the title and body are those of the pull request.
+    issue: {
+      number: issueNumber,
+      title: String(pr.title || '').slice(0, 1000),
+      body: String(pr.body || '').slice(0, 50000),
+      html_url: pr.html_url || null,
+      comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
+      labels: present
+    },
+    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
     sender: { login: payload.sender?.login || null }
   };
 }
