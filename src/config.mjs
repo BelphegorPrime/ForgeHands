@@ -40,7 +40,7 @@ function parseRoutes(text) {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100),
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: route.on === 'pull_request' ? 'pull_request' : 'issue'
+      kind: ['pull_request', 'ci_failure', 'ci_success'].includes(route.on) ? route.on : 'issue'
     });
   }
   return routes;
@@ -109,13 +109,16 @@ export function loadConfig(env = process.env) {
       tierBudgets.set(tier, Number(amount));
     }
   }
+  const routes = parseRoutes(env.LABEL_ROUTES || '');
   return {
     ...common,
     mode: 'direct',
     tierBudgets,
     apiUrl: httpUrl(env.OPENHANDS_API_URL, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
-    routes: parseRoutes(env.LABEL_ROUTES || ''),
+    routes,
+    // The label that asks for another round: the first route on pull requests (the reviewer sets it, a human may too).
+    changesLabel: [...routes].find(([, route]) => route.kind === 'pull_request')?.[0] || 'ai:changes',
     agentSecrets,
     workspaceDir: env.WORKSPACE_DIR || '/projects',
     maxConcurrent: positiveInt(env.MAX_CONCURRENT, 4, 'MAX_CONCURRENT', 100),
@@ -127,6 +130,7 @@ export function loadConfig(env = process.env) {
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    approvedLabel: env.APPROVED_LABEL || 'ai:approved',
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };

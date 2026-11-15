@@ -3,8 +3,9 @@
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [] } = {}) {
+export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {} } = {}) {
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels);
+  if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
   const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
   if (event === 'issue_label' && !isLabelEvent) return null;
@@ -96,5 +97,46 @@ function normalizePullRequest(payload, allowedRepos, labels) {
     },
     pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
     sender: { login: payload.sender?.login || null }
+  };
+}
+
+// A finished Forgejo Actions run of a pull request of an agent issue. Forgejo sends one event per workflow run (header
+// `action_run_failure` or `action_run_success`); `run.event_payload` is the pull request payload that started the run as a
+// JSON string. `ci.failure` and `ci.success` are the route names that handle each outcome (absent: not handled).
+function normalizeCiRun(event, payload, allowedRepos, ci) {
+  const label = event === 'action_run_failure' ? ci.failure : ci.success;
+  const run = payload?.run;
+  if (!label || !run || typeof run !== 'object' || run.event !== 'pull_request' || typeof run.event_payload !== 'string') return null;
+  const fullName = run.repository?.full_name;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  let data;
+  try { data = JSON.parse(run.event_payload); } catch { return null; }
+  const pr = data?.pull_request;
+  if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
+  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const issueNumber = match ? Number(match[1]) : 0;
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0 || typeof run.commit_sha !== 'string' || !run.commit_sha) return null;
+  return {
+    type: 'ci.' + (event === 'action_run_failure' ? 'failure' : 'success'),
+    source: 'forgejo',
+    action: event,
+    label,
+    repository: {
+      full_name: fullName,
+      clone_url: run.repository.clone_url || null,
+      html_url: run.repository.html_url || null,
+      default_branch: run.repository.default_branch || null
+    },
+    issue: {
+      number: issueNumber,
+      title: String(pr.title || '').slice(0, 1000),
+      body: String(pr.body || '').slice(0, 50000),
+      html_url: pr.html_url || null,
+      comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
+      labels: []
+    },
+    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
+    sender: { login: run.trigger_user?.login || null }
   };
 }

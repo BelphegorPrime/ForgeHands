@@ -4,6 +4,8 @@ const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
+// Routes that count as a follow-up round of an issue (a review run does not).
+const ROUND_KINDS = new Set(['pull_request', 'ci_failure']);
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data) {
@@ -75,9 +77,12 @@ export class Dispatcher {
     const label = this.pickLabel(event);
     if (!label) return { status: 'duplicate_job' };
     if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
-    const key = this.issueKey(event) + ':' + label;
-    if (this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
-    if (event.pull_request && this.rounds(event) >= this.config.maxRounds) {
+    // A CI outcome belongs to one commit: the same commit starts one run, whatever the outcome of each workflow.
+    const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
+    if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
+    const kind = this.config.routes.get(label).kind;
+    if (kind === 'ci_success' && !(await this.commitGreen(event))) return { status: 'ci_not_green' };
+    if (event.pull_request && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
       await this.roundsUsedUp(event);
       return { status: 'rounds_exceeded' };
     }
@@ -95,23 +100,46 @@ export class Dispatcher {
   // Follow-up runs (pull request routes) already made for the issue of this event.
   rounds(event) {
     const base = this.issueKey(event) + ':';
-    return this.jobs.list().filter((job) => job.key.startsWith(base) && this.config.routes.get(job.label)?.kind === 'pull_request'
+    return this.jobs.list().filter((job) => job.key.startsWith(base) && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
+  }
+
+  // One Forgejo call as the configured Forgejo user (null body for none).
+  async forgejoCall(event, method, path, body) {
+    const { url, token } = this.config.forgejo;
+    const response = await this.send(url + '/api/v1/repos/' + event.repository.full_name + path, {
+      method,
+      headers: { authorization: 'token ' + token, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+      redirect: 'error'
+    });
+    if (!response.ok) throw new Error(method + ' ' + path + ' -> HTTP ' + response.status);
+    return response.json().catch(() => null);
+  }
+
+  // Forgejo sends one event per finished workflow run. All workflows of the commit have to be green: the combined commit
+  // status says so. Without Forgejo access ForgeHands cannot tell and starts no review.
+  async commitGreen(event) {
+    if (!this.config.forgejo) {
+      this.logger.error('ci success of ' + this.issueKey(event) + ' ignored: FORGEJO_URL and FORGEJO_TOKEN are needed to check the commit status');
+      return false;
+    }
+    try {
+      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(event.ci.commit_sha) + '/status');
+      return status?.state === 'success' && status.total_count > 0;
+    } catch (error) {
+      this.logger.error('commit status failed:', error.message);
+      return false;
+    }
   }
 
   // The rounds are used up: say so on the pull request and mark it for a human. Best effort, a failure is only logged.
   async roundsUsedUp(event) {
     const { number } = event.pull_request;
     this.logger.error(this.issueKey(event) + ': ' + this.config.maxRounds + ' rounds used up, not starting another');
-    const forgejo = this.config.forgejo;
-    if (!forgejo) return;
-    const base = forgejo.url + '/api/v1/repos/' + event.repository.full_name;
-    const headers = { authorization: 'token ' + forgejo.token, 'content-type': 'application/json' };
-    const call = async (method, path, body) => {
-      const response = await this.send(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(this.config.timeoutMs), redirect: 'error' });
-      if (!response.ok) throw new Error(method + ' ' + path + ' -> HTTP ' + response.status);
-      return response.json().catch(() => null);
-    };
+    if (!this.config.forgejo) return;
+    const call = (method, path, body) => this.forgejoCall(event, method, path, body);
     try {
       await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + this.config.maxRounds + ' follow-up rounds for issue #' + event.issue.number + ' are used up. A human has to look at this pull request now.' });
       const known = await call('GET', '/labels?limit=100');
@@ -187,7 +215,7 @@ export class Dispatcher {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: route.profile,
       max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}) },
+      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
