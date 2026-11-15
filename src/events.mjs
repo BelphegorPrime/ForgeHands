@@ -5,6 +5,7 @@
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
 export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '' } = {}) {
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved);
+  if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
   const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
@@ -145,5 +146,21 @@ function normalizeCiRun(event, payload, allowedRepos, ci) {
     pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
     ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
     sender: { login: run.trigger_user?.login || null }
+  };
+}
+
+// A closed issue: the issues that depend on it may be ready now (see the dispatcher).
+function normalizeClosed(payload, allowedRepos) {
+  const fullName = payload.repository?.full_name;
+  const issue = payload.issue;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  if (!issue || !Number.isSafeInteger(issue.number) || issue.number <= 0) return null;
+  return {
+    type: 'issues.closed',
+    source: 'forgejo',
+    action: 'closed',
+    repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: payload.repository.default_branch || null },
+    issue: { number: issue.number, title: String(issue.title || '').slice(0, 1000), body: '', html_url: issue.html_url || null, comments: 0, labels: [] },
+    sender: { login: payload.sender?.login || null }
   };
 }

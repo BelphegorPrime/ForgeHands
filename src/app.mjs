@@ -65,7 +65,9 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     normalized.delivery_id = id;
     if (config.mode === 'direct') {
       try {
-        const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher.approve(normalized) } : await dispatcher.enqueue(normalized);
+        const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher.approve(normalized) }
+          : normalized.type === 'issues.closed' ? { status: await dispatcher.onClosed(normalized) }
+          : await dispatcher.enqueue(normalized);
         remember();
         await store.mark(key);
         return json(res, 202, { status: result.status, delivery_id: id });

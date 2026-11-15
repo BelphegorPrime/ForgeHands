@@ -41,7 +41,7 @@ function parseRoutes(text) {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100),
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: ['pull_request', 'ci_failure', 'ci_success'].includes(route.on) ? route.on : 'issue'
+      kind: ['pull_request', 'ci_failure', 'ci_success', 'epic_done'].includes(route.on) ? route.on : 'issue'
     });
   }
   return routes;
@@ -155,6 +155,8 @@ export function loadConfig(env = process.env) {
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
     approvedLabel: env.APPROVED_LABEL || 'ai:approved',
+    // The label that marks an epic: when its last dependency closes the route "on": "epic_done" reviews it.
+    epicLabel: env.EPIC_LABEL || 'ai:plan',
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };

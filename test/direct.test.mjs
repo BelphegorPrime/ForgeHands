@@ -940,3 +940,130 @@ test('a paused conversation frees its slot and the issue', async () => {
   assert.equal(job.result, 'paused');
   assert.equal(jobs.list(true).length, 0);
 });
+
+// ---- epic flow: issues wait for their dependencies, an epic is reviewed when its last dependency closes
+const withEpic = (extra = {}) => ({
+  LABEL_ROUTES: JSON.stringify({
+    'ai:ready': { profile: WORKER, tier: 'free' },
+    'epic:done': { profile: REVIEWER, tier: 'strong', max_iterations: 40, on: 'epic_done' }
+  }),
+  ...extra
+});
+async function buildEpic(routes, extra = {}) {
+  const config = loadConfig(env(withEpic(extra)));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const forgejo = fakeForgejo(routes);
+  const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
+  return { config, jobs, forgejo, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+const issue = (number, state, extra = {}) => ({ number, state, title: 'Sub ' + number, labels: [], ...extra });
+const closedEvent = (number) => normalizeEvent('issues', { action: 'closed', repository: { full_name: repo }, issue: { number }, sender: { login: 'marcel' } }, new Set([repo]), ['ai:ready'], {});
+
+test('a closed issue becomes an event, unless the repository is not allowed', () => {
+  assert.equal(closedEvent(7).type, 'issues.closed');
+  assert.equal(closedEvent(7).issue.number, 7);
+  assert.equal(normalizeEvent('issues', { action: 'closed', repository: { full_name: 'other/repo' }, issue: { number: 7 } }, new Set([repo]), ['ai:ready'], {}), null);
+  assert.equal(normalizeEvent('issues', { action: 'closed', repository: { full_name: repo }, issue: {} }, new Set([repo]), ['ai:ready'], {}), null);
+});
+
+test('an issue with open dependencies waits instead of starting', async () => {
+  const { dispatcher, jobs } = await buildEpic({ ['GET ' + API + '/issues/2/dependencies']: [issue(1, 'open'), issue(9, 'closed')] });
+  assert.deepEqual(await dispatcher.enqueue(event('ai:ready', 2)), { status: 'waiting' });
+  await dispatcher.tick();
+  assert.equal(starts().length, 0);
+  assert.equal(jobs.list()[0].status, 'waiting');
+  assert.deepEqual(jobs.list()[0].waiting_for, [1]);
+  assert.equal((await dispatcher.enqueue(event('ai:ready', 2))).status, 'duplicate_job');
+});
+
+test('an issue without open dependencies starts as before', async () => {
+  const { dispatcher } = await buildEpic({ ['GET ' + API + '/issues/2/dependencies']: [issue(1, 'closed')] });
+  assert.equal((await dispatcher.enqueue(event('ai:ready', 2))).status, 'queued');
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+});
+
+test('the last dependency closing starts the waiting issue; another open one keeps it waiting', async () => {
+  let still = [issue(1, 'closed'), issue(3, 'open')];
+  const routes = {
+    ['GET ' + API + '/issues/2/dependencies']: () => still,
+    ['GET ' + API + '/issues/1/blocks']: [issue(2, 'open')]
+  };
+  const { dispatcher, jobs } = await buildEpic(routes);
+  jobs.add({ key: 'owner/hello#2:ai:ready', label: 'ai:ready', event: { ...event('ai:ready', 2), label: 'ai:ready' }, status: 'waiting', waiting_for: [1, 3], created: clock });
+  assert.equal(await dispatcher.onClosed(closedEvent(1)), 'nothing_ready');
+  assert.equal(jobs.list()[0].status, 'waiting');
+  still = [issue(1, 'closed'), issue(3, 'closed')];
+  assert.equal(await dispatcher.onClosed(closedEvent(1)), 'started #2');
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+  assert.equal(starts()[0].body.agent_profile_id, WORKER);
+});
+
+test('an epic is reviewed when its last dependency closes, once, with its sub-issues in the prompt', async () => {
+  const epic = issue(10, 'open', { title: 'Epic', body: 'Make X work', labels: [{ name: 'ai:plan' }], html_url: 'https://forge.example/owner/hello/issues/10' });
+  const routes = {
+    ['GET ' + API + '/issues/11/blocks']: [epic],
+    ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed', { title: 'Part one' }), issue(12, 'closed', { title: 'Part two' })]
+  };
+  const { dispatcher, jobs } = await buildEpic(routes);
+  assert.equal(await dispatcher.onClosed(closedEvent(11)), 'epic #10 review');
+  await dispatcher.tick();
+  const { body } = starts()[0];
+  assert.equal(body.agent_profile_id, REVIEWER);
+  assert.equal(body.max_iterations, 40);
+  assert.deepEqual(body.tags, { source: 'forgehands', issue: '10', epic: 'done' });
+  const text = body.initial_message.content[0].text;
+  assert.match(text, /epic #10/);
+  assert.match(text, /Every sub-issue is closed: #11 Part one; #12 Part two/);
+  assert.match(text, /You do not change code and you do not create issues/);
+  assert.match(text, /close the epic/);
+  assert.match(text, /Make X work/);
+  assert.equal(jobs.list()[0].key, 'owner/hello#10:epic:done');
+  assert.equal(await dispatcher.onClosed(closedEvent(11)), 'nothing_ready'); // the review is already queued or running
+});
+
+test('epic review needs a route, the epic label, an open epic and Forgejo access', async () => {
+  const epic = issue(10, 'open', { labels: [{ name: 'ai:plan' }] });
+  const base = { ['GET ' + API + '/issues/11/blocks']: [epic], ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed')] };
+  const noLabel = await buildEpic({ ...base, ['GET ' + API + '/issues/11/blocks']: [issue(10, 'open', { labels: [{ name: 'bug' }] })] });
+  assert.equal(await noLabel.dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
+  const closed = await buildEpic({ ...base, ['GET ' + API + '/issues/11/blocks']: [issue(10, 'closed', { labels: [{ name: 'ai:plan' }] })] });
+  assert.equal(await closed.dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
+  const noRoute = await buildEpic(base);
+  noRoute.config.routes.delete('epic:done');
+  assert.equal(await noRoute.dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
+  const noAccess = await buildEpic(base);
+  noAccess.config.forgejo = null;
+  assert.equal(await noAccess.dispatcher.onClosed(closedEvent(11)), 'no_forgejo_access');
+  const failing = await buildEpic({});
+  assert.equal(await failing.dispatcher.onClosed(closedEvent(11)), 'blocks_unknown');
+  assert.equal(starts().length, 0);
+});
+
+test('the webhook turns a closed issue into the start of what waited for it', async () => {
+  const routes = { ['GET ' + API + '/issues/1/blocks']: [issue(2, 'open')], ['GET ' + API + '/issues/2/dependencies']: [issue(1, 'closed')] };
+  const { config, jobs, dispatcher } = await buildEpic(routes);
+  jobs.add({ key: 'owner/hello#2:ai:ready', label: 'ai:ready', event: { ...event('ai:ready', 2), label: 'ai:ready' }, status: 'waiting', waiting_for: [1], created: clock });
+  const store = new DeliveryStore(config.dataFile);
+  await store.load();
+  const server = createApp(config, store, undefined, quiet, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const raw = Buffer.from(JSON.stringify({ action: 'closed', repository: { full_name: repo }, issue: { number: 1 }, sender: { login: 'marcel' } }));
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/webhooks/forgejo', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forgejo-event': 'issues', 'x-forgejo-delivery': 'd-closed-1',
+        'x-forgejo-signature': createHmac('sha256', config.forgejoSecret).update(raw).digest('hex') },
+      body: raw
+    });
+    assert.equal(response.status, 202);
+    assert.equal((await response.json()).status, 'started #2');
+    await dispatcher.tick();
+    assert.equal(starts().length, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
