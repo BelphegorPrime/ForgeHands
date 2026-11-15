@@ -918,3 +918,16 @@ test('no CI-triggered run while an agent still works on the issue', async () => 
   await dispatcher.tick();
   assert.equal((await dispatcher.enqueue(ciEvent('failure'))).status, 'queued');
 });
+
+test('a paused conversation frees its slot and the issue', async () => {
+  const { dispatcher, jobs } = await build(withChanges());
+  assert.equal((await dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
+  await dispatcher.tick();
+  const job = jobs.list()[0];
+  assert.equal(job.status, 'running');
+  states[job.conversation_id] = 'paused';
+  await dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(jobs.list(true).length, 0);
+});

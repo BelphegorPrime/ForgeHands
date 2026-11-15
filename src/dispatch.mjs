@@ -2,7 +2,8 @@ import { buildPrompt } from './prompt.mjs';
 import { forgejoCall } from './forgejo.mjs';
 import { Merger } from './merge.mjs';
 
-const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted']);
+// `paused` counts: someone stopped the run on purpose (POST /pause), it does not end by itself and must not hold its slot or block the issue.
+const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
