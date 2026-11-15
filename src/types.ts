@@ -62,6 +62,7 @@ export interface DirectConfig extends BaseConfig {
   blockedLabel: string;
   updateBranches: boolean;
   branchUpdateDelayMs: number;
+  branchUpdateMinIntervalMs: number;
   minReviewChars: number;
   archiveAfterDays: number;
   humanLogin: string | null;

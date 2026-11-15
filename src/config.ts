@@ -174,6 +174,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     updateBranches: env.UPDATE_BRANCHES !== '0',
     // Wait this long after the last push to the default branch before looking at the pull requests (a merge is often followed by another).
     branchUpdateDelayMs: positiveInt(env.BRANCH_UPDATE_DELAY_SECONDS, 60, 'BRANCH_UPDATE_DELAY_SECONDS', 3600) * 1000,
+    // At most one update of a pull request branch in this many minutes, however often the default branch moves.
+    branchUpdateMinIntervalMs: positiveInt(env.BRANCH_UPDATE_MIN_INTERVAL_MINUTES, 30, 'BRANCH_UPDATE_MIN_INTERVAL_MINUTES', 1440) * 60000,
     // A merge needs a review comment for the current commit: it says "Verdict: OK" within its first 300 characters and has at least this
     // many characters (evidence, not a one-liner). A label alone is not a review.
     minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),

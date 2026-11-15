@@ -1684,6 +1684,66 @@ test('a pull request with a NOT OK review is still brought up to date, one an ag
   assert.deepEqual(updates(forgejo), ['42']);
 });
 
+const filesRoutes = (number, mine, main, commits = 1) => ({ ['GET ' + API + '/compare/' + OLD_BASE + '...' + TIP]: { total_commits: commits, files: main.map((filename) => ({ filename })) },
+  ['GET ' + API + '/pulls/' + number + '/files']: mine.map((filename) => ({ filename })) });
+
+test('a pull request whose files the default branch did not touch is left alone: no new commit, no cancelled CI', async () => {
+  const routes = { ...noReview(34), ...filesRoutes(34, ['src/a.ts'], ['docs/b.md']), ['POST ' + API + '/pulls/34/update']: {} };
+  const { dispatcher, forgejo } = await buildBranches([pull(34)], routes);
+  dispatcher.onMainMoved(movedEvent());
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), []);
+  // the same file (or a rename of it) on both sides: updated
+  for (const mine of [['src/a.ts'], ['x/new.ts']]) {
+    const main = mine[0] === 'x/new.ts' ? [{ filename: 'y.ts', previous_filename: 'x/new.ts' }] : [{ filename: 'src/a.ts' }];
+    const overlap = await buildBranches([pull(34)], { ...noReview(34), ...filesRoutes(34, mine, []), ['GET ' + API + '/compare/' + OLD_BASE + '...' + TIP]: { total_commits: 1, files: main }, ['POST ' + API + '/pulls/34/update']: {} });
+    overlap.dispatcher.onMainMoved(movedEvent());
+    await afterDelay(overlap.dispatcher);
+    assert.deepEqual(updates(overlap.forgejo), ['34'], mine[0]);
+  }
+});
+
+test('when the files cannot be compared reliably the pull request is updated as before', async () => {
+  for (const routes of [filesRoutes(34, ['src/a.ts'], [], 3), { ...filesRoutes(34, ['src/a.ts'], ['docs/b.md']), ['GET ' + API + '/pulls/34/files']: Array.from({ length: 100 }, (_, i) => ({ filename: 'f' + i })) }, {}]) {
+    const { dispatcher, forgejo } = await buildBranches([pull(34)], { ...noReview(34), ...routes, ['POST ' + API + '/pulls/34/update']: {} });
+    dispatcher.onMainMoved(movedEvent());
+    await afterDelay(dispatcher);
+    assert.deepEqual(updates(forgejo), ['34']);
+  }
+});
+
+test('while CI runs on the head commit the update is postponed and tried again later', async () => {
+  let state = 'pending';
+  const routes = { ...noReview(34), ...filesRoutes(34, ['a'], ['a']), ['GET ' + API + '/commits/cafe340000/status']: () => ({ state, total_count: 1 }), ['POST ' + API + '/pulls/34/update']: {} };
+  const { dispatcher, forgejo } = await buildBranches([pull(34)], routes);
+  dispatcher.onMainMoved(movedEvent());
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), []);
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), []);                  // still running: looked at again, still postponed
+  state = 'success';                                       // CI is done
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), ['34']);
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), ['34']);              // nothing left to look at
+});
+
+test('a pull request is updated at most once per BRANCH_UPDATE_MIN_INTERVAL_MINUTES, however often main moves', async () => {
+  const routes = { ...noReview(34), ...filesRoutes(34, ['a'], ['a']), ['POST ' + API + '/pulls/34/update']: {} };
+  const { dispatcher, forgejo, config } = await buildBranches([pull(34)], routes);
+  assert.equal(config.branchUpdateMinIntervalMs, 30 * 60000);
+  dispatcher.onMainMoved(movedEvent());
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), ['34']);
+  dispatcher.onMainMoved(movedEvent());
+  await afterDelay(dispatcher);
+  assert.deepEqual(updates(forgejo), ['34']);              // too soon
+  clock += 30 * 60000;
+  await dispatcher.tick();                                  // the postponed look happens by itself
+  assert.deepEqual(updates(forgejo), ['34', '34']);
+  assert.throws(() => loadConfig(env(withBranches({ BRANCH_UPDATE_MIN_INTERVAL_MINUTES: '0' }))), /BRANCH_UPDATE_MIN_INTERVAL_MINUTES/);
+});
+
 test('a rebase that conflicts becomes a conflict round of the worker, once per moved default branch', async () => {
   const routes = { ...noReview(34), ['POST ' + API + '/pulls/34/update']: { __status: 409 }, ['GET ' + API + '/issues/34/labels']: [] };
   const { dispatcher, jobs, forgejo } = await buildBranches([pull(34)], routes);
