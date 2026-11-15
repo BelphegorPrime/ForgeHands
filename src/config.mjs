@@ -41,7 +41,7 @@ function parseRoutes(text) {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100),
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: ['pull_request', 'ci_failure', 'ci_success', 'epic_done'].includes(route.on) ? route.on : 'issue'
+      kind: ['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict'].includes(route.on) ? route.on : 'issue'
     });
   }
   return routes;
@@ -168,6 +168,11 @@ export function loadConfig(env = process.env) {
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    // When the default branch moves, open agent pull requests that fell behind and have no review or approval yet are brought up to
+    // date (Forgejo's update, rebase style); one that conflicts gets a conflict round (route "on": "conflict"). 0 switches it off.
+    updateBranches: env.UPDATE_BRANCHES !== '0',
+    // Wait this long after the last push to the default branch before looking at the pull requests (a merge is often followed by another).
+    branchUpdateDelayMs: positiveInt(env.BRANCH_UPDATE_DELAY_SECONDS, 60, 'BRANCH_UPDATE_DELAY_SECONDS', 3600) * 1000,
     // A merge needs a review comment for the current commit: it says "Verdict: OK" within its first 300 characters and has at least this
     // many characters (evidence, not a one-liner). A label alone is not a review.
     minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),

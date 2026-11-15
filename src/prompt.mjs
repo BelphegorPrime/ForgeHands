@@ -25,11 +25,11 @@ const MARKED = (issue) => [
 // after a failed CI run, and the review after a green one.
 function buildPullRequestPrompt(event, config) {
   const { repository, issue, label, sender, pull_request: pr, ci } = event;
-  const mode = event.type === 'ci.failure' ? 'fix' : event.type === 'ci.success' ? 'review' : 'round';
+  const mode = event.type === 'ci.failure' ? 'fix' : event.type === 'ci.success' ? 'review' : event.type === 'pull_request.conflict' ? 'conflict' : 'round';
   const trusted = trustedLogins(event, config);
   const api = '$FORGEJO_URL/api/v1/repos/' + repository.full_name;
   // A directory of its own per run: the worker's checkout of this issue is still there and a clone into it fails.
-  const suffix = mode === 'review' ? '-review-' + ci.commit_sha.slice(0, 8) : mode === 'fix' ? '-fix-' + ci.commit_sha.slice(0, 8) : '-round-' + String(event.delivery_id || Date.now()).replace(/[^\w]/g, '').slice(0, 8);
+  const suffix = mode === 'review' ? '-review-' + ci.commit_sha.slice(0, 8) : mode === 'fix' ? '-fix-' + ci.commit_sha.slice(0, 8) : mode === 'conflict' ? '-conflict-' + String(event.base_sha || '').slice(0, 8) : '-round-' + String(event.delivery_id || Date.now()).replace(/[^\w]/g, '').slice(0, 8);
   const dir = config.workspaceDir.replace(/\/$/, '') + '/' + repository.full_name.replace('/', '-') + '-issue-' + issue.number + suffix;
   const where = 'Forgejo pull request #' + pr.number + ' in ' + repository.full_name + (pr.html_url ? ' (' + pr.html_url + ')' : '') + ', the work on issue #' + issue.number + '.';
   const clone = repository.clone_url
@@ -53,6 +53,20 @@ function buildPullRequestPrompt(event, config) {
       '3. Only after you have READ the results of the commands of steps 1 and 2, write ONE comment on the pull request (POST ' + api + '/issues/' + pr.number + '/comments). It BEGINS with the line `## Verdict: OK` or `## Verdict: NOT OK` and then gives the evidence: per acceptance criterion met or not, with file and line, and the checks you ran with their result. ForgeHands merges only on a comment like this for the current commit, so a label without it is worth nothing. Do not send the commands of several steps in one turn: you need each output before you can judge.',
       '4. If it is acceptable, add the label ' + config.approvedLabel + ' to the pull request (GET ' + api + '/labels for its id, then POST ' + api + '/issues/' + pr.number + '/labels with {"labels":[<id>]}). If it needs changes, list them concretely in the comment and add the label ' + changes + ' instead. Add exactly one of the two.',
       'You do not push, do not edit files and do not merge. Use at most 25 tool calls.',
+      ...MARKED(issue)
+    ].join('\n');
+  }
+  if (mode === 'conflict') {
+    const branch = repository.default_branch || 'the default branch';
+    return [
+      where + ' Its branch conflicts with ' + branch + ' (which moved to ' + String(event.base_sha || '').slice(0, 8) + '). Resolve the conflict.',
+      clone, never,
+      'Do this, in order:',
+      '1. Check out the branch ' + pr.head_ref + ' and fetch: `git fetch origin`.',
+      '2. Rebase the branch onto the default branch: `git rebase origin/' + branch + '`. This is the one kind of run in which a rebase and a force push are allowed. Resolve every conflict so that the purpose of the pull request stays (its acceptance criteria are in the issue: GET ' + api + '/issues/' + issue.number + ') and what the default branch brought in is kept: never resolve by taking one side wholesale. A generated file or a lock file is regenerated with the repository\'s own command, not edited between the markers.',
+      '3. Run the checks the repository documents (AGENTS.md / CONTRIBUTING.md / the workflow files) until they pass. If a check fails because of what the default branch brought in and not because of this pull request, say so in the comment.',
+      '4. Push ONCE: `git push --force-with-lease origin ' + pr.head_ref + '` (never a plain `--force`). Never open another pull request or branch for this issue.',
+      '5. Comment on the pull request which files conflicted and how you resolved each, so that the reviewer can judge it. If the two sides contradict each other and you cannot resolve it safely, do not guess and do not push: say why in a comment and stop.',
       ...MARKED(issue)
     ].join('\n');
   }

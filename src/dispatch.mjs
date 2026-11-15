@@ -8,7 +8,7 @@ const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 // Routes that count as a follow-up round of an issue (a review run does not).
-const ROUND_KINDS = new Set(['pull_request', 'ci_failure']);
+const ROUND_KINDS = new Set(['pull_request', 'ci_failure', 'conflict']);
 const MAX_RATE_LIMIT_RETRIES = 12;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
@@ -30,6 +30,7 @@ export class Dispatcher {
     this.current = null;
     this.timer = null;
     this.merger = new Merger(config, send, logger);
+    this.mainMoved = new Map(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
     this.cooldowns = new Map(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
   }
 
@@ -359,8 +360,78 @@ export class Dispatcher {
       if (!this.hasRoom(job, now)) continue;
       if (await this.startJob(job, now)) changed = true;
     }
+    if (await this.refreshMoved(now)) changed = true;
     if (await this.archiveOld(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
+  }
+
+  // The default branch of a repository moved. Remember the newest push and look at the pull requests once it has been quiet for a while.
+  onMainMoved(event) {
+    if (!this.config.updateBranches || !this.config.forgejo) return 'branch_updates_off';
+    this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
+    return 'scheduled';
+  }
+
+  async refreshMoved(now) {
+    let changed = false;
+    for (const [repository, moved] of [...this.mainMoved]) {
+      if (now - moved.at < this.config.branchUpdateDelayMs) continue;
+      this.mainMoved.delete(repository);
+      try { if (await this.refreshBranches(moved.event)) changed = true; }
+      catch (error) { this.logger.error('could not look at the pull requests of ' + repository + ':', error.message); }
+    }
+    return changed;
+  }
+
+  // Open agent pull requests (branch ai/issue-<n>) that fell behind the default branch. What a rebase throws away is a review, so only a
+  // pull request with neither an approval nor an OK review for its current commit is brought up to date, and only when no agent works on
+  // its issue. A rebase that conflicts becomes a conflict round of the worker. Approved and reviewed pull requests are left alone: they
+  // merge as they are, and a conflict shows when the merge is tried.
+  async refreshBranches(event) {
+    const tip = event.after;
+    const base = event.repository.full_name.toLowerCase() + '#';
+    const pulls = await this.forgejoCall(event, 'GET', '/pulls?state=open&limit=50');
+    let changed = false;
+    for (const pr of Array.isArray(pulls) ? pulls : []) {
+      const match = /^ai\/issue-(\d+)$/.exec(pr.head?.ref || '');
+      if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) continue;
+      if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) continue;
+      const issue = Number(match[1]);
+      if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) continue;
+      const labels = (pr.labels || []).map((label) => label.name);
+      if (labels.includes(this.config.blockedLabel) || labels.includes(this.config.approvedLabel)) continue;
+      const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+        issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
+      let reviewed = false;
+      try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; }
+      if (reviewed) continue;
+      try {
+        await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
+        this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
+      } catch (error) {
+        if (!/HTTP 409\b/.test(error.message)) { this.logger.error('could not update #' + pr.number + ':', error.message); continue; }
+        if (await this.startConflictRound(prEvent, tip)) changed = true;
+      }
+    }
+    return changed;
+  }
+
+  // The branch of a pull request conflicts with the default branch: a round of the worker resolves it (rebase and one force push are
+  // allowed in this round and only here). Counts as a round; without a conflict route, or when the rounds are used up, a human is called.
+  async startConflictRound(event, tip) {
+    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'conflict')?.[0];
+    const number = event.pull_request.number;
+    if (!route) {
+      await this.markForHuman(event, 'ForgeHands: the pull request conflicts with ' + (event.repository.default_branch || 'the default branch') + ' and no conflict round is configured. A human has to resolve it.');
+      return false;
+    }
+    const key = this.issueKey(event) + ':' + route + ':' + tip.slice(0, 8);
+    if (this.jobs.list().some((job) => job.key === key)) return false;
+    if (this.rounds(event) >= this.config.maxRounds) { await this.roundsUsedUp(event); return false; }
+    this.jobs.add({ key, label: route, status: 'queued', created: this.now(), event: { ...event, type: 'pull_request.conflict', label: route, base_sha: tip } });
+    await this.merger.clearApproval(event);
+    this.logger.error(this.issueKey(event) + ': pull request #' + number + ' conflicts with the default branch, conflict round queued');
+    return true;
   }
 
   // Archive the conversations of runs that ended a while ago: the tag archived=true is added, every other tag stays, so the runs can still
@@ -418,7 +489,7 @@ export class Dispatcher {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: route.profile,
       max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}) },
+      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
