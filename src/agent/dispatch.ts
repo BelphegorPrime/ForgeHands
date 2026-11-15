@@ -32,6 +32,7 @@ export class Dispatcher {
   timer: NodeJS.Timeout | undefined;
   merger: Merger;
   lastArchive = 0;
+  lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
 
@@ -408,6 +409,7 @@ export class Dispatcher {
     const base = event.repository.full_name.toLowerCase() + '#';
     const pulls = await this.forgejoCall(event, 'GET', '/pulls?state=open&limit=50');
     let changed = false;
+    let deferred = false;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
       const match = /^ai\/issue-(\d+)$/.exec(pr.head?.ref || '');
       if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) continue;
@@ -421,6 +423,12 @@ export class Dispatcher {
       let reviewed = false;
       try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; }
       if (reviewed) continue;
+      // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
+      // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
+      if (!(await this.touchesSameFiles(event, pr, tip))) continue;
+      const hold = await this.updateHold(event, pr);
+      if (hold) { deferred = true; this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); continue; }
+      this.lastUpdate.set(base + pr.number, this.now());
       try {
         await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
         this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
@@ -429,7 +437,38 @@ export class Dispatcher {
         if (await this.startConflictRound(prEvent, tip)) changed = true;
       }
     }
+    // Look again later at what was postponed (the CI run ended, the cooldown passed).
+    if (deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
     return changed;
+  }
+
+  // Can the rebase of this pull request conflict? Only if the default branch changed a file since the merge base that the pull request
+  // changes too. Anything unclear (a failing call, a list that may be cut off) counts as yes.
+  async touchesSameFiles(event: PushEvent, pr: Json, tip: string): Promise<boolean> {
+    try {
+      const compare = await this.forgejoCall(event, 'GET', '/compare/' + pr.merge_base + '...' + tip);
+      const ours = await this.forgejoCall(event, 'GET', '/pulls/' + pr.number + '/files?limit=100');
+      if (!Array.isArray(compare?.files) || !Array.isArray(ours) || ours.length >= 100 || (compare.total_commits > 0 && compare.files.length === 0)) return true;
+      const names = (list: Json[]) => list.flatMap((file) => [file.filename, file.previous_filename]).filter(Boolean);
+      const theirs = new Set(names(compare.files));
+      return names(ours).some((name) => theirs.has(name));
+    } catch (error) {
+      this.logger.error('could not compare #' + pr.number + ' with the default branch:', error.message);
+      return true;
+    }
+  }
+
+  // Why the update of this pull request has to wait, or null: CI still runs on its head commit, or its branch was updated recently.
+  async updateHold(event: PushEvent, pr: Json): Promise<string | null> {
+    const last = this.lastUpdate.get(event.repository.full_name.toLowerCase() + '#' + pr.number);
+    if (last && this.now() - last < this.config.branchUpdateMinIntervalMs) return 'cooldown';
+    try {
+      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(pr.head.sha) + '/status');
+      if (status?.state === 'pending' && status.total_count > 0) return 'CI is still running';
+    } catch (error) {
+      this.logger.error('could not read the status of #' + pr.number + ':', error.message);
+    }
+    return null;
   }
 
   // The branch of a pull request conflicts with the default branch: a round of the worker resolves it (rebase and one force push are
