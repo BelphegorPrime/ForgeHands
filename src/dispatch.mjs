@@ -31,12 +31,15 @@ export class Dispatcher {
 
   static labelsOf(payload, allowedRepos) {
     const name = payload?.repository?.full_name;
-    const number = payload?.issue?.number;
+    // A pull request has its own labels, kept under its own key.
+    const pull = payload?.pull_request && !payload?.issue;
+    const subject = pull ? payload.pull_request : payload?.issue;
+    const number = subject?.number;
     if (typeof name !== 'string' || !allowedRepos.has(name.toLowerCase()) || !Number.isSafeInteger(number)) return null;
-    if (!Array.isArray(payload.issue.labels)) return null;
+    if (!Array.isArray(subject.labels)) return null;
     return {
-      key: name.toLowerCase() + '#' + number,
-      labels: payload.issue.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((value) => typeof value === 'string')
+      key: name.toLowerCase() + (pull ? '#pr' : '#') + number,
+      labels: subject.labels.map((entry) => typeof entry === 'string' ? entry : entry?.name).filter((value) => typeof value === 'string')
     };
   }
 
@@ -61,7 +64,8 @@ export class Dispatcher {
   pickLabel(event) {
     if (!event.label_event) return event.label;
     const base = this.issueKey(event);
-    const present = [...this.config.routes.keys()].filter((label) => event.issue.labels.includes(label));
+    const kind = event.pull_request ? 'pull_request' : 'issue';
+    const present = [...this.config.routes.keys()].filter((label) => (this.config.routes.get(label)?.kind || 'issue') === kind && event.issue.labels.includes(label));
     const previous = event.previous_labels;
     if (Array.isArray(previous)) return present.find((label) => !previous.includes(label));
     return present.find((label) => !this.jobs.list().some((job) => job.key === base + ':' + label));
@@ -73,6 +77,10 @@ export class Dispatcher {
     if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
     const key = this.issueKey(event) + ':' + label;
     if (this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
+    if (event.pull_request && this.rounds(event) >= this.config.maxRounds) {
+      await this.roundsUsedUp(event);
+      return { status: 'rounds_exceeded' };
+    }
     const job = this.jobs.add({ key, label, event: { ...event, label }, status: 'queued', created: this.now() });
     try {
       await this.jobs.persist(this.now());
@@ -82,6 +90,37 @@ export class Dispatcher {
     }
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
+  }
+
+  // Follow-up runs (pull request routes) already made for the issue of this event.
+  rounds(event) {
+    const base = this.issueKey(event) + ':';
+    return this.jobs.list().filter((job) => job.key.startsWith(base) && this.config.routes.get(job.label)?.kind === 'pull_request'
+      && (job.started || job.status === 'queued' || job.status === 'running')).length;
+  }
+
+  // The rounds are used up: say so on the pull request and mark it for a human. Best effort, a failure is only logged.
+  async roundsUsedUp(event) {
+    const { number } = event.pull_request;
+    this.logger.error(this.issueKey(event) + ': ' + this.config.maxRounds + ' rounds used up, not starting another');
+    const forgejo = this.config.forgejo;
+    if (!forgejo) return;
+    const base = forgejo.url + '/api/v1/repos/' + event.repository.full_name;
+    const headers = { authorization: 'token ' + forgejo.token, 'content-type': 'application/json' };
+    const call = async (method, path, body) => {
+      const response = await this.send(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(this.config.timeoutMs), redirect: 'error' });
+      if (!response.ok) throw new Error(method + ' ' + path + ' -> HTTP ' + response.status);
+      return response.json().catch(() => null);
+    };
+    try {
+      await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + this.config.maxRounds + ' follow-up rounds for issue #' + event.issue.number + ' are used up. A human has to look at this pull request now.' });
+      const known = await call('GET', '/labels?limit=100');
+      let label = (known || []).find((entry) => entry.name === this.config.blockedLabel);
+      if (!label) label = await call('POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
+      await call('POST', '/issues/' + number + '/labels', { labels: [label.id] });
+    } catch (error) {
+      this.logger.error('could not mark the pull request:', error.message);
+    }
   }
 
   start(intervalMs = this.config.pollMs) {
@@ -148,7 +187,7 @@ export class Dispatcher {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: route.profile,
       max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', issue: String(job.event.issue.number) },
+      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
