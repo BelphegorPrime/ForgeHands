@@ -3,7 +3,8 @@
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '' } = {}) {
+export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false } = {}) {
+  if (event === 'push') return pushes ? normalizePush(payload, allowedRepos) : null;
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci);
@@ -161,6 +162,22 @@ function normalizeClosed(payload, allowedRepos) {
     action: 'closed',
     repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: payload.repository.default_branch || null },
     issue: { number: issue.number, title: String(issue.title || '').slice(0, 1000), body: '', html_url: issue.html_url || null, comments: 0, labels: [] },
+    sender: { login: payload.sender?.login || null }
+  };
+}
+
+// A push to the default branch: the open pull requests may have fallen behind (see the dispatcher). Other branches and deletions do not count.
+function normalizePush(payload, allowedRepos) {
+  const fullName = payload?.repository?.full_name;
+  const branch = payload?.repository?.default_branch;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase()) || typeof branch !== 'string' || !branch) return null;
+  if (payload.ref !== 'refs/heads/' + branch) return null;
+  if (typeof payload.after !== 'string' || !/^[0-9a-f]{7,64}$/i.test(payload.after) || /^0+$/.test(payload.after)) return null;
+  return {
+    type: 'push.default',
+    source: 'forgejo',
+    repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: branch },
+    after: payload.after,
     sender: { login: payload.sender?.login || null }
   };
 }

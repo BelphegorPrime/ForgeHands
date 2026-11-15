@@ -58,7 +58,8 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
     const routeLabels = (kind) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
     const normalized = normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
-      approved: direct && config.mergePolicy.size ? config.approvedLabel : '' });
+      approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
+      pushes: direct && config.updateBranches });
     if (!normalized) { remember(); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
@@ -75,6 +76,7 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
       try {
         const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher.approve(normalized) }
           : normalized.type === 'issues.closed' ? { status: await dispatcher.onClosed(normalized) }
+          : normalized.type === 'push.default' ? { status: dispatcher.onMainMoved(normalized) }
           : await dispatcher.enqueue(normalized);
         remember();
         await store.mark(key);
