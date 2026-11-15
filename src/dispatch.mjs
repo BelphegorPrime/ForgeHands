@@ -9,6 +9,7 @@ const MAX_ATTEMPTS = 3;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 // Routes that count as a follow-up round of an issue (a review run does not).
 const ROUND_KINDS = new Set(['pull_request', 'ci_failure']);
+const MAX_RATE_LIMIT_RETRIES = 12;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data) {
@@ -29,6 +30,7 @@ export class Dispatcher {
     this.current = null;
     this.timer = null;
     this.merger = new Merger(config, send, logger);
+    this.cooldowns = new Map(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
   }
 
   issueKey(event) {
@@ -274,6 +276,22 @@ export class Dispatcher {
     }
   }
 
+  // How long (ms) until the quota is back, when the run ended with a rate limit error; null for any other failure.
+  async rateLimitWait(job) {
+    try {
+      const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id) + '/events/search?limit=10&sort_order=TIMESTAMP_DESC');
+      if (!response.ok) return null;
+      const items = (await response.json())?.items || [];
+      const error = items.find((item) => item?.kind === 'ConversationErrorEvent' && (item.code === 'LLMRateLimitError' || item.classification?.kind === 'rate_limit'));
+      if (!error) return null;
+      const seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(String(error.detail || ''))?.[1]) || 900;
+      return Math.min(Math.max(seconds, 60), 6 * 3600) * 1000;
+    } catch (error) {
+      this.logger.error('could not read the error of ' + job.key + ':', error.message);
+      return null;
+    }
+  }
+
   // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
   // for ever, green and unseen. Unless it moved on meanwhile, say so and hand it to a human.
   async checkVerdict(job) {
@@ -336,6 +354,7 @@ export class Dispatcher {
     const running = this.jobs.list('running');
     if (running.length >= this.config.maxConcurrent) return false;
     const route = this.config.routes.get(job.label);
+    if ((this.cooldowns.get(route.tier) || 0) > now) return false;
     const tierLimit = route.maxConcurrent ?? this.config.maxConcurrentPerTier;
     if (running.filter((other) => this.config.routes.get(other.label)?.tier === route.tier).length >= tierLimit) return false;
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
@@ -396,6 +415,18 @@ export class Dispatcher {
       }
     } catch (error) {
       this.logger.error('polling ' + job.key + ' failed:', error.message);
+    }
+    // The model ran out of quota (the gateway answers with a rate limit and when it resets): not the pull request's fault and no reason
+    // to call a human. Hold the tier back until then and run this job again afterwards.
+    if (state === 'error' && (job.rate_limited || 0) < MAX_RATE_LIMIT_RETRIES) {
+      const wait = await this.rateLimitWait(job);
+      if (wait) {
+        const until = now + wait;
+        this.cooldowns.set(this.config.routes.get(job.label)?.tier, until);
+        this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
+        Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, retry_at: until });
+        return true;
+      }
     }
     if (TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
