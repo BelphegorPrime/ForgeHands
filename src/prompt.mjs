@@ -27,7 +27,7 @@ export function buildPrompt(event, config) {
     'Before you start, in this order:',
     '1. Read the comments of the issue' + (issue.comments ? ' (' + issue.comments + ' so far)' : '') + ': GET ' + api + '/issues/' + issue.number + '/comments. They can refine or correct the task.',
     '2. If your role implements the issue (not planning or reviewing), look for earlier work: GET ' + api + '/pulls?state=all and find the pull request whose head branch is ai/issue-' + issue.number + '.',
-    '   - Open pull request: continue it. Check out that branch, read its reviews and review comments (GET ' + api + '/pulls/<number>/reviews and the comments of each review), fix what they ask, push to the SAME branch and comment on the pull request what you changed. Never open a second pull request or a second branch for this issue.',
+    '   - Open pull request: continue it. Check out that branch, read what was said about it: the reviews and their comments (GET ' + api + '/pulls/<number>/reviews and the comments of each review) and the comments in the conversation of the pull request (GET ' + api + '/issues/<number>/comments, the number of the pull request), fix what they ask, push to the SAME branch and comment on the pull request what you changed. Never open a second pull request or a second branch for this issue.',
     '   - Branch without a pull request: reuse the branch, then open the pull request as usual.',
     '   - Closed or merged pull request: stop and comment on the issue that the earlier pull request is closed.',
     trusted.length
