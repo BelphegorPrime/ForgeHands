@@ -44,6 +44,7 @@ export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready
       title: String(issue.title || '').slice(0, 1000),
       body: String(issue.body || '').slice(0, 50000),
       html_url: issue.html_url || null,
+      comments: Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0,
       labels: present
     },
     sender: { login: payload.sender?.login || null }

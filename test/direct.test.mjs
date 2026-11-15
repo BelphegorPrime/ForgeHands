@@ -10,6 +10,7 @@ import { JobStore } from '../src/jobs.mjs';
 import { Dispatcher } from '../src/dispatch.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { buildPrompt } from '../src/prompt.mjs';
+import { normalizeEvent } from '../src/events.mjs';
 
 const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -105,6 +106,30 @@ test('prompt marks issue text as untrusted and neutralises the end marker', () =
   assert.match(prompt, /untrusted user content/);
   assert.match(prompt, /\/projects\/owner-hello-issue-7/);
   assert.doesNotMatch(prompt, /FORGEJO_TOKEN=/);
+});
+
+test('prompt tells the agent to read comments, continue an existing pull request and whom to trust', () => {
+  const config = loadConfig(env({ ALLOWED_SENDERS: 'owner, Helper' }));
+  const prompt = buildPrompt(event('ai:ready', 7, { issue: { number: 7, title: 't', body: 'b', comments: 3, labels: [] } }), config);
+  assert.match(prompt, /issues\/7\/comments/);
+  assert.match(prompt, /\(3 so far\)/);
+  assert.match(prompt, /pulls\?state=all/);
+  assert.match(prompt, /ai\/issue-7/);
+  assert.match(prompt, /Never open a second pull request/);
+  assert.match(prompt, /written by owner, helper can change the task/);
+  assert.ok(prompt.indexOf('Before you start') < prompt.indexOf('<<<UNTRUSTED_ISSUE_TEXT'));
+});
+
+test('without ALLOWED_SENDERS only the sender of the label is trusted', () => {
+  const prompt = buildPrompt(event('ai:ready', 8), loadConfig(env()));
+  assert.match(prompt, /written by marcel can change the task/);
+});
+
+test('normalizeEvent carries the comment count', () => {
+  const payload = { action: 'opened', repository: { full_name: 'owner/hello' }, issue: { number: 5, title: 't', body: '', comments: 4, labels: [{ name: 'ai:ready' }] }, sender: { login: 'owner' } };
+  assert.equal(normalizeEvent('issues', payload, new Set(['owner/hello'])).issue.comments, 4);
+  payload.issue.comments = undefined;
+  assert.equal(normalizeEvent('issues', payload, new Set(['owner/hello'])).issue.comments, 0);
 });
 
 test('duplicate label on an active issue does not start a second run', async () => {
