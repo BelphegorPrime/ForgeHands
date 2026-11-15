@@ -168,6 +168,9 @@ export function loadConfig(env = process.env) {
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    // A merge needs a review comment for the current commit: it says "Verdict: OK" within its first 300 characters and has at least this
+    // many characters (evidence, not a one-liner). A label alone is not a review.
+    minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
