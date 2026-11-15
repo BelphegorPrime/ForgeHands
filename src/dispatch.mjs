@@ -308,7 +308,19 @@ export class Dispatcher {
     }
   }
 
-  start(intervalMs = this.config.pollMs) {
+  // The hold on a tier lives in memory and is gone after a restart; the wait of a job that was queued again for a rate limit lives in the
+  // ledger. A restart clears both, so that it means "try again now" (the quota may be back, or the model was changed). If the model is still
+  // out of quota the first attempt fails again and sets the hold anew (a counter keeps that from going on for ever).
+  clearQuotaHolds() {
+    let cleared = 0;
+    for (const job of this.jobs.list('queued')) {
+      if (job.retry_at) { delete job.next_try; delete job.retry_at; cleared += 1; }
+    }
+    return cleared;
+  }
+
+  async start(intervalMs = this.config.pollMs) {
+    if (this.clearQuotaHolds()) await this.jobs.persist(this.now());
     this.timer = setInterval(() => this.tick().catch((error) => this.logger.error('dispatch failed:', error.message)), intervalMs);
     this.timer.unref?.();
     return this.tick();

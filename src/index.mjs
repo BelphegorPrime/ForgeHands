@@ -12,7 +12,7 @@ if (config.mode === 'direct') {
   const jobs = new JobStore(config.jobsFile);
   await jobs.load();
   dispatcher = new Dispatcher(config, jobs);
-  dispatcher.start();
+  dispatcher.start().catch((error) => console.error('dispatcher start failed:', error.message));
 }
 const server = createApp(config, store, fetch, console, dispatcher);
 

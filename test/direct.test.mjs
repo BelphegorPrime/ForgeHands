@@ -1385,3 +1385,33 @@ test('the wait is taken from the gateway, kept within sane bounds and has a defa
   await dispatcher.tick();
   assert.equal(job.next_try - clock, 900 * 1000);
 });
+
+// ---- a restart clears what was held back for the model quota
+test('a restart releases jobs that waited for the model quota, and only those', async () => {
+  const { dispatcher, jobs } = await buildQuota([]);
+  const held = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 2, retry_at: clock + 7200000, next_try: clock + 7200000 });
+  const failedStart = jobs.add({ key: 'owner/hello#27:ci:success:22222222', label: 'ci:success', status: 'queued', attempts: 1, next_try: clock + 120000, created: clock, event: { ...ciEvent('success'), issue: { number: 27, title: 't', body: '', labels: [] } } });
+  const waiting = jobs.add({ key: 'owner/hello#28:ai:ready', label: 'ai:ready', status: 'waiting', waiting_for: [1], created: clock, event: event('ai:ready', 28) });
+  assert.equal(dispatcher.clearQuotaHolds(), 1);
+  assert.equal(held.next_try, undefined);
+  assert.equal(held.retry_at, undefined);
+  assert.equal(held.rate_limited, 2);                       // the counter stays: a model that is still out of quota cannot loop for ever
+  assert.ok(failedStart.next_try > clock);                  // a wait for another reason is kept
+  assert.equal(waiting.status, 'waiting');
+  await dispatcher.start(60000);
+  dispatcher.stop();
+  assert.equal(held.status, 'running');
+  assert.equal(failedStart.status, 'queued');               // its own wait still holds
+});
+
+test('after a restart a model that is still out of quota sets the hold again, within the retry cap', async () => {
+  const { dispatcher, jobs } = await buildQuota([rateLimitError(600)]);
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 1, retry_at: clock + 7200000, next_try: clock + 7200000 });
+  await dispatcher.start(60000);
+  dispatcher.stop();
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.status, 'queued');
+  assert.equal(job.rate_limited, 2);
+  assert.equal(job.next_try, clock + 600 * 1000);
+});
