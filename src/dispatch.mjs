@@ -264,7 +264,7 @@ export class Dispatcher {
     const { number } = event.pull_request;
     const call = (method, path, body) => this.forgejoCall(event, method, path, body);
     try {
-      await call('POST', '/issues/' + number + '/comments', { body: text });
+      await call('POST', '/issues/' + number + '/comments', { body: (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + text });
       const known = await call('GET', '/labels?limit=100');
       let label = (known || []).find((entry) => entry.name === this.config.blockedLabel);
       if (!label) label = await call('POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });

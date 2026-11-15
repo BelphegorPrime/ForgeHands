@@ -1260,3 +1260,50 @@ test('a failing Forgejo call while checking the verdict is only logged', async (
   await dispatcher.tick();
   assert.equal(job.status, 'done');
 });
+
+// ---- the human is mentioned only where a human is needed
+const commentsOf = (forgejo) => forgejo.calls.filter((call) => call.method === 'POST' && call.path.endsWith('/comments')).map((call) => call.body.body);
+
+test('HUMAN_LOGIN is validated, an @ is allowed, empty means no mention', () => {
+  assert.equal(loadConfig(env(withMerge({ HUMAN_LOGIN: ' @marcel ' }))).humanLogin, 'marcel');
+  assert.equal(loadConfig(env(withMerge())).humanLogin, null);
+  assert.equal(loadConfig(env(withMerge({ HUMAN_LOGIN: '' }))).humanLogin, null);
+  assert.throws(() => loadConfig(env(withMerge({ HUMAN_LOGIN: 'bad login; drop' }))), /HUMAN_LOGIN must be a Forgejo login/);
+});
+
+test('a hand-over to a human mentions him: protected path, conflict, failed merge', async () => {
+  const protectedPr = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }] }), { HUMAN_LOGIN: 'marcel' });
+  assert.equal(await protectedPr.merger.handle(approvedEvent()), 'protected_paths');
+  assert.match(commentsOf(protectedPr.forgejo)[0], /^@marcel ForgeHands: approved and green, but not merged automatically/);
+  const conflict = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: false, title: 'Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] } }), { HUMAN_LOGIN: 'marcel' });
+  assert.equal(await conflict.merger.handle(approvedEvent()), 'not_mergeable');
+  assert.match(commentsOf(conflict.forgejo)[0], /^@marcel ForgeHands: .*does not merge cleanly/);
+  const failed = await mergerFor(goodRoutes({ ['POST ' + API + '/pulls/34/merge']: undefined }), { HUMAN_LOGIN: 'marcel' });
+  assert.equal(await failed.merger.handle(approvedEvent()), 'merge_failed');
+  assert.match(commentsOf(failed.forgejo)[0], /^@marcel ForgeHands: approved and green, but the merge failed/);
+});
+
+test('a successful merge and a pull request that is not ready never mention him', async () => {
+  const merged = await mergerFor(goodRoutes(), { HUMAN_LOGIN: 'marcel' });
+  assert.equal(await merged.merger.handle(approvedEvent()), 'merged');
+  assert.deepEqual(commentsOf(merged.forgejo).filter((text) => text.includes('@marcel')), []);
+  const red = await mergerFor(goodRoutes({ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'failure', total_count: 1 } }), { HUMAN_LOGIN: 'marcel' });
+  assert.equal(await red.merger.handle(approvedEvent()), 'ci_not_green');
+  assert.deepEqual(commentsOf(red.forgejo), []);
+});
+
+test('rounds used up, a review without verdict and an epic with gaps mention him; without HUMAN_LOGIN nobody is mentioned', async () => {
+  const blocked = await buildVerdict(prWith([]), { HUMAN_LOGIN: 'marcel' });
+  blocked.jobs.add(reviewJob());
+  states['conv-r'] = 'finished';
+  await blocked.dispatcher.tick();
+  assert.match(commentsOf(blocked.forgejo)[0], /^@marcel ForgeHands: the review of commit abcdef01 ended without a verdict/);
+  const plain = await buildVerdict(prWith([]));
+  plain.jobs.add(reviewJob());
+  states['conv-r'] = 'finished';
+  await plain.dispatcher.tick();
+  assert.match(commentsOf(plain.forgejo)[0], /^ForgeHands: the review/);
+  const epic = { type: 'epic.done', repository: { full_name: repo }, issue: { number: 10, title: 'Epic', body: 'B', labels: [] }, epic: { children: [] }, sender: { login: 'marcel' } };
+  assert.match(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /starts with @marcel/);
+  assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic()))), /@marcel|mention/);
+});

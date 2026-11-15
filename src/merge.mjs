@@ -44,8 +44,10 @@ export class Merger {
     return names.filter((name) => typeof name === 'string');
   }
 
-  async remark(repository, number, text) {
-    try { await this.call(repository, 'POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + text }); }
+  // `human`: the comment hands the pull request to a human, so it mentions him (and is the only kind that does).
+  async remark(repository, number, text, human = false) {
+    const mention = human && this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '';
+    try { await this.call(repository, 'POST', '/issues/' + number + '/comments', { body: mention + 'ForgeHands: ' + text }); }
     catch (error) { this.logger.error('could not comment on #' + number + ':', error.message); }
   }
 
@@ -76,11 +78,11 @@ export class Merger {
         current = await this.call(repository, 'GET', '/pulls/' + number);
       }
       if (protectedFiles.length) {
-        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.');
+        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.', true);
         return 'protected_paths';
       }
       if (current?.mergeable === false) {
-        await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.');
+        await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.', true);
         return 'not_mergeable';
       }
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
@@ -93,6 +95,7 @@ export class Merger {
       return 'merged';
     } catch (error) {
       this.logger.error('auto-merge of ' + repository + '#' + number + ' failed:', error.message);
+      await this.remark(repository, number, 'approved and green, but the merge failed (' + String(error.message).slice(0, 120) + '). A human has to look at this pull request.', true);
       return 'merge_failed';
     }
   }
