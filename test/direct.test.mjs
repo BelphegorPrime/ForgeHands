@@ -1576,4 +1576,7 @@ test('the review prompt asks for the verdict line and for reading each output be
   const text = buildPrompt(ciEvent('success'), loadConfig(env(withCi())));
   assert.match(text, /BEGINS with the line `## Verdict: OK` or `## Verdict: NOT OK`/);
   assert.match(text, /Do not send the commands of several steps in one turn/);
+  assert.match(text, /Also check against reality/);
+  assert.match(text, /a test with a fake proves nothing/);
+  assert.match(text, /character by character/);
 });
