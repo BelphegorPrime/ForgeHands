@@ -6,10 +6,10 @@ const KIND_TEXT = {
 
 // One line for the current state of an issue, from its newest relevant run.
 function stateOf(runs, maxRounds, rounds) {
-  const waiting = runs.find((run) => run.status === 'waiting');
-  if (waiting) return 'waiting for ' + (waiting.waiting_for || []).map((n) => '#' + n).join(', ');
   const active = runs.find((run) => run.status === 'running' || run.status === 'queued');
   if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running';
+  const waiting = runs.find((run) => run.status === 'waiting');
+  if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n) => '#' + n).join(', ');
   const last = runs[0];
   if (!last) return 'idle';
   if (last.status === 'failed') return KIND_TEXT[last.kind] + ' failed' + (last.result ? ' (' + last.result + ')' : '');
@@ -28,7 +28,7 @@ export function buildStatus(config, jobs, now = Date.now()) {
       started: job.started ? new Date(job.started).toISOString() : null,
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
-      waiting_for: job.waiting_for, created: job.created
+      waiting_for: job.waiting_for, waiting_for_run: job.waiting_for_run || undefined, created: job.created
     };
     const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [] };
     entry.runs.push(run);

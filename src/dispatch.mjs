@@ -86,10 +86,20 @@ export class Dispatcher {
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
     const kind = this.config.routes.get(label).kind;
     if (event.ci) {
-      // A CI outcome says nothing while an agent still works on the issue (it will push again), and nothing about a commit
-      // that is no longer the head of the pull request (the run was replaced by a newer push).
+      // While an agent still works on the issue (it will push again) the outcome is not acted on, but kept: it is looked at again
+      // when that run ends (see releaseDeferred), because CI often finishes seconds before the agent's last step.
       const base = this.issueKey(event) + ':';
-      if (this.jobs.list(true).some((job) => job.key.startsWith(base))) return { status: 'issue_busy' };
+      if (this.jobs.list(true).some((job) => job.key.startsWith(base) && !job.waiting_for_run)) {
+        const deferred = this.jobs.add({ key, label, event: { ...event, label }, status: 'waiting', waiting_for_run: true, created: this.now() });
+        try {
+          await this.jobs.persist(this.now());
+        } catch (error) {
+          this.jobs.remove(deferred.id);
+          throw error;
+        }
+        return { status: 'deferred' };
+      }
+      // A commit that is no longer the head of the pull request says nothing (the run was replaced by a newer push).
       if (await this.isStale(event)) return { status: 'stale_run' };
     }
     if (kind === 'ci_success' && !(await this.commitGreen(event))) return { status: 'ci_not_green' };
@@ -191,6 +201,29 @@ export class Dispatcher {
     return true;
   }
 
+  // A CI outcome kept while an agent worked on the issue. Once no run of the issue is active any more it is judged as if it had just
+  // arrived: gone when its commit is no longer the head or the status is not green (a later event can come again), otherwise started.
+  async releaseDeferred(job, now) {
+    const base = job.key.split(':')[0] + ':';
+    if (this.jobs.list(true).some((other) => other.id !== job.id && !other.waiting_for_run && other.key.startsWith(base))) {
+      if (job.created + this.config.maxRunMs < now) { this.jobs.remove(job.id); return true; }
+      return false;
+    }
+    const event = job.event;
+    const kind = this.config.routes.get(job.label)?.kind;
+    let start = !(await this.isStale(event));
+    if (start && kind === 'ci_success') start = await this.commitGreen(event);
+    if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
+      await this.roundsUsedUp(event);
+      start = false;
+    }
+    if (!start) { this.jobs.remove(job.id); return true; }
+    delete job.waiting_for_run;
+    job.status = 'queued';
+    await this.merger.clearApproval(event);
+    return true;
+  }
+
   // Is the commit of a CI run no longer the head of its pull request? Unknown (no access, error) counts as not stale.
   async isStale(event) {
     if (!this.config.forgejo) return false;
@@ -266,6 +299,9 @@ export class Dispatcher {
     const now = this.now();
     for (const job of this.jobs.list('running')) {
       if (await this.poll(job, now)) changed = true;
+    }
+    for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
+      if (await this.releaseDeferred(job, now)) changed = true;
     }
     for (const job of this.jobs.list('queued')) {
       if (job.next_try && job.next_try > now) continue;
