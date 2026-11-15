@@ -765,6 +765,24 @@ test('merge: the method comes from MERGE_METHOD, and a title without WIP is left
   assert.equal(forgejo.calls.find((call) => call.path.endsWith('/merge')).body.Do, 'squash');
 });
 
+test('merge: a WIP title makes Forgejo report not mergeable; the title is cleaned first and the pull request read again', async () => {
+  let cleaned = false;
+  const pr = () => ({ state: 'open', merged: false, mergeable: cleaned, title: cleaned ? 'Fix it' : 'WIP: Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] });
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34']: pr, ['PATCH ' + API + '/pulls/34']: () => { cleaned = true; return {}; } });
+  const { merger, forgejo } = await mergerFor(routes);
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /pulls/34/merge', 'POST /issues/34/comments', 'PATCH /issues/26']);
+});
+
+test('merge: a real conflict after the title is clean is reported, and a blocked pull request keeps its WIP title', async () => {
+  const conflict = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: false, title: 'WIP: Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] } }));
+  assert.equal(await conflict.merger.handle(approvedEvent()), 'not_mergeable');
+  assert.deepEqual(conflict.forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
+  const protectedOne = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }] }));
+  assert.equal(await protectedOne.merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!protectedOne.forgejo.wrote().includes('PATCH /pulls/34'));
+});
+
 test('merge: a protected path stops it with a comment, whichever page of files it is on', async () => {
   const page = (n) => Array.from({ length: 50 }, (_, i) => ({ filename: 'src/f' + n + '-' + i + '.mjs' }));
   const files = (url) => {

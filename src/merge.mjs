@@ -63,10 +63,6 @@ export class Merger {
       const labels = (pr.labels || []).map((label) => label.name);
       if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
       if (labels.includes(this.config.blockedLabel)) return 'blocked';
-      if (pr.mergeable === false) {
-        await this.remark(repository, number, 'approved, but the pull request does not merge cleanly (conflict). A human has to look at it.');
-        return 'not_mergeable';
-      }
       const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(sha) + '/status');
       if (status?.state !== 'success' || !(status.total_count > 0)) return 'ci_not_green';
       const protectedFiles = (await this.changedFiles(repository, number))
@@ -75,8 +71,17 @@ export class Merger {
         await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). A human merges it.');
         return 'protected_paths';
       }
-      // Forgejo refuses to merge a pull request titled as work in progress; the approval is what lifts that.
-      if (WIP.test(pr.title || '')) await this.call(repository, 'PATCH', '/pulls/' + number, { title: pr.title.replace(WIP, '') });
+      // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable); the approval is what
+      // lifts that. Only after the title is clean does `mergeable` say anything about conflicts, so look at the pull request again.
+      let current = pr;
+      if (WIP.test(pr.title || '')) {
+        await this.call(repository, 'PATCH', '/pulls/' + number, { title: pr.title.replace(WIP, '') });
+        current = await this.call(repository, 'GET', '/pulls/' + number);
+      }
+      if (current?.mergeable === false) {
+        await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.');
+        return 'not_mergeable';
+      }
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
         Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
       });
