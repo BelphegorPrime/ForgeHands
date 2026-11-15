@@ -1124,3 +1124,34 @@ test('/status and /status.json are served in direct mode and show no secrets', a
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// ---- ai:close: an issue that only wants the closing review, without a planner run
+test('ai:close asks for the closing review like ai:plan and starts no run of its own', async () => {
+  const closing = issue(10, 'open', { title: 'Old ticket', body: 'Criteria', labels: [{ name: 'ai:close' }] });
+  const routes = {
+    ['GET ' + API + '/issues/11/blocks']: [closing],
+    ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed', { title: 'Part' })]
+  };
+  const { dispatcher, jobs, config } = await buildEpic(routes);
+  assert.deepEqual([...config.epicLabels], ['ai:plan', 'ai:close']);
+  // the label itself starts nothing: it has no route
+  assert.equal(normalizeEvent('issues', { action: 'labeled', repository: { full_name: repo }, label: { name: 'ai:close' }, issue: { number: 10, labels: [{ name: 'ai:close' }] }, sender: { login: 'marcel' } },
+    new Set([repo]), [...config.routes.keys()], {}), null);
+  assert.equal(await dispatcher.onClosed(closedEvent(11)), 'epic #10 review');
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+  assert.equal(starts()[0].body.agent_profile_id, REVIEWER);
+  assert.match(starts()[0].body.initial_message.content[0].text, /Every sub-issue is closed: #11 Part/);
+  assert.equal(jobs.list().filter((job) => job.label === 'ai:plan').length, 0);
+});
+
+test('only a dependency that is still open holds the ai:close review back, and EPIC_LABEL is a list', async () => {
+  const closing = issue(10, 'open', { labels: [{ name: 'ai:close' }] });
+  const routes = { ['GET ' + API + '/issues/11/blocks']: [closing], ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed'), issue(12, 'open')] };
+  const { dispatcher } = await buildEpic(routes);
+  assert.equal(await dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
+  assert.equal(starts().length, 0);
+  assert.deepEqual([...loadConfig(env(withEpic({ EPIC_LABEL: ' ai:x , ai:y ' }))).epicLabels], ['ai:x', 'ai:y']);
+  const other = await buildEpic({ ['GET ' + API + '/issues/11/blocks']: [closing], ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed')] }, { EPIC_LABEL: 'ai:plan' });
+  assert.equal(await other.dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
+});

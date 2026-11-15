@@ -159,7 +159,7 @@ export class Dispatcher {
         for (const job of waiting) { job.status = 'queued'; delete job.waiting_for; }
         outcome.push('started #' + target.number);
         changed = true;
-      } else if ((target.labels || []).some((label) => label.name === this.config.epicLabel)) {
+      } else if ((target.labels || []).some((label) => this.config.epicLabels.has(label.name))) {
         if (await this.startEpicReview(event, target)) { outcome.push('epic #' + target.number + ' review'); changed = true; }
       }
     }

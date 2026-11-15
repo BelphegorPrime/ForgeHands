@@ -155,8 +155,9 @@ export function loadConfig(env = process.env) {
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
     approvedLabel: env.APPROVED_LABEL || 'ai:approved',
-    // The label that marks an epic: when its last dependency closes the route "on": "epic_done" reviews it.
-    epicLabel: env.EPIC_LABEL || 'ai:plan',
+    // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
+    // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
+    epicLabels: new Set((env.EPIC_LABEL || 'ai:plan,ai:close').split(',').map((value) => value.trim()).filter(Boolean)),
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };
