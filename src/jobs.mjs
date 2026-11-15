@@ -3,7 +3,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
-export const ACTIVE = new Set(['queued', 'running']);
+// `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
+export const ACTIVE = new Set(['waiting', 'queued', 'running']);
 
 // Persistent issue ledger: one record per started or queued run (repo#issue:label -> conversation).
 export class JobStore {

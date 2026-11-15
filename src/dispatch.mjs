@@ -97,13 +97,16 @@ export class Dispatcher {
       await this.roundsUsedUp(event);
       return { status: 'rounds_exceeded' };
     }
-    const job = this.jobs.add({ key, label, event: { ...event, label }, status: 'queued', created: this.now() });
+    // An issue that depends on open issues waits until the last of them closes (Forgejo's issue dependencies).
+    const open = !event.pull_request && kind === 'issue' ? await this.openDependencies(event, event.issue.number) : [];
+    const job = this.jobs.add({ key, label, event: { ...event, label }, status: open.length ? 'waiting' : 'queued', ...(open.length ? { waiting_for: open } : {}), created: this.now() });
     try {
       await this.jobs.persist(this.now());
     } catch (error) {
       this.jobs.remove(job.id); // not durable: the retried delivery must be able to enqueue it again
       throw error;
     }
+    if (open.length) return { status: 'waiting' };
     // The earlier approval does not cover what this run will push or review.
     if (event.pull_request) await this.merger.clearApproval(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
@@ -125,6 +128,67 @@ export class Dispatcher {
   async approve(event) {
     if (Array.isArray(event.previous_labels) && event.previous_labels.includes(this.config.approvedLabel)) return 'already_approved';
     return this.merger.handle(event);
+  }
+
+  // The open issues the given issue depends on. Without Forgejo access, or when the call fails, none: the issue is not held back.
+  async openDependencies(event, number) {
+    if (!this.config.forgejo) return [];
+    try {
+      const dependencies = await this.forgejoCall(event, 'GET', '/issues/' + number + '/dependencies');
+      return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => issue.number);
+    } catch (error) {
+      this.logger.error('could not read the dependencies of #' + number + ':', error.message);
+      return [];
+    }
+  }
+
+  // An issue closed: what depended on it may start now (a waiting job), and an epic whose last dependency this was is reviewed.
+  async onClosed(event) {
+    if (!this.config.forgejo) return 'no_forgejo_access';
+    let blocked;
+    try { blocked = await this.forgejoCall(event, 'GET', '/issues/' + event.issue.number + '/blocks'); }
+    catch (error) { this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message); return 'blocks_unknown'; }
+    const outcome = [];
+    let changed = false;
+    for (const target of Array.isArray(blocked) ? blocked : []) {
+      if (target.state !== 'open') continue;
+      if ((await this.openDependencies(event, target.number)).length) continue;
+      const base = event.repository.full_name.toLowerCase() + '#' + target.number + ':';
+      const waiting = this.jobs.list(true).filter((job) => job.status === 'waiting' && job.key.startsWith(base));
+      if (waiting.length) {
+        for (const job of waiting) { job.status = 'queued'; delete job.waiting_for; }
+        outcome.push('started #' + target.number);
+        changed = true;
+      } else if ((target.labels || []).some((label) => label.name === this.config.epicLabel)) {
+        if (await this.startEpicReview(event, target)) { outcome.push('epic #' + target.number + ' review'); changed = true; }
+      }
+    }
+    if (changed) {
+      await this.jobs.persist(this.now());
+      this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
+    }
+    return outcome.join(', ') || 'nothing_ready';
+  }
+
+  // All dependencies of the epic are closed: have it reviewed (and closed when its criteria are met). Once per run.
+  async startEpicReview(event, epic) {
+    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'epic_done')?.[0];
+    if (!route) return false;
+    const key = event.repository.full_name.toLowerCase() + '#' + epic.number + ':' + route;
+    if (this.jobs.activeByKey(key)) return false;
+    let children = [];
+    try {
+      children = (await this.forgejoCall(event, 'GET', '/issues/' + epic.number + '/dependencies')).map((issue) => ({ number: issue.number, title: String(issue.title || '').slice(0, 200) }));
+    } catch (error) { this.logger.error('could not list the sub-issues of #' + epic.number + ':', error.message); }
+    this.jobs.add({
+      key, label: route, status: 'queued', created: this.now(),
+      event: {
+        type: 'epic.done', source: 'forgejo', action: 'dependencies_closed', label: route, repository: event.repository,
+        issue: { number: epic.number, title: String(epic.title || '').slice(0, 1000), body: String(epic.body || '').slice(0, 50000), html_url: epic.html_url || null, comments: epic.comments || 0, labels: (epic.labels || []).map((label) => label.name) },
+        epic: { children }, sender: event.sender
+      }
+    });
+    return true;
   }
 
   // Is the commit of a CI run no longer the head of its pull request? Unknown (no access, error) counts as not stale.
@@ -236,7 +300,7 @@ export class Dispatcher {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: route.profile,
       max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}) },
+      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
