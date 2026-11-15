@@ -1066,6 +1066,8 @@ test('an epic is reviewed when its last dependency closes, once, with its sub-is
   assert.match(text, /You do not change code and you do not create issues/);
   assert.match(text, /close the epic/);
   assert.match(text, /Make X work/);
+  assert.match(text, /write exactly ONE comment on the epic/);
+  assert.match(text, /do not post drafts, do not delete or rewrite comments afterwards, and finish right after the comment/);
   assert.equal(jobs.list()[0].key, 'owner/hello#10:epic:done');
   assert.equal(await dispatcher.onClosed(closedEvent(11)), 'nothing_ready'); // the review is already queued or running
 });
