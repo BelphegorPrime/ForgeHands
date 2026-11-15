@@ -65,6 +65,12 @@ export class Merger {
       const labels = (pr.labels || []).map((label) => label.name);
       if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
       if (labels.includes(this.config.blockedLabel)) return 'blocked';
+      // The approval label is a claim; the review comment is the proof. Without a verdict for this very commit nothing is merged.
+      const review = await this.reviewOf(repository, number, sha);
+      if (!review.ok) {
+        await this.rejectApproval(repository, number, sha, review.reason);
+        return 'no_valid_review';
+      }
       const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(sha) + '/status');
       if (status?.state !== 'success' || !(status.total_count > 0)) return 'ci_not_green';
       const protectedFiles = (await this.changedFiles(repository, number))
@@ -97,6 +103,46 @@ export class Merger {
       this.logger.error('auto-merge of ' + repository + '#' + number + ' failed:', error.message);
       await this.remark(repository, number, 'approved and green, but the merge failed (' + String(error.message).slice(0, 120) + '). A human has to look at this pull request.', true);
       return 'merge_failed';
+    }
+  }
+
+  // The latest review comment of the current commit: written after the commit, long enough to hold evidence, and starting with
+  // "Verdict: OK" or "Verdict: NOT OK". A comment of anybody counts (a human may review too); the latest one decides.
+  async reviewOf(repository, number, sha) {
+    let since = 0;
+    try {
+      const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
+      const time = Date.parse(commit?.created || commit?.commit?.committer?.date || '');
+      if (Number.isFinite(time)) since = time;
+    } catch (error) {
+      this.logger.error('could not read the time of commit ' + sha.slice(0, 8) + ', counting every review comment:', error.message);
+    }
+    const comments = await this.call(repository, 'GET', '/issues/' + number + '/comments?limit=100');
+    const verdicts = (Array.isArray(comments) ? comments : [])
+      .filter((comment) => Date.parse(comment.created_at) >= since && String(comment.body || '').length >= this.config.minReviewChars)
+      .map((comment) => ({ at: Date.parse(comment.created_at), match: /verdict\s*:\s*(not\s+ok|ok)\b/i.exec(String(comment.body).slice(0, 300)) }))
+      .filter((entry) => entry.match)
+      .sort((a, b) => a.at - b.at);
+    const last = verdicts.at(-1);
+    if (!last) return { ok: false, reason: 'none' };
+    return /^not/i.test(last.match[1]) ? { ok: false, reason: 'not_ok' } : { ok: true };
+  }
+
+  // An approval without a review behind it: take it off, say so, hand the pull request to a human. Best effort.
+  async rejectApproval(repository, number, sha, reason) {
+    const event = { repository: { full_name: repository }, pull_request: { number } };
+    await this.clearApproval(event);
+    const what = reason === 'not_ok'
+      ? 'the latest review of commit ' + sha.slice(0, 8) + ' says NOT OK'
+      : 'there is no review comment for commit ' + sha.slice(0, 8) + ' that starts with \"Verdict: OK\" and holds evidence (at least ' + this.config.minReviewChars + ' characters)';
+    await this.remark(repository, number, 'the label ' + this.config.approvedLabel + ' was set, but ' + what + '. The approval is not trusted and was taken off. A human has to look at this pull request, or push a commit to run the review again.', true);
+    try {
+      const known = await this.call(repository, 'GET', '/labels?limit=100');
+      let label = (known || []).find((entry) => entry.name === this.config.blockedLabel);
+      if (!label) label = await this.call(repository, 'POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
+      await this.call(repository, 'POST', '/issues/' + number + '/labels', { labels: [label.id] });
+    } catch (error) {
+      this.logger.error('could not mark the pull request:', error.message);
     }
   }
 
