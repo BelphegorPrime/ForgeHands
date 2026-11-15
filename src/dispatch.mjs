@@ -294,7 +294,7 @@ export class Dispatcher {
   }
 
   // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
-  // for ever, green and unseen. Unless it moved on meanwhile, say so and hand it to a human.
+  // for ever, green and unseen. Unless it moved on meanwhile, run it once more; after the second miss hand it to a human.
   async checkVerdict(job) {
     const event = job.event;
     if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
@@ -303,7 +303,13 @@ export class Dispatcher {
       if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
       const names = (pr.labels || []).map((label) => label.name);
       if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
-      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.');
+      // The first time, review once more: such a run mostly ends early (a blind command, a spent iteration budget), not for good.
+      if (!job.verdict_retry) {
+        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
+        this.logger.error('review ' + job.key + ' ended without a verdict, running it once more');
+        return;
+      }
+      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.');
     } catch (error) {
       this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
     }
