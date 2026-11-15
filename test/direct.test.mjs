@@ -114,6 +114,8 @@ test('prompt tells the agent to read comments, continue an existing pull request
   assert.match(prompt, /issues\/7\/comments/);
   assert.match(prompt, /\(3 so far\)/);
   assert.match(prompt, /pulls\?state=all/);
+  assert.match(prompt, /pulls\/<number>\/reviews/);
+  assert.match(prompt, /conversation of the pull request \(GET .*\/issues\/<number>\/comments/);
   assert.match(prompt, /ai\/issue-7/);
   assert.match(prompt, /Never open a second pull request/);
   assert.match(prompt, /written by owner, helper can change the task/);
