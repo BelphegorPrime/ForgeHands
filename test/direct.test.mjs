@@ -1415,3 +1415,94 @@ test('after a restart a model that is still out of quota sets the hold again, wi
   assert.equal(job.rate_limited, 2);
   assert.equal(job.next_try, clock + 600 * 1000);
 });
+
+// ---- finished runs are archived after a while, with their tags
+const DAY = 86400000;
+async function buildArchive(extra = {}, conversations = {}) {
+  const config = loadConfig(env(withChanges(extra)));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const patches = [];
+  const send = async (url, request) => {
+    const path = new URL(url).pathname;
+    const id = decodeURIComponent(path.split('/').pop());
+    if (request.method === 'PATCH') {
+      if (conversations[id]?.failPatch) return { ok: false, status: 500 };
+      patches.push({ id, body: JSON.parse(request.body) });
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+    const conversation = conversations[id];
+    if (!conversation) return { ok: false, status: 404 };
+    return { ok: true, status: 200, json: async () => ({ execution_status: conversation.status || 'finished', tags: conversation.tags || {}, stats: { usage_to_metrics: {} } }) };
+  };
+  return { config, jobs, patches, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+const endedJob = (id, finished, status = 'done') => ({ key: 'owner/hello#' + id + ':ai:ready', label: 'ai:ready', status, conversation_id: 'c' + id, finished, created: finished - 1000, event: event('ai:ready', id) });
+
+test('ARCHIVE_AFTER_DAYS: default one week, 0 switches it off, anything odd is refused', () => {
+  assert.equal(loadConfig(env(withChanges())).archiveAfterDays, 7);
+  assert.equal(loadConfig(env(withChanges({ ARCHIVE_AFTER_DAYS: '0' }))).archiveAfterDays, 0);
+  assert.equal(loadConfig(env(withChanges({ ARCHIVE_AFTER_DAYS: '30' }))).archiveAfterDays, 30);
+  for (const bad of ['-1', 'x', '1.5', '99999']) assert.throws(() => loadConfig(env(withChanges({ ARCHIVE_AFTER_DAYS: bad }))), /ARCHIVE_AFTER_DAYS/);
+});
+
+test('a run that ended more than the period ago is archived and keeps its other tags; a recent one is left alone', async () => {
+  clock = 100 * DAY;
+  const { dispatcher, jobs, patches } = await buildArchive({}, { c1: { tags: { source: 'forgehands', issue: '1', pr: '5' } }, c2: { tags: { source: 'forgehands', issue: '2' } }, c3: { tags: { source: 'forgehands', issue: '3' } } });
+  const old = jobs.add(endedJob(1, clock - 8 * DAY));
+  const failed = jobs.add(endedJob(3, clock - 9 * DAY, 'failed'));
+  const recent = jobs.add(endedJob(2, clock - 6 * DAY));
+  await dispatcher.tick();
+  assert.deepEqual(patches.map((p) => p.id).sort(), ['c1', 'c3']);
+  assert.deepEqual(patches.find((p) => p.id === 'c1').body, { tags: { source: 'forgehands', issue: '1', pr: '5', archived: 'true' } });
+  assert.equal(old.archived, true);
+  assert.equal(failed.archived, true);
+  assert.equal(recent.archived, undefined);
+});
+
+test('archiving runs at most once an hour, never twice for one run, and not when switched off', async () => {
+  clock = 100 * DAY;
+  const { dispatcher, jobs, patches } = await buildArchive({}, { c1: { tags: {} }, c2: { tags: {} } });
+  jobs.add(endedJob(1, clock - 8 * DAY));
+  await dispatcher.tick();
+  assert.equal(patches.length, 1);
+  jobs.add(endedJob(2, clock - 8 * DAY));
+  await dispatcher.tick();
+  assert.equal(patches.length, 1);                        // the hour has not passed
+  clock += 3600000 + 1;
+  await dispatcher.tick();
+  assert.deepEqual(patches.map((p) => p.id), ['c1', 'c2']); // c1 is not archived a second time
+  const off = await buildArchive({ ARCHIVE_AFTER_DAYS: '0' }, { c1: { tags: {} } });
+  off.jobs.add(endedJob(1, clock - 80 * DAY));
+  await off.dispatcher.tick();
+  assert.equal(off.patches.length, 0);
+});
+
+test('a deleted or running conversation, a job that is not over and a failing call are handled without harm', async () => {
+  clock = 100 * DAY;
+  const { dispatcher, jobs, patches } = await buildArchive({}, { c1: { status: 'running', tags: {} }, c3: { tags: {}, failPatch: true } });
+  const running = jobs.add(endedJob(1, clock - 8 * DAY));
+  const deleted = jobs.add(endedJob(2, clock - 8 * DAY));          // no such conversation: 404
+  const failing = jobs.add(endedJob(3, clock - 8 * DAY));
+  const waiting = jobs.add({ ...endedJob(4, clock - 8 * DAY), status: 'waiting' });
+  const noConversation = jobs.add({ ...endedJob(5, clock - 8 * DAY), conversation_id: undefined });
+  await dispatcher.tick();
+  assert.equal(patches.length, 0);
+  assert.equal(running.archived, undefined);
+  assert.equal(deleted.archived, true);                           // nothing left to archive, do not ask again
+  assert.equal(failing.archived, undefined);                      // tried again in the next round
+  assert.equal(waiting.archived, undefined);
+  assert.equal(noConversation.archived, undefined);
+});
+
+test('at most twenty runs are archived in one round', async () => {
+  clock = 100 * DAY;
+  const conversations = Object.fromEntries(Array.from({ length: 25 }, (_, i) => ['c' + (i + 1), { tags: {} }]));
+  const { dispatcher, jobs, patches } = await buildArchive({}, conversations);
+  for (let i = 1; i <= 25; i++) jobs.add(endedJob(i, clock - 8 * DAY));
+  await dispatcher.tick();
+  assert.equal(patches.length, 20);
+  clock += 3600000 + 1;
+  await dispatcher.tick();
+  assert.equal(patches.length, 25);
+});

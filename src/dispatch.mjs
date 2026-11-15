@@ -359,7 +359,37 @@ export class Dispatcher {
       if (!this.hasRoom(job, now)) continue;
       if (await this.startJob(job, now)) changed = true;
     }
+    if (await this.archiveOld(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
+  }
+
+  // Archive the conversations of runs that ended a while ago: the tag archived=true is added, every other tag stays, so the runs can still
+  // be found by issue, pull request and kind. At most once an hour and 20 at a time; a conversation that is deleted or running is skipped.
+  async archiveOld(now) {
+    const days = this.config.archiveAfterDays;
+    if (!days || (this.lastArchive && now - this.lastArchive < 3600000)) return false;
+    this.lastArchive = now;
+    const before = now - days * 86400000;
+    let changed = false;
+    let done = 0;
+    for (const job of this.jobs.list()) {
+      if (job.archived || !job.conversation_id || !job.finished || job.finished > before || (job.status !== 'done' && job.status !== 'failed')) continue;
+      if (done++ >= 20) break;
+      try {
+        const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id));
+        if (response.status === 404) { job.archived = true; changed = true; continue; }
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        if ((data.execution_status || data.status) === 'running') continue;
+        const patched = await this.api('PATCH', '/api/conversations/' + encodeURIComponent(job.conversation_id), { tags: { ...(data.tags || {}), archived: 'true' } });
+        if (!patched.ok) throw new Error('HTTP ' + patched.status);
+        job.archived = true;
+        changed = true;
+      } catch (error) {
+        this.logger.error('could not archive the run of ' + job.key + ':', error.message);
+      }
+    }
+    return changed;
   }
 
   hasRoom(job, now) {
