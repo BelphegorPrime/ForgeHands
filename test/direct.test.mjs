@@ -1067,3 +1067,60 @@ test('the webhook turns a closed issue into the start of what waited for it', as
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// ---- status page
+import { buildStatus, renderStatus } from '../src/status.mjs';
+
+test('the status says per issue what runs and what it waits for, without event text', async () => {
+  const { config, jobs } = await build(withChanges({ MAX_ROUNDS: "2" }));
+  const add = (key, label, status, extra = {}, ev = {}) => jobs.add({ key, label, status, created: clock++, event: { ...event(label, Number(key.match(/#(\d+)/)[1])), ...ev }, ...extra });
+  add('owner/hello#2:ai:ready', 'ai:ready', 'waiting', { waiting_for: [1] }, { issue: { number: 2, title: 'Second <b>', body: 'SECRET BODY', labels: [] } });
+  add('owner/hello#3:ai:ready', 'ai:ready', 'running', { started: clock, conversation_id: 'c3', cost: 0.12345 });
+  add('owner/hello#4:ai:ready', 'ai:ready', 'done', { started: clock, finished: clock });
+  add('owner/hello#5:ai:ready', 'ai:ready', 'failed', { result: 'timeout', started: clock });
+  const status = buildStatus(config, jobs, clock);
+  const byIssue = Object.fromEntries(status.issues.map((issue) => [issue.issue, issue]));
+  assert.equal(byIssue['owner/hello#2'].state, 'waiting for #1');
+  assert.equal(byIssue['owner/hello#3'].state, 'worker running');
+  assert.equal(byIssue['owner/hello#4'].state, 'worker done, waiting for the next event');
+  assert.equal(byIssue['owner/hello#5'].state, 'worker failed (timeout)');
+  assert.equal(byIssue['owner/hello#3'].runs[0].cost, 0.123);
+  assert.equal(byIssue['owner/hello#3'].runs[0].conversation, 'c3');
+  assert.equal(status.limits.running, 1);
+  assert.doesNotMatch(JSON.stringify(status), /SECRET BODY/);
+  const html = renderStatus(status);
+  assert.match(html, /Second &lt;b&gt;/);
+  assert.doesNotMatch(html, /<b>/);
+});
+
+test('rounds are counted per issue and shown as used up', async () => {
+  const { config, jobs } = await build(withChanges({ MAX_ROUNDS: '2' }));
+  for (const [i, label] of ['ai:changes', 'ai:changes'].entries()) {
+    jobs.add({ key: 'owner/hello#26:' + label + ':' + i, label, status: 'done', started: clock, created: clock + i, event: { ...prEvent(), label } });
+  }
+  const [issue] = buildStatus(config, jobs, clock).issues;
+  assert.equal(issue.rounds, 2);
+  assert.equal(issue.pr, 34);
+  assert.equal(issue.state, 'rounds used up (2/2)');
+});
+
+test('/status and /status.json are served in direct mode and show no secrets', async () => {
+  const { config, jobs, dispatcher } = await build(withChanges());
+  jobs.add({ key: 'owner/hello#3:ai:ready', label: 'ai:ready', status: 'running', started: clock, created: clock, conversation_id: 'c3', event: event('ai:ready', 3) });
+  const store = new DeliveryStore(config.dataFile);
+  await store.load();
+  const server = createApp(config, store, undefined, quiet, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = 'http://127.0.0.1:' + server.address().port;
+    const data = await (await fetch(base + '/status.json')).json();
+    assert.equal(data.issues[0].issue, 'owner/hello#3');
+    const page = await fetch(base + '/status');
+    assert.match(page.headers.get('content-type'), /text\/html/);
+    const html = await page.text();
+    assert.match(html, /worker running/);
+    assert.doesNotMatch(html + JSON.stringify(data), /tok-secret-value|k{24}/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

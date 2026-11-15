@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { deliveryId, signPayload, verifyForgejoSignature } from './security.mjs';
 import { normalizeEvent } from './events.mjs';
+import { buildStatus, renderStatus } from './status.mjs';
 
 const json = (res, status, body) => {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -27,6 +28,13 @@ export function createApp(config, store, send = fetch, logger = console, dispatc
   return createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       return json(res, 200, { status: 'ok' });
+    }
+    // Read only view of the work in flight (direct mode): /status for people, /status.json for tools.
+    if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json') && dispatcher) {
+      const status = buildStatus(config, dispatcher.jobs);
+      if (req.url === '/status.json') return json(res, 200, status);
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(renderStatus(status));
     }
     if (req.method !== 'POST' || req.url !== '/webhooks/forgejo') {
       return json(res, 404, { error: 'not_found' });
