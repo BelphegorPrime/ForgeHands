@@ -64,6 +64,13 @@ function parseMergePolicy(text) {
   return policy;
 }
 
+function archiveDays(value) {
+  if (value === undefined || value === '') return 7;
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 0 || days > 3650) throw new Error('ARCHIVE_AFTER_DAYS must be an integer between 0 and 3650');
+  return days;
+}
+
 function parseHumanLogin(value) {
   const login = String(value || '').trim().replace(/^@/, '');
   if (!login) return null;
@@ -161,6 +168,8 @@ export function loadConfig(env = process.env) {
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
+    archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
