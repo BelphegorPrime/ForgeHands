@@ -3,8 +3,8 @@
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {} } = {}) {
-  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels);
+export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '' } = {}) {
+  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
   const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
@@ -56,9 +56,9 @@ export function normalizeEvent(event, payload, allowedRepos, labels = ['ai:ready
 // A label on the pull request of an agent issue (branch ai/issue-<n>) starts a follow-up round for that issue. As with issues,
 // Forgejo reports a label change as action `label_updated` with the current labels only, so the event is flagged and the
 // dispatcher compares it with the labels it saw before. `labeled` (with the added label) is accepted as well.
-function normalizePullRequest(payload, allowedRepos, labels) {
+function normalizePullRequest(payload, allowedRepos, labels, approved) {
   const pr = payload?.pull_request;
-  if (!pr || typeof pr !== 'object' || !labels.length) return null;
+  if (!pr || typeof pr !== 'object' || (!labels.length && !approved)) return null;
   if (payload.action !== 'label_updated' && payload.action !== 'labeled') return null;
   const fullName = payload.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
@@ -73,9 +73,14 @@ function normalizePullRequest(payload, allowedRepos, labels) {
   let matched;
   if (isLabelEvent) matched = labels.find((name) => present.includes(name));
   else matched = labels.includes(payload.label?.name) && present.includes(payload.label.name) ? payload.label.name : undefined;
+  // The approval label asks ForgeHands to merge (a round label takes precedence when both are there).
+  let type = 'pull_request.labeled';
+  if (!matched && approved) {
+    if (isLabelEvent ? present.includes(approved) : payload.label?.name === approved && present.includes(approved)) { matched = approved; type = 'pull_request.approved'; }
+  }
   if (!matched) return null;
   return {
-    type: 'pull_request.labeled',
+    type,
     source: 'forgejo',
     action: 'labeled',
     ...(isLabelEvent ? { label_event: true } : {}),

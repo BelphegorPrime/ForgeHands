@@ -1,4 +1,5 @@
 import { URL } from 'node:url';
+import { globToRegExp } from './merge.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
@@ -44,6 +45,23 @@ function parseRoutes(text) {
     });
   }
   return routes;
+}
+
+// MERGE_POLICY: {"owner/repo": {"deny": ["stacks/**", "compose.yaml"]}}. Only the repositories named here are merged by ForgeHands,
+// and only when none of the changed files matches a deny pattern. A repository without an entry is never merged automatically.
+function parseMergePolicy(text) {
+  const policy = new Map();
+  if (!text) return policy;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('MERGE_POLICY must be valid JSON'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('MERGE_POLICY must be a JSON object');
+  for (const [name, rule] of Object.entries(parsed)) {
+    if (!REPO.test(name.toLowerCase())) throw new Error('MERGE_POLICY: ' + name + ' is not owner/repository');
+    const deny = rule?.deny ?? [];
+    if (!Array.isArray(deny) || deny.some((glob) => typeof glob !== 'string' || !glob)) throw new Error('MERGE_POLICY: deny of ' + name + ' must be a list of patterns');
+    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp) });
+  }
+  return policy;
 }
 
 export function loadConfig(env = process.env) {
@@ -110,6 +128,10 @@ export function loadConfig(env = process.env) {
     }
   }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
+  const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
+  const mergeMethod = env.MERGE_METHOD || 'merge';
+  if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
+  if (mergePolicy.size && !(env.FORGEJO_URL && env.FORGEJO_TOKEN)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN');
   return {
     ...common,
     mode: 'direct',
@@ -117,6 +139,8 @@ export function loadConfig(env = process.env) {
     apiUrl: httpUrl(env.OPENHANDS_API_URL, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
     routes,
+    mergePolicy,
+    mergeMethod,
     // The label that asks for another round: the first route on pull requests (the reviewer sets it, a human may too).
     changesLabel: [...routes].find(([, route]) => route.kind === 'pull_request')?.[0] || 'ai:changes',
     agentSecrets,

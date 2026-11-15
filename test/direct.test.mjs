@@ -465,11 +465,11 @@ test('a round starts the pull request route on the same branch and says so in it
 });
 
 test('the same label while a round runs starts no second round, a re-label after it ended does', async () => {
-  const { dispatcher } = await build(withChanges());
+  const { dispatcher, jobs } = await build(withChanges());
   await dispatcher.enqueue(prEvent());
   await dispatcher.tick();
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'duplicate_job');
-  states['conv-1'] = 'finished';
+  states[jobs.list()[0].conversation_id] = 'finished';
   await dispatcher.tick();
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
 });
@@ -495,17 +495,19 @@ test('rounds are limited per issue; the pull request is told and marked when the
   }
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'rounds_exceeded');
   assert.equal(starts().length, 2);
-  const paths = forgejo.map((call) => call.method + ' ' + call.path);
+  // every started round first looks whether an earlier approval has to be taken back
+  const marking = forgejo.filter((call) => !(call.method === 'GET' && call.path.endsWith('/issues/34/labels')));
+  const paths = marking.map((call) => call.method + ' ' + call.path);
   assert.deepEqual(paths, [
     'POST /api/v1/repos/owner/hello/issues/34/comments',
     'GET /api/v1/repos/owner/hello/labels',
     'POST /api/v1/repos/owner/hello/labels',
     'POST /api/v1/repos/owner/hello/issues/34/labels'
   ]);
-  assert.match(forgejo[0].body.body, /2 follow-up rounds for issue #26/);
-  assert.equal(forgejo[2].body.name, 'ai:blocked');
-  assert.deepEqual(forgejo[3].body, { labels: [77] });
-  assert.equal(forgejo[0].auth, 'token tok-secret-value');
+  assert.match(marking[0].body.body, /2 follow-up rounds for issue #26/);
+  assert.equal(marking[2].body.name, 'ai:blocked');
+  assert.deepEqual(marking[3].body, { labels: [77] });
+  assert.equal(marking[0].auth, 'token tok-secret-value');
 });
 
 test('rounds of another issue do not count', async () => {
@@ -667,6 +669,182 @@ test('the webhook delivers a CI outcome of an agent pull request', async () => {
     assert.equal(response.status, 202);
     assert.equal((await response.json()).status, 'queued');
     assert.equal(jobs.list()[0].key, 'owner/hello#26:ci:failure:abcdef01');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// ---- auto-merge of an approved pull request, by the operator's per-repository policy
+import { Merger, globToRegExp } from '../src/merge.mjs';
+const MERGE = { 'owner/hello': { deny: ['compose.yaml', '.github/**', 'docs/**/*.secret'] } };
+const withMerge = (extra = {}) => withCi({ MERGE_POLICY: JSON.stringify(MERGE), ...extra });
+const API = '/api/v1/repos/owner/hello';
+
+// A fake Forgejo: routes maps "METHOD path" to a value or a function (url, body) => value; unknown calls answer 404.
+function fakeForgejo(routes) {
+  const calls = [];
+  const send = async (url, request) => {
+    const u = new URL(url);
+    const body = request.body ? JSON.parse(request.body) : undefined;
+    calls.push({ method: request.method, path: u.pathname, search: u.search, body });
+    const route = routes[request.method + ' ' + u.pathname];
+    if (route === undefined) return { ok: false, status: 404 };
+    const value = typeof route === 'function' ? route(u, body) : route;
+    return { ok: true, status: 200, json: async () => value };
+  };
+  const wrote = () => calls.filter((call) => call.method !== 'GET').map((call) => call.method + ' ' + call.path.replace(API, ''));
+  return { calls, send, wrote };
+}
+const goodRoutes = (over = {}) => ({
+  ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: true, title: 'WIP: Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] },
+  ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'success', total_count: 2 },
+  ['GET ' + API + '/pulls/34/files']: [{ filename: 'README.md' }, { filename: 'src/a.mjs' }],
+  ['PATCH ' + API + '/pulls/34']: {}, ['POST ' + API + '/pulls/34/merge']: {}, ['POST ' + API + '/issues/34/comments']: {}, ['PATCH ' + API + '/issues/26']: {},
+  ...over
+});
+async function mergerFor(routes, extra) {
+  const config = loadConfig(env(withMerge(extra)));
+  const forgejo = fakeForgejo(routes);
+  return { config, forgejo, merger: new Merger(config, forgejo.send, quiet) };
+}
+const approvedEvent = () => ({ repository: { full_name: repo }, pull_request: { number: 34, head_ref: 'ai/issue-26' }, issue: { number: 26 } });
+
+test('globs: * stays in a folder, ** crosses folders, a plain name is exact', () => {
+  const m = (glob, path) => globToRegExp(glob).test(path);
+  assert.ok(m('compose.yaml', 'compose.yaml'));
+  assert.ok(!m('compose.yaml', 'sub/compose.yaml'));
+  assert.ok(m('.github/**', '.github/workflows/image.yaml'));
+  assert.ok(!m('.github/**', 'x.github/a'));
+  assert.ok(m('stacks/*/compose.yaml', 'stacks/app/compose.yaml'));
+  assert.ok(!m('stacks/*/compose.yaml', 'stacks/app/sub/compose.yaml'));
+  assert.ok(m('**/*.env', 'a/b/c.env'));
+  assert.ok(m('**/*.env', 'c.env'));
+  assert.ok(m('docs/**/*.secret', 'docs/a/b/x.secret'));
+  assert.ok(!m('a.b', 'aXb'));
+});
+
+test('MERGE_POLICY and MERGE_METHOD are validated; a repository without an entry has no policy', () => {
+  const policy = loadConfig(env(withMerge())).mergePolicy;
+  assert.deepEqual([...policy.keys()], ['owner/hello']);
+  assert.ok(policy.get('owner/hello').deny[0].test('compose.yaml'));
+  assert.equal(loadConfig(env(withMerge({ MERGE_METHOD: 'squash' }))).mergeMethod, 'squash');
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: '{' }))), /MERGE_POLICY must be valid JSON/);
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: '{"nope":{}}' }))), /not owner\/repository/);
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: '{"a/b":{"deny":"x"}}' }))), /list of patterns/);
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_METHOD: 'octopus' }))), /MERGE_METHOD/);
+  assert.throws(() => loadConfig(env(withMerge({ FORGEJO_URL: '', FORGEJO_TOKEN: '', AGENT_SECRETS: '' }))), /needs FORGEJO_URL and FORGEJO_TOKEN/);
+});
+
+test('the approval label on a pull request becomes a merge event, a round label comes first, and it needs the policy', () => {
+  const norm = (labels, options = { approved: 'ai:approved', prLabels: ['ai:changes'] }) =>
+    normalizeEvent('pull_request', prPayload(labels), new Set([repo]), [], { labelEvents: true, ...options });
+  assert.equal(norm(['ai:approved']).type, 'pull_request.approved');
+  assert.equal(norm(['ai:approved']).pull_request.number, 34);
+  assert.equal(norm(['ai:approved', 'ai:changes']).type, 'pull_request.labeled');
+  assert.equal(norm(['ai:approved'], { approved: '', prLabels: ['ai:changes'] }), null);
+  const labeled = normalizeEvent('pull_request', { ...prPayload(['ai:approved']), action: 'labeled', label: { name: 'ai:approved' } }, new Set([repo]), [], { approved: 'ai:approved' });
+  assert.equal(labeled.type, 'pull_request.approved');
+});
+
+test('merge: approved, green, nothing protected -> title cleaned, merged on the checked commit, issue closed', async () => {
+  const { merger, forgejo } = await mergerFor(goodRoutes());
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /pulls/34/merge', 'POST /issues/34/comments', 'PATCH /issues/26']);
+  const byPath = (method, path) => forgejo.calls.find((call) => call.method === method && call.path === API + path);
+  assert.equal(byPath('PATCH', '/pulls/34').body.title, 'Fix it');
+  assert.deepEqual(byPath('POST', '/pulls/34/merge').body, { Do: 'merge', head_commit_id: 'cafe0000cafe', delete_branch_after_merge: true });
+  assert.deepEqual(byPath('PATCH', '/issues/26').body, { state: 'closed' });
+  assert.match(byPath('POST', '/issues/34/comments').body.body, /merged: approved by the reviewer/);
+});
+
+test('merge: the method comes from MERGE_METHOD, and a title without WIP is left alone', async () => {
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] } });
+  const { merger, forgejo } = await mergerFor(routes, { MERGE_METHOD: 'squash' });
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.ok(!forgejo.wrote().includes('PATCH /pulls/34'));
+  assert.equal(forgejo.calls.find((call) => call.path.endsWith('/merge')).body.Do, 'squash');
+});
+
+test('merge: a protected path stops it with a comment, whichever page of files it is on', async () => {
+  const page = (n) => Array.from({ length: 50 }, (_, i) => ({ filename: 'src/f' + n + '-' + i + '.mjs' }));
+  const files = (url) => {
+    const p = Number(url.searchParams.get('page'));
+    if (p === 1 || p === 2) return page(p);
+    if (p === 3) return [{ filename: 'ok.txt' }, { filename: 'old.txt', previous_filename: '.github/workflows/image.yaml' }];
+    return [];
+  };
+  const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: files }));
+  assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
+  assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments']);
+  assert.match(forgejo.calls.find((call) => call.method === 'POST').body.body, /protected paths \(\.github\/workflows\/image\.yaml\)/);
+});
+
+test('merge: nothing happens without policy, approval, green CI, a clean merge, an open agent branch', async () => {
+  const pr = (over) => ({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: true, title: 'x', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }], ...over } });
+  const cases = [
+    [pr({ labels: [] }), 'not_approved', []],
+    [pr({ labels: [{ name: 'ai:approved' }, { name: 'ai:blocked' }] }), 'blocked', []],
+    [pr({ merged: true }), 'not_open', []],
+    [pr({ state: 'closed' }), 'not_open', []],
+    [pr({ head: { ref: 'feature/x', sha: 'cafe0000cafe' } }), 'not_an_agent_branch', []],
+    [pr({ mergeable: false }), 'not_mergeable', ['POST /issues/34/comments']],
+    [{ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'pending', total_count: 1 } }, 'ci_not_green', []],
+    [{ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'success', total_count: 0 } }, 'ci_not_green', []]
+  ];
+  for (const [over, outcome, wrote] of cases) {
+    const { merger, forgejo } = await mergerFor(goodRoutes(over));
+    assert.equal(await merger.handle(approvedEvent()), outcome);
+    assert.deepEqual(forgejo.wrote(), wrote);
+  }
+  const noPolicy = await mergerFor(goodRoutes());
+  noPolicy.config.mergePolicy.clear();
+  assert.equal(await noPolicy.merger.handle(approvedEvent()), 'no_merge_policy');
+  assert.equal(noPolicy.forgejo.calls.length, 0);
+});
+
+test('merge: a Forgejo error is reported as a failed merge, never thrown', async () => {
+  const { merger } = await mergerFor(goodRoutes({ ['POST ' + API + '/pulls/34/merge']: undefined }));
+  assert.equal(await merger.handle(approvedEvent()), 'merge_failed');
+});
+
+test('a round or a review takes back the earlier approval first', async () => {
+  const forgejo = fakeForgejo({ ['GET ' + API + '/issues/34/labels']: [{ id: 5, name: 'ai:approved' }, { id: 6, name: 'bug' }], ['DELETE ' + API + '/issues/34/labels/5']: {} });
+  const api = fakeApi();
+  const config = loadConfig(env(withMerge()));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request), quiet, () => clock);
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  assert.deepEqual(forgejo.wrote(), ['DELETE /issues/34/labels/5']);
+});
+
+test('the webhook merges an approved agent pull request and says so', async () => {
+  const forgejo = fakeForgejo(goodRoutes());
+  const config = loadConfig(env(withMerge()));
+  const store = new DeliveryStore(config.dataFile);
+  await store.load();
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
+  const server = createApp(config, store, undefined, quiet, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const post = async (labels, delivery) => {
+    const raw = Buffer.from(JSON.stringify(prPayload(labels)));
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/webhooks/forgejo', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forgejo-event': 'pull_request', 'x-forgejo-delivery': delivery,
+        'x-forgejo-signature': createHmac('sha256', config.forgejoSecret).update(raw).digest('hex') },
+      body: raw
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  try {
+    assert.deepEqual(await post(['ai:approved'], 'd-merge-1'), { status: 202, body: { status: 'merged', delivery_id: 'd-merge-1' } });
+    assert.ok(forgejo.wrote().includes('POST /pulls/34/merge'));
+    forgejo.calls.length = 0;
+    // the same label again, with the label seen before: no second merge attempt
+    assert.equal((await post(['ai:approved'], 'd-merge-2')).body.status, 'already_approved');
+    assert.equal(forgejo.calls.length, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
