@@ -254,18 +254,39 @@ export class Dispatcher {
 
   // The rounds are used up: say so on the pull request and mark it for a human. Best effort, a failure is only logged.
   async roundsUsedUp(event) {
-    const { number } = event.pull_request;
     this.logger.error(this.issueKey(event) + ': ' + this.config.maxRounds + ' rounds used up, not starting another');
+    await this.markForHuman(event, 'ForgeHands: ' + this.config.maxRounds + ' follow-up rounds for issue #' + event.issue.number + ' are used up. A human has to look at this pull request now.');
+  }
+
+  // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
+  async markForHuman(event, text) {
     if (!this.config.forgejo) return;
+    const { number } = event.pull_request;
     const call = (method, path, body) => this.forgejoCall(event, method, path, body);
     try {
-      await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + this.config.maxRounds + ' follow-up rounds for issue #' + event.issue.number + ' are used up. A human has to look at this pull request now.' });
+      await call('POST', '/issues/' + number + '/comments', { body: text });
       const known = await call('GET', '/labels?limit=100');
       let label = (known || []).find((entry) => entry.name === this.config.blockedLabel);
       if (!label) label = await call('POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
       await call('POST', '/issues/' + number + '/labels', { labels: [label.id] });
     } catch (error) {
       this.logger.error('could not mark the pull request:', error.message);
+    }
+  }
+
+  // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
+  // for ever, green and unseen. Unless it moved on meanwhile, say so and hand it to a human.
+  async checkVerdict(job) {
+    const event = job.event;
+    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
+    try {
+      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
+      const names = (pr.labels || []).map((label) => label.name);
+      if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
+      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.');
+    } catch (error) {
+      this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
     }
   }
 
@@ -378,6 +399,7 @@ export class Dispatcher {
     }
     if (TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
+      if (this.config.routes.get(job.label)?.kind === 'ci_success') await this.checkVerdict(job);
       return true;
     }
     if (costChanged) return true;
