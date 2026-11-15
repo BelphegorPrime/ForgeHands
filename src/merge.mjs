@@ -67,16 +67,17 @@ export class Merger {
       if (status?.state !== 'success' || !(status.total_count > 0)) return 'ci_not_green';
       const protectedFiles = (await this.changedFiles(repository, number))
         .filter((name) => policy.deny.some((pattern) => pattern.test(name)));
-      if (protectedFiles.length) {
-        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). A human merges it.');
-        return 'protected_paths';
-      }
-      // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable); the approval is what
-      // lifts that. Only after the title is clean does `mergeable` say anything about conflicts, so look at the pull request again.
+      // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable). Approved and green is
+      // the end of the work in progress, for a human as much as for ForgeHands: the marker goes before either merges it. Only after
+      // the title is clean does `mergeable` say anything about conflicts, so look at the pull request again.
       let current = pr;
       if (WIP.test(pr.title || '')) {
         await this.call(repository, 'PATCH', '/pulls/' + number, { title: pr.title.replace(WIP, '') });
         current = await this.call(repository, 'GET', '/pulls/' + number);
+      }
+      if (protectedFiles.length) {
+        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.');
+        return 'protected_paths';
       }
       if (current?.mergeable === false) {
         await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.');

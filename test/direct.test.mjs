@@ -785,9 +785,18 @@ test('merge: a real conflict after the title is clean is reported, and a blocked
   const conflict = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: false, title: 'WIP: Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] } }));
   assert.equal(await conflict.merger.handle(approvedEvent()), 'not_mergeable');
   assert.deepEqual(conflict.forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
-  const protectedOne = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }] }));
-  assert.equal(await protectedOne.merger.handle(approvedEvent()), 'protected_paths');
-  assert.ok(!protectedOne.forgejo.wrote().includes('PATCH /pulls/34'));
+  // not ready (red status): the marker stays
+  const red = await mergerFor(goodRoutes({ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'failure', total_count: 1 } }));
+  assert.equal(await red.merger.handle(approvedEvent()), 'ci_not_green');
+  assert.ok(!red.forgejo.wrote().includes('PATCH /pulls/34'));
+});
+
+test('merge: a protected path hands the pull request to a human with the WIP marker already removed', async () => {
+  const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }] }));
+  assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
+  assert.equal(forgejo.calls.find((call) => call.method === 'PATCH').body.title, 'Fix it');
+  assert.match(forgejo.calls.find((call) => call.method === 'POST').body.body, /ready for a human to merge/);
 });
 
 test('merge: a protected path stops it with a comment, whichever page of files it is on', async () => {
@@ -800,7 +809,7 @@ test('merge: a protected path stops it with a comment, whichever page of files i
   };
   const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: files }));
   assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
-  assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments']);
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
   assert.match(forgejo.calls.find((call) => call.method === 'POST').body.body, /protected paths \(\.github\/workflows\/image\.yaml\)/);
 });
 
