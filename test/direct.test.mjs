@@ -1197,3 +1197,66 @@ test('only a dependency that is still open holds the ai:close review back, and E
   const other = await buildEpic({ ['GET ' + API + '/issues/11/blocks']: [closing], ['GET ' + API + '/issues/10/dependencies']: [issue(11, 'closed')] }, { EPIC_LABEL: 'ai:plan' });
   assert.equal(await other.dispatcher.onClosed(closedEvent(11)), 'nothing_ready');
 });
+
+// ---- a directory per run, and a review that ends without a verdict
+async function buildVerdict(routes, extra = {}) {
+  const config = loadConfig(env(withCi(extra)));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const forgejo = fakeForgejo(routes);
+  const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
+  return { config, jobs, forgejo, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+const reviewJob = () => ({ key: 'owner/hello#26:ci:success:abcdef01', label: 'ci:success', status: 'running', started: clock, created: clock, conversation_id: 'conv-r', event: ciEvent('success') });
+const prWith = (labels, over = {}) => ({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, head: { sha: 'abcdef0123456789' }, labels: labels.map((name) => ({ name })), ...over },
+  ['POST ' + API + '/issues/34/comments']: {}, ['GET ' + API + '/labels']: [{ id: 9, name: 'ai:blocked' }], ['POST ' + API + '/issues/34/labels']: {} });
+
+test('every kind of run on a pull request clones into a directory of its own, and a leftover one is no obstacle', () => {
+  const config = loadConfig(env(withCi()));
+  const dirOf = (e) => buildPrompt(e, config).match(/at (\/projects\/\S+)/)[1];
+  const review = dirOf(ciEvent('success'));
+  const fix = dirOf(ciEvent('failure'));
+  const worker = dirOf(event('ai:ready', 26));
+  const roundA = dirOf({ ...prEvent(), delivery_id: 'aaaa1111-x' });
+  const roundB = dirOf({ ...prEvent(), delivery_id: 'bbbb2222-y' });
+  assert.equal(review, '/projects/owner-hello-issue-26-review-abcdef01');
+  assert.equal(fix, '/projects/owner-hello-issue-26-fix-abcdef01');
+  assert.equal(worker, '/projects/owner-hello-issue-26');
+  assert.notEqual(roundA, roundB);
+  assert.equal(new Set([review, fix, worker, roundA]).size, 4);
+  for (const e of [ciEvent('success'), ciEvent('failure'), prEvent(), event('ai:ready', 26)]) assert.match(buildPrompt(e, config), /If that directory exists from an earlier run, delete it and clone again/);
+});
+
+test('a review run that ends without a verdict is marked for a human', async () => {
+  const { dispatcher, jobs, forgejo } = await buildVerdict(prWith([]));
+  const job = jobs.add(reviewJob());
+  states['conv-r'] = 'finished';
+  await dispatcher.tick();
+  assert.equal(job.status, 'done');
+  assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments', 'POST /issues/34/labels']);
+  assert.match(forgejo.calls.find((call) => call.path.endsWith('/comments')).body.body, /review of commit abcdef01 ended without a verdict/);
+});
+
+test('a review with a verdict, a moved pull request or another kind of run is left alone', async () => {
+  for (const routes of [prWith(['ai:approved']), prWith(['ai:changes']), prWith(['ai:blocked']), prWith([], { merged: true }), prWith([], { state: 'closed' }), prWith([], { head: { sha: 'ffffffff00000000' } })]) {
+    const { dispatcher, jobs, forgejo } = await buildVerdict(routes);
+    jobs.add(reviewJob());
+    states['conv-r'] = 'finished';
+    await dispatcher.tick();
+    assert.deepEqual(forgejo.wrote(), []);
+  }
+  const { dispatcher, jobs, forgejo } = await buildVerdict(prWith([]));
+  jobs.add({ ...reviewJob(), key: 'owner/hello#26:ai:ready', label: 'ai:ready', event: event('ai:ready', 26) });
+  states['conv-r'] = 'finished';
+  await dispatcher.tick();
+  assert.deepEqual(forgejo.wrote(), []);
+});
+
+test('a failing Forgejo call while checking the verdict is only logged', async () => {
+  const { dispatcher, jobs } = await buildVerdict({});
+  const job = jobs.add(reviewJob());
+  states['conv-r'] = 'finished';
+  await dispatcher.tick();
+  assert.equal(job.status, 'done');
+});
