@@ -1307,3 +1307,81 @@ test('rounds used up, a review without verdict and an epic with gaps mention him
   assert.match(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /starts with @marcel/);
   assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic()))), /@marcel|mention/);
 });
+
+// ---- the model is out of quota: hold the tier back and try again, instead of blocking the pull request
+const rateLimitError = (seconds) => ({ kind: 'ConversationErrorEvent', code: 'LLMRateLimitError', classification: { kind: 'rate_limit', retryable: true },
+  detail: 'litellm.RateLimitError: OpenAIException - {"error":{"message":"quota","retry_after":' + seconds + '}}' });
+async function buildQuota(events) {
+  const config = loadConfig(env(withCi()));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const forgejo = fakeForgejo(prWith([]));
+  const send = async (url, request) => {
+    const u = new URL(url);
+    if (String(url).startsWith('https://forge.example/')) return forgejo.send(url, request);
+    if (u.pathname.endsWith('/events/search')) return events === null ? { ok: false, status: 500 } : { ok: true, status: 200, json: async () => ({ items: events }) };
+    return api(url, request);
+  };
+  return { config, jobs, forgejo, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+
+test('a run that ends with a rate limit is queued again after the reset, the tier waits, nobody is called', async () => {
+  const { dispatcher, jobs, forgejo } = await buildQuota([rateLimitError(7200)]);
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+  await dispatcher.tick();
+  assert.equal(job.status, 'running');
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.status, 'queued');
+  assert.equal(job.rate_limited, 1);
+  assert.equal(job.next_try, clock + 7200 * 1000);
+  assert.equal(job.conversation_id, undefined);
+  assert.deepEqual(forgejo.wrote(), []);                  // no "ended without a verdict", no label, no mention
+  assert.match(buildStatus(dispatcher.config, jobs, clock).issues[0].state, /^model quota used up, review tries again after \d\d:\d\d UTC$/);
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);                       // still waiting
+  // another job of the same tier does not start either while the quota is out
+  jobs.add({ key: 'owner/hello#27:ci:success:11111111', label: 'ci:success', status: 'queued', created: clock, event: { ...ciEvent('success'), issue: { number: 27, title: 't', body: '', labels: [] } } });
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+  clock += 7200 * 1000 + 1;
+  await dispatcher.tick();
+  assert.equal(starts().length, 3);                       // both start once the reset has passed
+});
+
+test('another failure, an unreadable error and too many retries end the run as before', async () => {
+  for (const events of [[{ kind: 'ConversationErrorEvent', code: 'SomethingElse', classification: { kind: 'other' }, detail: 'boom' }], [], null]) {
+    const { dispatcher, jobs, forgejo } = await buildQuota(events);
+    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+    await dispatcher.tick();
+    states[job.conversation_id] = 'error';
+    await dispatcher.tick();
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result, 'error');
+    assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments', 'POST /issues/34/labels']); // the pull request is marked as before
+  }
+  const { dispatcher, jobs } = await buildQuota([rateLimitError(60)]);
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 12 });
+  await dispatcher.tick();
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.status, 'failed');
+});
+
+test('the wait is taken from the gateway, kept within sane bounds and has a default', async () => {
+  for (const [seconds, expected] of [[7200, 7200], [5, 60], [999999, 6 * 3600]]) {
+    const { dispatcher, jobs } = await buildQuota([rateLimitError(seconds)]);
+    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+    await dispatcher.tick();
+    states[job.conversation_id] = 'error';
+    await dispatcher.tick();
+    assert.equal(job.next_try - clock, expected * 1000, String(seconds));
+  }
+  const { dispatcher, jobs } = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMRateLimitError', detail: 'no number in here' }]);
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+  await dispatcher.tick();
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.next_try - clock, 900 * 1000);
+});
