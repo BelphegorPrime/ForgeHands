@@ -1234,14 +1234,17 @@ test('every kind of run on a pull request clones into a directory of its own, an
   for (const e of [ciEvent('success'), ciEvent('failure'), prEvent(), event('ai:ready', 26)]) assert.match(buildPrompt(e, config), /If that directory exists from an earlier run, delete it and clone again/);
 });
 
-test('a review run that ends without a verdict is marked for a human', async () => {
+test('a review run that ends without a verdict is run once more, then marked for a human', async () => {
   const { dispatcher, jobs, forgejo } = await buildVerdict(prWith([]));
   const job = jobs.add(reviewJob());
-  states['conv-r'] = 'finished';
-  await dispatcher.tick();
-  assert.equal(job.status, 'done');
+  await dispatcher.checkVerdict(job);
+  assert.equal(job.status, 'queued');
+  assert.equal(job.verdict_retry, 1);
+  assert.equal(job.conversation_id, undefined);
+  assert.deepEqual(forgejo.wrote(), []);
+  await dispatcher.checkVerdict(job);
   assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments', 'POST /issues/34/labels']);
-  assert.match(forgejo.calls.find((call) => call.path.endsWith('/comments')).body.body, /review of commit abcdef01 ended without a verdict/);
+  assert.match(forgejo.calls.find((call) => call.path.endsWith('/comments')).body.body, /review of commit abcdef01 ended twice without a verdict/);
 });
 
 test('a review with a verdict, a moved pull request or another kind of run is left alone', async () => {
@@ -1300,15 +1303,15 @@ test('a successful merge and a pull request that is not ready never mention him'
 
 test('rounds used up, a review without verdict and an epic with gaps mention him; without HUMAN_LOGIN nobody is mentioned', async () => {
   const blocked = await buildVerdict(prWith([]), { HUMAN_LOGIN: 'marcel' });
-  blocked.jobs.add(reviewJob());
+  blocked.jobs.add({ ...reviewJob(), verdict_retry: 1 });
   states['conv-r'] = 'finished';
   await blocked.dispatcher.tick();
-  assert.match(commentsOf(blocked.forgejo)[0], /^@marcel ForgeHands: the review of commit abcdef01 ended without a verdict/);
+  assert.match(commentsOf(blocked.forgejo)[0], /^@marcel ForgeHands: the review of commit abcdef01 ended twice without a verdict/);
   const plain = await buildVerdict(prWith([]));
-  plain.jobs.add(reviewJob());
+  plain.jobs.add({ ...reviewJob(), verdict_retry: 1 });
   states['conv-r'] = 'finished';
   await plain.dispatcher.tick();
-  assert.match(commentsOf(plain.forgejo)[0], /^ForgeHands: the review/);
+  assert.match(commentsOf(plain.forgejo)[0], /^ForgeHands: the review of commit abcdef01 ended twice/);
   const epic = { type: 'epic.done', repository: { full_name: repo }, issue: { number: 10, title: 'Epic', body: 'B', labels: [] }, epic: { children: [] }, sender: { login: 'marcel' } };
   assert.match(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /starts with @marcel/);
   assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic()))), /@marcel|mention/);
@@ -1359,7 +1362,7 @@ test('a run that ends with a rate limit is queued again after the reset, the tie
 test('another failure, an unreadable error and too many retries end the run as before', async () => {
   for (const events of [[{ kind: 'ConversationErrorEvent', code: 'SomethingElse', classification: { kind: 'other' }, detail: 'boom' }], [], null]) {
     const { dispatcher, jobs, forgejo } = await buildQuota(events);
-    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+    const job = jobs.add({ ...reviewJob(), verdict_retry: 1, status: 'queued', conversation_id: undefined, started: undefined });
     await dispatcher.tick();
     states[job.conversation_id] = 'error';
     await dispatcher.tick();
@@ -1368,7 +1371,7 @@ test('another failure, an unreadable error and too many retries end the run as b
     assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments', 'POST /issues/34/labels']); // the pull request is marked as before
   }
   const { dispatcher, jobs } = await buildQuota([rateLimitError(60)]);
-  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 12 });
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 12, verdict_retry: 1 });
   await dispatcher.tick();
   states[job.conversation_id] = 'error';
   await dispatcher.tick();
