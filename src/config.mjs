@@ -64,6 +64,13 @@ function parseMergePolicy(text) {
   return policy;
 }
 
+function parseHumanLogin(value) {
+  const login = String(value || '').trim().replace(/^@/, '');
+  if (!login) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(login)) throw new Error('HUMAN_LOGIN must be a Forgejo login');
+  return login;
+}
+
 export function loadConfig(env = process.env) {
   const forgejoSecret = env.FORGEJO_WEBHOOK_SECRET || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
@@ -154,6 +161,9 @@ export function loadConfig(env = process.env) {
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
+    // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
+    humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
     approvedLabel: env.APPROVED_LABEL || 'ai:approved',
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
