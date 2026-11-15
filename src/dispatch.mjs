@@ -84,6 +84,13 @@ export class Dispatcher {
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
     const kind = this.config.routes.get(label).kind;
+    if (event.ci) {
+      // A CI outcome says nothing while an agent still works on the issue (it will push again), and nothing about a commit
+      // that is no longer the head of the pull request (the run was replaced by a newer push).
+      const base = this.issueKey(event) + ':';
+      if (this.jobs.list(true).some((job) => job.key.startsWith(base))) return { status: 'issue_busy' };
+      if (await this.isStale(event)) return { status: 'stale_run' };
+    }
     if (kind === 'ci_success' && !(await this.commitGreen(event))) return { status: 'ci_not_green' };
     if (event.pull_request && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
       await this.roundsUsedUp(event);
@@ -117,6 +124,18 @@ export class Dispatcher {
   async approve(event) {
     if (Array.isArray(event.previous_labels) && event.previous_labels.includes(this.config.approvedLabel)) return 'already_approved';
     return this.merger.handle(event);
+  }
+
+  // Is the commit of a CI run no longer the head of its pull request? Unknown (no access, error) counts as not stale.
+  async isStale(event) {
+    if (!this.config.forgejo) return false;
+    try {
+      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      return Boolean(pr?.head?.sha) && pr.head.sha !== event.ci.commit_sha;
+    } catch (error) {
+      this.logger.error('could not read the head of #' + event.pull_request.number + ':', error.message);
+      return false;
+    }
   }
 
   // Forgejo sends one event per finished workflow run. All workflows of the commit have to be green: the combined commit

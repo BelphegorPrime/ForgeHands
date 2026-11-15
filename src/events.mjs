@@ -112,6 +112,8 @@ function normalizeCiRun(event, payload, allowedRepos, ci) {
   const label = event === 'action_run_failure' ? ci.failure : ci.success;
   const run = payload?.run;
   if (!label || !run || typeof run !== 'object' || run.event !== 'pull_request' || typeof run.event_payload !== 'string') return null;
+  // Forgejo also sends `action_run_failure` for a run that was cancelled (a newer push replaced it) or skipped: not a failure.
+  if (run.status !== (event === 'action_run_failure' ? 'failure' : 'success')) return null;
   const fullName = run.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   let data;

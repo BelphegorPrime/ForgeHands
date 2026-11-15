@@ -614,6 +614,10 @@ test('a failed CI run starts a fix round on the same branch, once per commit', a
   assert.doesNotMatch(text, /remove the label/);
   assert.equal(jobs.list()[0].key, 'owner/hello#26:ci:failure:abcdef01');
   assert.equal((await dispatcher.enqueue(ciEvent('failure', { sha: 'abcdef0123456789' }))).status, 'duplicate_job');
+  // another commit has to wait until the run of the first one is over
+  assert.equal((await dispatcher.enqueue(ciEvent('failure', { sha: 'ffffff0123456789' }))).status, 'issue_busy');
+  states[jobs.list()[0].conversation_id] = 'finished';
+  await dispatcher.tick();
   assert.equal((await dispatcher.enqueue(ciEvent('failure', { sha: 'ffffff0123456789' }))).status, 'queued');
 });
 
@@ -630,7 +634,7 @@ test('a green commit starts the review; it needs all workflows green and never c
   assert.match(text, /add the label ai:approved/);
   assert.match(text, /add the label ai:changes instead/);
   assert.match(text, /at most 25 tool calls/);
-  assert.match(green.forgejo[0].path, /\/commits\/abcdef0123456789\/status$/);
+  assert.ok(green.forgejo.some((call) => /\/commits\/abcdef0123456789\/status$/.test(call.path)));
   assert.equal(green.dispatcher.rounds(ciEvent('success')), 0);
 });
 
@@ -646,9 +650,12 @@ test('no review while another workflow is pending or failed, on an unknown statu
 });
 
 test('fix rounds share the round limit with label rounds', async () => {
-  const { dispatcher } = await buildCi({}, { MAX_ROUNDS: '2' });
+  const { dispatcher, jobs } = await buildCi({}, { MAX_ROUNDS: '2' });
+  const finish = async () => { await dispatcher.tick(); states[jobs.list().at(-1).conversation_id] = 'finished'; await dispatcher.tick(); };
   assert.equal((await dispatcher.enqueue(ciEvent('failure', { sha: '1111111100' }))).status, 'queued');
+  await finish();
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  await finish();
   assert.equal((await dispatcher.enqueue(ciEvent('failure', { sha: '2222222200' }))).status, 'rounds_exceeded');
 });
 
@@ -866,4 +873,48 @@ test('the webhook merges an approved agent pull request and says so', async () =
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+// ---- CI outcomes that must not start anything
+test('a cancelled or skipped run is not a failure, a run of another status is not a success', () => {
+  for (const status of ['cancelled', 'skipped', 'running', 'waiting']) {
+    assert.equal(normalizeEvent('action_run_failure', runPayload(status), new Set([repo]), [], { ci: CI_ROUTES }), null, status);
+  }
+  assert.equal(normalizeEvent('action_run_success', runPayload('failure'), new Set([repo]), [], { ci: CI_ROUTES }), null);
+  assert.notEqual(ciEvent('failure'), null);
+  assert.notEqual(ciEvent('success'), null);
+});
+
+// the Forgejo of buildCi answers every call with `status`; this one answers the pull request with its head commit
+async function buildCiWithHead(head, status = { state: 'success', total_count: 1 }) {
+  const config = loadConfig(env(withCi()));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    const path = new URL(url).pathname;
+    return { ok: true, status: 200, json: async () => (path.endsWith('/pulls/34') ? { head: { sha: head } } : status) };
+  };
+  return { jobs, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+
+test('a CI outcome of a commit that is no longer the head of the pull request starts nothing', async () => {
+  const stale = await buildCiWithHead('ffffffff00000000');
+  assert.equal((await stale.dispatcher.enqueue(ciEvent('failure'))).status, 'stale_run');
+  assert.equal((await stale.dispatcher.enqueue(ciEvent('success'))).status, 'stale_run');
+  assert.equal(starts().length, 0);
+  const current = await buildCiWithHead('abcdef0123456789');
+  assert.equal((await current.dispatcher.enqueue(ciEvent('failure'))).status, 'queued');
+});
+
+test('no CI-triggered run while an agent still works on the issue', async () => {
+  const { dispatcher, jobs } = await buildCiWithHead('abcdef0123456789');
+  assert.equal((await dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
+  assert.equal((await dispatcher.enqueue(ciEvent('failure'))).status, 'issue_busy');
+  assert.equal((await dispatcher.enqueue(ciEvent('success'))).status, 'issue_busy');
+  await dispatcher.tick();
+  states[jobs.list()[0].conversation_id] = 'finished';
+  await dispatcher.tick();
+  assert.equal((await dispatcher.enqueue(ciEvent('failure'))).status, 'queued');
 });
