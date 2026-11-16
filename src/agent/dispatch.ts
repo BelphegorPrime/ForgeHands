@@ -627,6 +627,16 @@ export class Dispatcher {
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {
+    // Dependencies are looked at when the job is queued, but an edge may be added afterwards (a ticket labelled before its dependencies were
+    // set): look again before a worker starts, so that the order the edges give is kept.
+    if (this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && this.config.forgejo) {
+      const open = await this.openDependencies(job.event, job.event.issue.number);
+      if (open.length) {
+        Object.assign(job, { status: 'waiting', waiting_for: open });
+        this.logger.error(job.key + ' waits for ' + open.map((number) => '#' + number).join(', ') + ' (dependencies added after it was queued)');
+        return true;
+      }
+    }
     if (job.event.ci && this.config.routes.get(job.label)?.kind === 'ci_failure' && (await this.commitRecovered(job.event))) {
       this.jobs.remove(job.id);
       return true;

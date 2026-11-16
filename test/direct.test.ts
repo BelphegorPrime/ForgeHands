@@ -670,6 +670,30 @@ test('the hand-over to the human says what the security review found for this co
   assert.doesNotMatch(await say(review('CONCERNS')), /security review/i, 'without the route the text is as before');
 });
 
+test('a queued ticket whose dependencies were added afterwards waits instead of starting', async () => {
+  const forgejo = [];
+  const config = loadConfig(env({}));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  let asked = 0;
+  const open = [{ number: 130, state: 'open' }, { number: 131, state: 'closed' }];
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    const path = new URL(url).pathname;
+    forgejo.push(request.method + ' ' + path);
+    // The first look (when the ticket is queued) finds no dependency; the edges are added after that.
+    return { ok: true, status: 200, json: async () => path.endsWith('/dependencies') ? (asked++ === 0 ? [] : open) : [] };
+  };
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  assert.equal((await dispatcher.enqueue(event('ai:ready', 132))).status, 'queued');
+  await dispatcher.tick();
+  assert.equal(starts().length, 0, 'nothing started');
+  const job = jobs.list(true)[0];
+  assert.equal(job.status, 'waiting');
+  assert.deepEqual(job.waiting_for, [130]);
+});
+
 test('rounds are limited per issue; the pull request is told and marked when they are used up', async () => {
   const forgejo = [];
   const config = loadConfig(env(withChanges({ MAX_ROUNDS: '2' })));
