@@ -1892,7 +1892,8 @@ test('after a push to the default branch the tickets of merged agent pull reques
   const dispatcher = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
   assert.equal(await dispatcher.closeMergedTickets(movedEvent()), 1);
   assert.deepEqual(forgejo.wrote(), ['POST /issues/53/comments', 'PATCH /issues/53'], 'only the open ticket of a merged agent pull request into the default branch');
-  const offline = new Dispatcher(loadConfig(env({ ...withBranches({}), FORGEJO_URL: '', FORGEJO_TOKEN: '', AGENT_SECRETS: '' })), jobs, forgejo.send, quiet, () => clock);
+  const offline = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
+  offline.config = { ...config, forgejo: null };
   assert.equal(await offline.closeMergedTickets(movedEvent()), 0, 'without Forgejo access nothing happens');
 });
 
