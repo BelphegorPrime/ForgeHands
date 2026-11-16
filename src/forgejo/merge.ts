@@ -82,7 +82,8 @@ export class Merger {
         current = await this.call(repository, 'GET', '/pulls/' + number);
       }
       if (protectedFiles.length) {
-        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.', true);
+        const security = await this.securityLine(repository, number, sha);
+        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.' + security, true);
         return 'protected_paths';
       }
       if (current?.mergeable === false) {
@@ -101,6 +102,32 @@ export class Merger {
       this.logger.error('auto-merge of ' + repository + '#' + number + ' failed:', error.message);
       await this.remark(repository, number, 'approved and green, but the merge failed (' + String(error.message).slice(0, 120) + '). A human has to look at this pull request.', true);
       return 'merge_failed';
+    }
+  }
+
+  // The verdict word of the latest security review comment for this commit ("OK" or "CONCERNS"), or null. Advisory, written by the
+  // sensitive reviewer: `## Security review: OK|CONCERNS` and the first eight characters of the commit.
+  async securityReview(repository: string, number: number, sha: string): Promise<string | null> {
+    const comments = await this.call(repository, 'GET', '/issues/' + number + '/comments?limit=100');
+    const found = (Array.isArray(comments) ? comments : [])
+      .map((comment: Json) => ({ at: Date.parse(comment.created_at), text: String(comment.body || '').slice(0, 600) }))
+      .filter((entry) => /security review\s*:\s*(ok|concerns)\b/i.test(entry.text.slice(0, 200)) && entry.text.includes(sha.slice(0, 8)))
+      .sort((a, b) => a.at - b.at)
+      .at(-1);
+    return found ? /concerns/i.test(found.text.slice(0, 200)) ? 'CONCERNS' : 'OK' : null;
+  }
+
+  // One sentence for the comment that hands a protected-path pull request to the human. Empty without a security review route.
+  async securityLine(repository: string, number: number, sha: string): Promise<string> {
+    if (![...this.config.routes.values()].some((route) => route.kind === 'sensitive_review')) return '';
+    try {
+      const verdict = await this.securityReview(repository, number, sha);
+      if (verdict === 'CONCERNS') return ' The security review of this commit has CONCERNS: read its comment before you merge.';
+      if (verdict === 'OK') return ' The security review of this commit found no concerns.';
+      return ' There is no security review of this commit yet.';
+    } catch (error) {
+      this.logger.error('could not read the security review of #' + number + ':', error.message);
+      return '';
     }
   }
 
