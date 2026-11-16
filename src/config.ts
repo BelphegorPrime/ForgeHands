@@ -240,6 +240,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     approvedLabel: env.APPROVED_LABEL || 'ai:approved',
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
+    // Pull requests of dependency bots (Renovate): Forgejo logins and, optionally, head branch prefixes (comma separated). They get the same
+    // review and merge policy as agent pull requests, without a worker. A red commit starts a fix round only with BOT_FIX_ROUNDS (per pull request).
+    botAuthors: new Set((env.BOT_AUTHORS || '').split(',').map((value) => value.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)),
+    botBranchPrefixes: (env.BOT_BRANCH_PREFIXES || '').split(',').map((value) => value.trim()).filter(Boolean),
+    botFixRounds: env.BOT_FIX_ROUNDS === undefined || env.BOT_FIX_ROUNDS === '' || env.BOT_FIX_ROUNDS === '0' ? 0 : positiveInt(env.BOT_FIX_ROUNDS, 0, 'BOT_FIX_ROUNDS', 100) as number,
     epicLabels: new Set((env.EPIC_LABEL || 'ai:plan,ai:close').split(',').map((value) => value.trim()).filter(Boolean)),
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')

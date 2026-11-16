@@ -1,3 +1,4 @@
+import { isBotPull, type BotRules } from '../forgejo/bot.ts';
 import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {
@@ -6,6 +7,8 @@ export interface NormalizeOptions {
   ci?: { failure?: string; success?: string };
   approved?: string;
   pushes?: boolean;
+  /** Dependency bots (BOT_AUTHORS): their pull requests count like agent pull requests. `fixRounds` 0: a red commit and a round label start nothing. */
+  bots?: BotRules & { fixRounds: number };
 }
 
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
@@ -13,11 +16,11 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false }: NormalizeOptions = {}): NormalizedEvent | null {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return pushes ? normalizePush(payload, allowedRepos) : null;
-  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved);
+  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
-  if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci);
+  if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci, bots);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
   const isLabelEvent = labelEvents && (event === 'issue_label' || payload.action === 'label_updated');
   if (event === 'issue_label' && !isLabelEvent) return null;
@@ -68,7 +71,7 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
 // A label on the pull request of an agent issue (branch ai/issue-<n>) starts a follow-up round for that issue. As with issues,
 // Forgejo reports a label change as action `label_updated` with the current labels only, so the event is flagged and the
 // dispatcher compares it with the labels it saw before. `labeled` (with the added label) is accepted as well.
-function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string): ForgeEvent | null {
+function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string, bots?: NormalizeOptions['bots']): ForgeEvent | null {
   const pr = payload?.pull_request;
   if (!pr || typeof pr !== 'object' || (!labels.length && !approved)) return null;
   if (payload.action !== 'label_updated' && payload.action !== 'labeled') return null;
@@ -76,8 +79,11 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
   const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
-  const issueNumber = match ? Number(match[1]) : 0;
+  // A dependency bot's pull request has no ticket: it stands for itself. It takes part in rounds only when BOT_FIX_ROUNDS allows them.
+  const bot = !match && !!bots && isBotPull(bots, pr, fullName);
+  const issueNumber = bot ? pr.number : match ? Number(match[1]) : 0;
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+  if (bot && !bots!.fixRounds) labels = [];
   const present = Array.isArray(pr.labels)
     ? pr.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
     : [];
@@ -96,6 +102,7 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
     source: 'forgejo',
     action: 'labeled',
     ...(isLabelEvent ? { label_event: true } : {}),
+    ...(bot ? { bot: true } : {}),
     label: matched,
     repository: {
       full_name: fullName,
@@ -120,7 +127,7 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
 // A finished Forgejo Actions run of a pull request of an agent issue. Forgejo sends one event per workflow run (header
 // `action_run_failure` or `action_run_success`); `run.event_payload` is the pull request payload that started the run as a
 // JSON string. `ci.failure` and `ci.success` are the route names that handle each outcome (absent: not handled).
-function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>, ci: { failure?: string; success?: string }): ForgeEvent | null {
+function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>, ci: { failure?: string; success?: string }, bots?: NormalizeOptions['bots']): ForgeEvent | null {
   const label = event === 'action_run_failure' ? ci.failure : ci.success;
   const run = payload?.run;
   if (!label || !run || typeof run !== 'object' || run.event !== 'pull_request' || typeof run.event_payload !== 'string') return null;
@@ -133,12 +140,16 @@ function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>,
   const pr = data?.pull_request;
   if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
   const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
-  const issueNumber = match ? Number(match[1]) : 0;
+  const bot = !match && !!bots && isBotPull(bots, pr, fullName);
+  // A red commit of a bot's pull request is only worth a fix round when BOT_FIX_ROUNDS asks for it.
+  if (bot && event === 'action_run_failure' && !bots!.fixRounds) return null;
+  const issueNumber = bot ? pr.number : match ? Number(match[1]) : 0;
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0 || typeof run.commit_sha !== 'string' || !run.commit_sha) return null;
   return {
     type: 'ci.' + (event === 'action_run_failure' ? 'failure' : 'success'),
     source: 'forgejo',
     action: event,
+    ...(bot ? { bot: true } : {}),
     label,
     repository: {
       full_name: fullName,

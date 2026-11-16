@@ -71,10 +71,12 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     const normalized = normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
-      pushes: direct && config.updateBranches });
+      pushes: direct && config.updateBranches,
+      bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, fixRounds: config.botFixRounds } : undefined });
     if (!normalized) { remember(); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
-    if (config.allowedSenders && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
+    // The CI outcome of a bot's pull request is let in by BOT_AUTHORS (the operator's own list), not by who triggered the run. Labels still need an allowed sender.
+    if (config.allowedSenders && !((normalized as ForgeEvent).bot && normalized.type.startsWith('ci.')) && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
       remember();
       return json(res, 202, { status: 'ignored' });
     }

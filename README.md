@@ -144,6 +144,9 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `SPLIT_LABEL` | none | Label (for example `ai:plan`) that sends a ticket whose worker ran out of iterations or time to the planner. |
 | `UPDATE_BRANCHES`, `BRANCH_UPDATE_DELAY_SECONDS`, `BRANCH_UPDATE_MIN_INTERVAL_MINUTES` | on, 60, 30 | Keep open agent pull requests current, see below. |
 | `ARCHIVE_AFTER_DAYS` | 7 | Archive finished OpenHands conversations after this many days; `0` = off. |
+| `BOT_AUTHORS`, `BOT_BRANCH_PREFIXES`, `BOT_FIX_ROUNDS` | none, none, 0 | Dependency bot pull requests, see below: Forgejo logins of the bots (for example `renovate`), optional head branch prefixes (for example `renovate/`), and fix rounds per pull request after a red commit. |
+
+**Dependency bot pull requests.** A pull request qualifies when its author is in `BOT_AUTHORS`, its head branch starts with one of `BOT_BRANCH_PREFIXES` (if set) and the branch lives in the repository itself (not a fork). It then follows the review and merge policy of agent pull requests, without a worker: a **green** commit starts the review once per commit (the reviewer reads the changelogs between the old and the new version and checks breaking changes against the repository's usage), `Verdict: OK` plus `APPROVED_LABEL` merges through `MERGE_POLICY` (deny list unchanged, no issue is closed), and a review that finds a problem sets `BLOCKED_LABEL` with a mention. A **red** commit starts nothing unless `BOT_FIX_ROUNDS` is set. ForgeHands never updates a bot's branch (Renovate rebases itself). The ledger and `/status` list it as `owner/repo!pr<n>`. Titles, descriptions and changelogs of these pull requests are untrusted text, like issue text. Their CI outcomes are let in by `BOT_AUTHORS`, not by `ALLOWED_SENDERS`.
 
 ## Behaviour in detail
 

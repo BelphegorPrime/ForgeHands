@@ -1,12 +1,13 @@
 import { forgejoCall } from './client.ts';
 import { DryLog } from '../dry.ts';
+import { isBotPull } from './bot.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 
 export const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
 const PAGE = 50;
 const MAX_FILES = 1000;
 
-// Merges the pull request of an agent issue once the reviewer approved it, CI is green and it touches no protected path.
+// Merges the pull request of an agent issue (or of a dependency bot, BOT_AUTHORS) once the reviewer approved it, CI is green and it touches no protected path.
 // What may merge is the operator's decision (MERGE_POLICY, per repository), never the repository's or the agent's.
 export class Merger {
   config: DirectConfig;
@@ -57,7 +58,9 @@ export class Merger {
     try {
       const pr = await this.call(repository, 'GET', '/pulls/' + number);
       if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
-      if (!/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
+      // Judged from the pull request as Forgejo has it now, not from the event: an agent branch, or a pull request of a listed bot.
+      const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes }, pr, repository);
+      if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
       const labels = (pr.labels || []).map((label: Json) => label.name);
       if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
@@ -100,8 +103,10 @@ export class Merger {
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
         Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
       });
-      const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
       await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
+      // A bot's pull request belongs to no ticket: there is nothing to close.
+      if (bot) return 'merged';
+      const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
       try { await this.call(repository, 'PATCH', '/issues/' + issue, { state: 'closed' }); }
       catch (error) { this.logger.error('could not close issue #' + issue + ':', error.message); }
       return 'merged';
