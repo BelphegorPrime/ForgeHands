@@ -56,6 +56,7 @@ export interface DirectConfig extends BaseConfig {
   maxConcurrent: number;
   maxConcurrentPerTier: number;
   maxRunsPerHour: number;
+  repoWeights: Map<string, number>;
   maxRunMs: number;
   maxRounds: number;
   forgejo: ForgejoAccess | null;

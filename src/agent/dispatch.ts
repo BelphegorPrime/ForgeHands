@@ -13,6 +13,8 @@ const WEEK_MS = 7 * 24 * 3600 * 1000;
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
 const MAX_RATE_LIMIT_RETRIES = 12;
 const ERROR_RETRY_DELAY_MS = 60000;
+// The last this many started runs decide what a repository has had so far (see pickNext).
+const RECENT_STARTS = 50;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -480,9 +482,12 @@ export class Dispatcher {
     for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
       if (await this.releaseDeferred(job, now)) changed = true;
     }
-    for (const job of this.jobs.list('queued')) {
-      if (job.next_try && job.next_try > now) continue;
-      if (!this.hasRoom(job, now)) continue;
+    // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
+    const tried = new Set<string>();
+    for (;;) {
+      const job = this.pickNext(now, tried);
+      if (!job) break;
+      tried.add(job.id);
       if (await this.startJob(job, now)) changed = true;
     }
     if (await this.refreshMoved(now)) changed = true;
@@ -630,6 +635,33 @@ export class Dispatcher {
     const route = this.config.routes.get(label);
     if (!route) throw new Error('no route for label ' + label);
     return route;
+  }
+
+  // Which queued job gets the next free slot. Between repositories the starts are shared by weight (REPO_WEIGHTS, default 1; a higher weight
+  // means more of the starts): the repository with the fewest recent starts per unit of weight goes first, so weights 2, 1 and 5 give 2 of 8,
+  // 1 of 8 and 5 of 8 starts when all three have work. Within a repository it is the oldest ticket (lowest issue number) that can start now,
+  // not the one that was queued first. A repository without a startable job does not take a share: the others use it.
+  pickNext(now: number, tried: Set<string>): Job | null {
+    const heads = new Map<string, Job>();
+    for (const job of this.jobs.list('queued')) {
+      if (tried.has(job.id) || (job.next_try && job.next_try > now) || !this.hasRoom(job, now)) continue;
+      const repo = job.event.repository.full_name.toLowerCase();
+      const best = heads.get(repo);
+      if (!best || job.event.issue.number < best.event.issue.number || (job.event.issue.number === best.event.issue.number && job.created < best.created)) heads.set(repo, job);
+    }
+    if (!heads.size) return null;
+    const recent = new Map<string, number>();
+    for (const job of this.jobs.list().filter((entry) => entry.started).sort((a, b) => (b.started || 0) - (a.started || 0)).slice(0, RECENT_STARTS)) {
+      const repo = job.event.repository.full_name.toLowerCase();
+      recent.set(repo, (recent.get(repo) || 0) + 1);
+    }
+    let pick: { repo: string; job: Job; score: number; weight: number } | null = null;
+    for (const [repo, job] of heads) {
+      const weight = this.config.repoWeights.get(repo) ?? 1;
+      const score = (recent.get(repo) || 0) / weight;
+      if (!pick || score < pick.score || (score === pick.score && (weight > pick.weight || (weight === pick.weight && repo < pick.repo)))) pick = { repo, job, score, weight };
+    }
+    return pick!.job;
   }
 
   hasRoom(job: Job, now: number): boolean {
