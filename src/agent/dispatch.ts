@@ -519,40 +519,72 @@ export class Dispatcher {
   // merge as they are, and a conflict shows when the merge is tried.
   async refreshBranches(event: PushEvent): Promise<boolean> {
     const tip = event.after;
-    const base = event.repository.full_name.toLowerCase() + '#';
     const pulls = await this.forgejoCall(event, 'GET', '/pulls?state=open&limit=50');
     let changed = false;
     let deferred = false;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
-      const match = /^ai\/issue-(\d+)$/.exec(pr.head?.ref || '');
-      if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) continue;
-      if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) continue;
-      const issue = Number(match[1]);
-      if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) continue;
-      const labels = (pr.labels || []).map((label: Json) => label.name);
-      if (labels.includes(this.config.blockedLabel) || labels.includes(this.config.approvedLabel)) continue;
-      const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
-        issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
-      let reviewed = false;
-      try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; }
-      if (reviewed) continue;
-      // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
-      // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
-      if (!(await this.touchesSameFiles(event, pr, tip))) continue;
-      const hold = await this.updateHold(event, pr);
-      if (hold) { deferred = true; this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); continue; }
-      this.lastUpdate.set(base + pr.number, this.now());
-      try {
-        await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
-        this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
-      } catch (error) {
-        if (!/HTTP 409\b/.test(error.message)) { this.logger.error('could not update #' + pr.number + ':', error.message); continue; }
-        if (await this.startConflictRound(prEvent, tip)) changed = true;
-      }
+      const outcome = await this.refreshPull(event, pr, tip);
+      if (outcome.changed) changed = true;
+      if (outcome.deferred) deferred = true;
     }
     // Look again later at what was postponed (the CI run ended, the cooldown passed).
     if (deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
     return changed;
+  }
+
+  // One open pull request against the default branch at `tip`: bring it up to date, or start a conflict round when the rebase conflicts.
+  async refreshPull(event: PushEvent, pr: Json, tip: string): Promise<{ changed: boolean; deferred: boolean }> {
+    const none = { changed: false, deferred: false };
+    const base = event.repository.full_name.toLowerCase() + '#';
+    const match = /^ai\/issue-(\d+)$/.exec(pr.head?.ref || '');
+    if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) return none;
+    if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) return none;
+    const issue = Number(match[1]);
+    if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) return none;
+    const labels = (pr.labels || []).map((label: Json) => label.name);
+    if (labels.includes(this.config.blockedLabel) || labels.includes(this.config.approvedLabel)) return none;
+    const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+      issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
+    let reviewed = false;
+    try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; }
+    if (reviewed) return none;
+    // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
+    // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
+    if (!(await this.touchesSameFiles(event, pr, tip))) return none;
+    const hold = await this.updateHold(event, pr);
+    if (hold) { this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); return { changed: false, deferred: true }; }
+    this.lastUpdate.set(base + pr.number, this.now());
+    try {
+      await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
+      this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
+    } catch (error) {
+      if (!/HTTP 409\b/.test(error.message)) { this.logger.error('could not update #' + pr.number + ':', error.message); return none; }
+      if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
+    }
+    return none;
+  }
+
+  // The default branch may have moved while a run on this pull request was active (such a pull request is left alone, see refreshPull), and
+  // no later push brings it back into view. When the run ends, look at the pull request once: the same update, the same conflict round.
+  async checkBranchAfterRun(job: Job): Promise<void> {
+    const event = job.event;
+    if (!this.config.updateBranches || !this.config.forgejo || !event?.pull_request) return;
+    const kind = this.config.routes.get(job.label)?.kind;
+    if (kind === 'conflict' || kind === 'sensitive_review') return;
+    try {
+      const branch = event.repository.default_branch;
+      if (!branch) return;
+      const head = await this.forgejoCall(event, 'GET', '/branches/' + encodeURIComponent(branch));
+      const tip = head?.commit?.id;
+      if (typeof tip !== 'string' || !tip) return;
+      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      const push = { type: 'push.default', source: 'forgejo', repository: event.repository, sender: event.sender, after: tip } as unknown as PushEvent;
+      const outcome = await this.refreshPull(push, pr, tip);
+      if (outcome.deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event: push });
+      if (outcome.changed) this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
+    } catch (error) {
+      this.logger.error('could not look at the branch of #' + event.pull_request.number + ' after its run:', error.message);
+    }
   }
 
   // Can the rebase of this pull request conflict? Only if the default branch changed a file since the merge base that the pull request
@@ -774,6 +806,7 @@ export class Dispatcher {
     }
     if (state !== null && TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
+      await this.checkBranchAfterRun(job);
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); }

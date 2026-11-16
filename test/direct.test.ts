@@ -784,7 +784,8 @@ test('rounds are limited per issue; the pull request is told and marked when the
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'rounds_exceeded');
   assert.equal(starts().length, 2);
   // every started round first looks whether an earlier approval has to be taken back
-  const marking = forgejo.filter((call) => !(call.method === 'GET' && call.path.endsWith('/issues/34/labels')));
+  // (after every run the branch is looked at once, see checkBranchAfterRun: those reads are not part of the marking)
+  const marking = forgejo.filter((call) => !(call.method === 'GET' && (call.path.endsWith('/issues/34/labels') || call.path.includes('/branches/'))));
   const paths = marking.map((call) => call.method + ' ' + call.path);
   assert.deepEqual(paths, [
     'POST /api/v1/repos/owner/hello/issues/34/comments',
@@ -2090,6 +2091,31 @@ test('a pull request is updated at most once per BRANCH_UPDATE_MIN_INTERVAL_MINU
   await dispatcher.tick();                                  // the postponed look happens by itself
   assert.deepEqual(updates(forgejo), ['34', '34']);
   assert.throws(() => loadConfig(env(withBranches({ BRANCH_UPDATE_MIN_INTERVAL_MINUTES: '0' }))), /BRANCH_UPDATE_MIN_INTERVAL_MINUTES/);
+});
+
+test('when a run on a pull request ends, a conflict with the default branch that arrived meanwhile becomes a conflict round', async () => {
+  const { dispatcher, jobs, forgejo } = await buildBranches([], {
+    ['GET ' + API + '/branches/main']: { commit: { id: TIP } },
+    ['GET ' + API + '/pulls/34']: pull(34),
+    ['GET ' + API + '/compare/' + OLD_BASE + '...' + TIP]: { total_commits: 1, files: [{ filename: 'a.txt' }] },
+    ['GET ' + API + '/pulls/34/files']: [{ filename: 'a.txt' }],
+    ['GET ' + API + '/commits/cafe340000/status']: { state: 'success', total_count: 1 },
+    ['POST ' + API + '/pulls/34/update']: { __status: 409 },
+    ...noReview(34)
+  });
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  await dispatcher.tick();
+  assert.deepEqual(updates(forgejo), [], 'while the run is active the pull request is left alone');
+  states[jobs.list().at(-1).conversation_id] = 'finished';
+  await dispatcher.tick();
+  assert.deepEqual(updates(forgejo), ['34'], 'the run ended: the rebase was tried once');
+  assert.ok(jobs.list().some((job) => job.label === 'pr:conflict'), 'and it conflicted, so a conflict round was queued');
+  // a conflict round itself does not trigger another look
+  const rounds = jobs.list().filter((job) => job.label === 'pr:conflict').length;
+  const conflictJob = jobs.list().find((job) => job.label === 'pr:conflict');
+  states[conflictJob.conversation_id || 'none'] = 'finished';
+  await dispatcher.tick();
+  assert.equal(jobs.list().filter((job) => job.label === 'pr:conflict').length, rounds);
 });
 
 test('a rebase that conflicts becomes a conflict round of the worker, once per moved default branch', async () => {
