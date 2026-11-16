@@ -241,39 +241,15 @@ test('config rejects broken routes and missing key', () => {
   assert.equal(loadConfig(env()).jobsFile, join(dir, 'jobs.json'));
 });
 
-test('weekly tier budget stops new starts until the spend leaves the 7-day window', async () => {
-  const { dispatcher, jobs } = await build({ TIER_WEEKLY_BUDGETS: '{"strong": 5}', MAX_CONCURRENT_PER_TIER: '5' });
-  await dispatcher.enqueue(event('ai:plan', 1));
-  await dispatcher.tick();
-  const id = jobs.list('running')[0].conversation_id;
-  costs[id] = 5.2; states[id] = 'finished';
-  await dispatcher.tick();
-  assert.equal(jobs.list()[0].cost, 5.2);
-  await dispatcher.enqueue(event('ai:plan', 2));
-  await dispatcher.enqueue(event('ai:ready', 3));
-  await dispatcher.tick();
-  assert.equal(starts().length, 2, 'free tier still starts, strong tier is held back');
-  assert.equal(jobs.list('queued').length, 1);
-  clock += 7 * 24 * 3600 * 1000 + 1;
-  await dispatcher.tick();
-  assert.equal(starts().length, 3);
-});
-
-test('running job cost counts toward the weekly budget', async () => {
-  const { dispatcher, jobs } = await build({ TIER_WEEKLY_BUDGETS: '{"strong": 5}', MAX_CONCURRENT_PER_TIER: '5' });
-  await dispatcher.enqueue(event('ai:plan', 1));
-  await dispatcher.tick();
-  costs[jobs.list('running')[0].conversation_id] = 5;
-  await dispatcher.tick();
-  await dispatcher.enqueue(event('ai:plan', 2));
-  await dispatcher.tick();
-  assert.equal(starts().length, 1);
-});
-
-test('config validates TIER_WEEKLY_BUDGETS', () => {
-  assert.throws(() => loadConfig(env({ TIER_WEEKLY_BUDGETS: 'x' })), /valid JSON/);
-  assert.throws(() => loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 0}' })), /> 0/);
-  assert.equal(loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 5}' })).tierBudgets.get('strong'), 5);
+test('a set TIER_WEEKLY_BUDGETS is ignored with a warning instead of failing', () => {
+  const errors = [];
+  const config = loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 5}' }), { error: (...args) => errors.push(args.join(' ')) });
+  assert.equal('tierBudgets' in config, false);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /TIER_WEEKLY_BUDGETS is ignored, it was removed in 0\.4\.0/);
+  const quiet = [];
+  loadConfig(env(), { error: (...args) => quiet.push(args) });
+  assert.equal(quiet.length, 0, 'no warning when it is not set');
 });
 
 test('label added to an existing issue (real Forgejo event: issues/label_updated) starts one run and never a repeat', async () => {
@@ -377,18 +353,19 @@ test('a failed delivery does not swallow the label change: the retry still start
   } finally { await hook.close(); }
 });
 
-test('job store reads the v0.2.0 array format and keeps label state across a reload', async () => {
+test('job store keeps jobs and label state across a reload and refuses a bare array', async () => {
   const { writeFile } = await import('node:fs/promises');
-  await writeFile(join(dir, 'jobs.json'), JSON.stringify([{ id: 'old', key: 'owner/hello#1:ai:ready', label: 'ai:ready', status: 'done', created: Date.now(), event: {} }]));
   const first = new JobStore(join(dir, 'jobs.json'));
-  await first.load();
-  assert.equal(first.list().length, 1);
+  first.add({ key: 'owner/hello#1:ai:ready', label: 'ai:ready', status: 'done', created: Date.now(), event: {} });
   first.setLabels('owner/hello#1', ['ai:ready']);
   await first.persist();
   const second = new JobStore(join(dir, 'jobs.json'));
   await second.load();
   assert.deepEqual(second.getLabels('owner/hello#1'), ['ai:ready']);
   assert.equal(second.list().length, 1);
+  // The v0.2.0 to v0.2.4 format (a bare array of jobs) is not read any more.
+  await writeFile(join(dir, 'jobs.json'), JSON.stringify([{ id: 'old', key: 'owner/hello#1:ai:ready', label: 'ai:ready', status: 'done', created: Date.now(), event: {} }]));
+  await assert.rejects(new JobStore(join(dir, 'jobs.json')).load(), /Invalid job store/);
 });
 
 // ---- follow-up rounds: a label on the pull request of an agent issue
