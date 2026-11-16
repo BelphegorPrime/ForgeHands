@@ -84,6 +84,13 @@ function archiveDays(value: string | undefined): number {
   return days;
 }
 
+function remindDays(value: string | undefined): number {
+  if (value === undefined || value === '') return 0;
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 0 || days > 365) throw new Error('REMIND_AFTER_DAYS must be an integer between 0 and 365');
+  return days;
+}
+
 function parseHumanLogin(value: string | undefined): string | null {
   const login = String(value || '').trim().replace(/^@/, '');
   if (!login) return null;
@@ -178,6 +185,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const mergeMethod = env.MERGE_METHOD || 'merge';
   if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
   if (mergePolicy.size && !(env.FORGEJO_URL && env.FORGEJO_TOKEN)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN');
+  if (remindDays(env.REMIND_AFTER_DAYS) && !(env.FORGEJO_URL && env.FORGEJO_TOKEN && parseHumanLogin(env.HUMAN_LOGIN))) throw new Error('REMIND_AFTER_DAYS needs FORGEJO_URL, FORGEJO_TOKEN and HUMAN_LOGIN');
   return {
     ...common,
     mode: 'direct',
@@ -229,6 +237,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
+    // Once a day, remind HUMAN_LOGIN of agent pull requests that wait for him (marked blocked, approved on a protected path, untouched):
+    // after this many days, then at most once per this many days and REMIND_MAX times per pull request; 0 (default) switches it off.
+    // STALE_LABEL is added after the last reminder.
+    remindAfterDays: remindDays(env.REMIND_AFTER_DAYS),
+    remindMax: positiveInt(env.REMIND_MAX, 3, 'REMIND_MAX', 100),
+    staleLabel: env.STALE_LABEL?.trim() || null,
     approvedLabel: env.APPROVED_LABEL || 'ai:approved',
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.

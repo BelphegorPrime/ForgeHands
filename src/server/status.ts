@@ -13,6 +13,8 @@ export interface Status {
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; runs: Omit<Run, 'created'>[] }[];
+  // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
+  waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
 }
 
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
@@ -36,7 +38,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog): Status {
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = []): Status {
   const byIssue = new Map<string, { key: string; title: string; runs: Run[] }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -68,7 +70,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     generated: new Date(now).toISOString(),
     dry_run: config.dryRun ? { repositories: config.dryRunRepos.size ? [...config.dryRunRepos] : 'all', would_write: dry?.writes.slice(-50) || [] } : null,
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
-    issues
+    issues,
+    waiting_for_human: waiting.map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason }))
   };
 }
 
@@ -77,9 +80,11 @@ const escape = (value: unknown): string => String(value ?? '').replace(/[&<>"']/
 export function renderStatus(status: Status): string {
   const rows = status.issues.map((issue) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
     + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>').join('\n');
+  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + ' #' + entry.pr
+    + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
-    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>'
+    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + waiting
     + '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n' + rows + '</table>';
 }
