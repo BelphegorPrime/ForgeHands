@@ -724,6 +724,12 @@ test('within a repository the oldest ticket that can start goes first, not the o
   assert.deepEqual(await startOrder(dispatcher, jobs, 4), ['o/a#3', 'o/a#4', 'o/a#5', 'o/a#9']);
 });
 
+test('within a repository a ticket that has begun (a review, a round) goes before a new ticket', async () => {
+  const { jobs, dispatcher } = await buildQueue({ ALLOWED_REPOS: repo, LABEL_ROUTES: withCi().LABEL_ROUTES }, [[repo, 3], [repo, 5]], 'begun.json');
+  jobs.add({ key: repo + '#26:ci:success:abcdef01', label: 'ci:success', event: ciEvent('success'), status: 'queued', created: clock + 100 });
+  assert.deepEqual(await startOrder(dispatcher, jobs, 3), [repo + '#26', repo + '#3', repo + '#5'], 'the review of ticket 26 first, then the new tickets from the lowest number');
+});
+
 test('REPO_WEIGHTS: weights 2, 1 and 5 give 2 of 8, 1 of 8 and 5 of 8 of the starts; an unlisted repository has weight 1', async () => {
   const tickets = [];
   for (let n = 1; n <= 24; n++) for (const full of ['o/a', 'o/b', 'o/c']) tickets.push([full, n]);
