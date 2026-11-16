@@ -1628,9 +1628,9 @@ test('rounds used up, a review without verdict and an epic with gaps mention him
 // ---- the model is out of quota: hold the tier back and try again, instead of blocking the pull request
 const rateLimitError = (seconds) => ({ kind: 'ConversationErrorEvent', code: 'LLMRateLimitError', classification: { kind: 'rate_limit', retryable: true },
   detail: 'litellm.RateLimitError: OpenAIException - {"error":{"message":"quota","retry_after":' + seconds + '}}' });
-async function buildQuota(events) {
+async function buildQuota(events, file = 'jobs.json') {
   const config = loadConfig(env(withCi()));
-  const jobs = new JobStore(join(dir, 'jobs.json'));
+  const jobs = new JobStore(join(dir, file));
   await jobs.load();
   const api = fakeApi();
   const forgejo = fakeForgejo(prWith([]));
@@ -1678,16 +1678,39 @@ test('another failure, an unreadable error and too many retries end the run as b
     assert.equal(job.result, 'error');
     assert.deepEqual(forgejo.wrote(), ['POST /issues/34/comments', 'POST /issues/34/labels']); // the pull request is marked as before
   }
-  const { dispatcher, jobs } = await buildQuota([rateLimitError(60)]);
-  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 12, verdict_retry: 1 });
+  // the quota has been out for QUOTA_GIVE_UP_HOURS (24 by default): give up; a little less: wait once more, however often it waited
+  for (const [hours, status] of [[25, 'failed'], [23, 'queued']]) {
+    const { dispatcher, jobs } = await buildQuota([rateLimitError(60)]);
+    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 40, rate_limited_since: clock - hours * 3600000, verdict_retry: 1 });
+    await dispatcher.tick();
+    states[job.conversation_id] = 'error';
+    await dispatcher.tick();
+    assert.equal(job.status, status, hours + 'h');
+  }
+});
+
+test('a run that reached its iteration limit is not run again: it ends as max_iterations', async () => {
+  const limit = { kind: 'ConversationErrorEvent', code: 'MaxIterationsReached', detail: 'Agent reached maximum iterations limit (150).' };
+  const { dispatcher, jobs, config } = await buildQuota([limit]);
+  dispatcher.config = { ...config, errorRetries: 1 };
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, verdict_retry: 1 });
   await dispatcher.tick();
   states[job.conversation_id] = 'error';
   await dispatcher.tick();
   assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'max_iterations');
+  assert.equal(job.error_retry, undefined, 'no error retry');
+  const other = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMServiceUnavailableError', detail: '503' }], 'other.json');
+  other.dispatcher.config = { ...other.config, errorRetries: 1 };
+  const retried = other.jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, verdict_retry: 1 });
+  await other.dispatcher.tick();
+  states[retried.conversation_id] = 'error';
+  await other.dispatcher.tick();
+  assert.equal(retried.error_retry, 1, 'another error is retried as before');
 });
 
 test('the wait is taken from the gateway, kept within sane bounds and has a default', async () => {
-  for (const [seconds, expected] of [[7200, 7200], [5, 60], [999999, 6 * 3600]]) {
+  for (const [seconds, expected] of [[7200, 7200], [5, 60], [18000, 18000], [999999, 8 * 3600]]) {
     const { dispatcher, jobs } = await buildQuota([rateLimitError(seconds)]);
     const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
     await dispatcher.tick();

@@ -5,13 +5,12 @@ import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob,
 import type { JobStore } from '../store/jobs.ts';
 
 // `paused` counts: someone stopped the run on purpose (POST /pause), it does not end by itself and must not hold its slot or block the issue.
-const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused']);
+const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 // Routes that count as a follow-up round of an issue (a review run does not).
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
-const MAX_RATE_LIMIT_RETRIES = 12;
 const ERROR_RETRY_DELAY_MS = 60000;
 // The last this many started runs decide what a repository has had so far (see pickNext).
 const RECENT_STARTS = 50;
@@ -399,15 +398,21 @@ export class Dispatcher {
   }
 
   // How long (ms) until the quota is back, when the run ended with a rate limit error; null for any other failure.
-  async rateLimitWait(job: Job): Promise<number | null> {
+  // The error a run ended with, from its last events: whether the model was out of quota (and, when the gateway says, for how long), or
+  // whether the agent reached its iteration limit. Null when there is no error event or it cannot be read.
+  async lastError(job: Job): Promise<{ code: string; rateLimited: boolean; waitMs: number | null } | null> {
     try {
       const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/search?limit=10&sort_order=TIMESTAMP_DESC');
       if (!response.ok) return null;
       const items = ((await response.json()) as Json)?.items || [];
-      const error = items.find((item: Json) => item?.kind === 'ConversationErrorEvent' && (item.code === 'LLMRateLimitError' || item.classification?.kind === 'rate_limit'));
-      if (!error) return null;
-      const seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(String(error.detail || ''))?.[1]) || 900;
-      return Math.min(Math.max(seconds, 60), 6 * 3600) * 1000;
+      const errors = items.filter((item: Json) => item?.kind === 'ConversationErrorEvent');
+      const limit = errors.find((item: Json) => item.code === 'LLMRateLimitError' || item.classification?.kind === 'rate_limit');
+      if (limit) {
+        const seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(String(limit.detail || ''))?.[1]);
+        return { code: String(limit.code || 'LLMRateLimitError'), rateLimited: true, waitMs: seconds > 0 ? seconds * 1000 : null };
+      }
+      if (!errors.length) return null;
+      return { code: String(errors[0].code || ''), rateLimited: false, waitMs: null };
     } catch (error) {
       this.logger.error('could not read the error of ' + job.key + ':', error.message);
       return null;
@@ -785,17 +790,25 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('polling ' + job.key + ' failed:', error.message);
     }
-    // The model ran out of quota (the gateway answers with a rate limit and when it resets): not the pull request's fault and no reason
-    // to call a human. Hold the tier back until then and run this job again afterwards.
-    if (state === 'error' && (job.rate_limited || 0) < MAX_RATE_LIMIT_RETRIES) {
-      const wait = await this.rateLimitWait(job);
-      if (wait) {
-        const until = now + wait;
-        this.cooldowns.set(this.route(job.label).tier, until);
-        this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
-        Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, retry_at: until });
-        return true;
+    if (state === 'error') {
+      const error = await this.lastError(job);
+      // The model ran out of quota (the gateway answers with a rate limit, mostly with the time until it resets): not the ticket's fault
+      // and no reason to call a human. Hold the tier back until then (at most QUOTA_HOLD_MAX_HOURS, 15 minutes when the gateway gives no
+      // time) and run this job again afterwards; give up only when the quota has been out for QUOTA_GIVE_UP_HOURS.
+      if (error?.rateLimited) {
+        const since = job.rate_limited_since || now;
+        if (now - since < this.config.quotaGiveUpMs) {
+          const wait = Math.min(Math.max(error.waitMs ?? 15 * 60000, 60000), this.config.quotaHoldMaxMs);
+          const until = now + wait;
+          this.cooldowns.set(this.route(job.label).tier, until);
+          this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
+          Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: until });
+          return true;
+        }
       }
+      // The agent reached its iteration limit: OpenHands reports that as an error, but running it again does the same. It is a ticket that
+      // is too big (see reportFailure and SPLIT_LABEL), not an error that passes.
+      if (error?.code === 'MaxIterationsReached') state = 'max_iterations';
     }
     // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
     if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
@@ -823,8 +836,8 @@ export class Dispatcher {
     return false;
   }
 
-  // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (paused, stuck,
-  // timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. Everything else is handed to the human,
+  // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (max_iterations,
+  // paused, stuck, timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. Everything else is handed to the human,
   // on the pull request (label and mention) or, without one, as a comment on the issue. Best effort: a failing call is only logged.
   async reportFailure(job: Job, state: string): Promise<void> {
     const event = job.event;
@@ -832,7 +845,7 @@ export class Dispatcher {
     const kind = this.config.routes.get(job.label)?.kind;
     const what = 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
     try {
-      const exhausted = state === 'paused' || state === 'stuck' || state === 'timeout';
+      const exhausted = state === 'max_iterations' || state === 'paused' || state === 'stuck' || state === 'timeout';
       if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
         const number = event.issue.number;
         const known = await this.forgejoCall(event, 'GET', '/labels?limit=100');

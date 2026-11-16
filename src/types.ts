@@ -67,6 +67,8 @@ export interface DirectConfig extends BaseConfig {
   minReviewChars: number;
   approvalGraceMs: number;
   errorRetries: number;
+  quotaHoldMaxMs: number;
+  quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
   humanLogin: string | null;
@@ -164,6 +166,7 @@ export interface Job {
   next_try?: number;
   retry_at?: number;
   rate_limited?: number;
+  rate_limited_since?: number;
   verdict_retry?: number;
   round_reset?: boolean;
   archived?: boolean;

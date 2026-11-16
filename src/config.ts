@@ -200,6 +200,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     approvalGraceMs: env.APPROVAL_GRACE_SECONDS === '0' ? 0 : positiveInt(env.APPROVAL_GRACE_SECONDS, 90, 'APPROVAL_GRACE_SECONDS', 3600) * 1000,
     // A run whose conversation ends in `error` (the model failed, OpenHands was restarted) is started once more after a minute, this many
     // times, before it counts as failed; 0 switches it off. A run that stays failed is reported on the issue or pull request.
+    // Out of quota: hold a tier back at most this long at a time, and give a job up once its quota has been out this long.
+    quotaHoldMaxMs: positiveInt(env.QUOTA_HOLD_MAX_HOURS, 8, 'QUOTA_HOLD_MAX_HOURS', 48) * 3600000,
+    quotaGiveUpMs: positiveInt(env.QUOTA_GIVE_UP_HOURS, 24, 'QUOTA_GIVE_UP_HOURS', 168) * 3600000,
     errorRetries: env.ERROR_RETRIES === '0' ? 0 : positiveInt(env.ERROR_RETRIES, 1, 'ERROR_RETRIES', 5),
     // When a worker run on an issue ends without finishing (paused at its iteration limit, stuck, timed out) the issue is probably too big:
     // this label (the planner route, e.g. ai:plan) is added so that the planner splits it into slices. Empty: off, a human is called.
