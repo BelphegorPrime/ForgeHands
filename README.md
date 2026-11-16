@@ -98,6 +98,7 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 | `FORGEJO_URL`, `FORGEJO_TOKEN` | direct mode, for most features | Forgejo API access: merge, round limits, status checks, dependencies, branch updates. Without them ForgeHands only logs what it would tell Forgejo. |
 | `DATA_FILE`, `JOBS_FILE` | no | Delivery store (`./data/deliveries.json`) and issue ledger (`jobs.json` next to it). |
 | `PORT`, `HOST` | no | Listening port (`8080`) and address (`0.0.0.0`). |
+| `DRY_RUN`, `DRY_RUN_REPOS` | no | `DRY_RUN=1`: events are received and judged as usual, but every write is only logged: no OpenHands conversation (the job ends as `dry`, its first message kept in the ledger as `dry_prompt`), no Forgejo comment, label, merge, branch update or close, no webhook-mode forward. Reads stay real. `DRY_RUN_REPOS=owner/repo,...` (must be in `ALLOWED_REPOS`) limits it to those repositories. `/status` shows a banner and `/status.json` the latest would-be writes. |
 
 ### Direct mode: routes, who may trigger, limits
 
