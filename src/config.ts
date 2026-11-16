@@ -1,6 +1,6 @@
 import { URL } from 'node:url';
 import { globToRegExp } from './forgejo/glob.ts';
-import type { MergeRule, Config, Json, Route, RouteKind } from './types.ts';
+import type { Config, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
@@ -99,7 +99,9 @@ function parseRepoWeights(raw: string | undefined): Map<string, number> {
   return weights;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger = console): Config {
+  // Removed in 0.4.0: a weekly cost cap per tier. Ignored (not an error) so that an existing setup still starts.
+  if (env.TIER_WEEKLY_BUDGETS) logger.error('TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0 (max_budget of a route still caps one run)');
   const forgejoSecret = env.FORGEJO_WEBHOOK_SECRET || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
   const allowedRepos = new Set((env.ALLOWED_REPOS || '')
@@ -151,17 +153,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (!env[name]) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
     agentSecrets[name] = env[name]!;
   }
-  // TIER_WEEKLY_BUDGETS: {"strong": 5} caps the LLM cost (USD) that runs of a tier may add up to within 7 days.
-  const tierBudgets = new Map<string, number>();
-  if (env.TIER_WEEKLY_BUDGETS) {
-    let parsed: Json;
-    try { parsed = JSON.parse(env.TIER_WEEKLY_BUDGETS); } catch { throw new Error('TIER_WEEKLY_BUDGETS must be valid JSON'); }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('TIER_WEEKLY_BUDGETS must be a JSON object');
-    for (const [tier, amount] of Object.entries(parsed as Record<string, Json>)) {
-      if (!(Number(amount) > 0)) throw new Error('TIER_WEEKLY_BUDGETS: ' + tier + ' must be a number > 0');
-      tierBudgets.set(tier, Number(amount));
-    }
-  }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
   const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
   const mergeMethod = env.MERGE_METHOD || 'merge';
@@ -170,7 +161,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     ...common,
     mode: 'direct',
-    tierBudgets,
     apiUrl: httpUrl(env.OPENHANDS_API_URL!, 'OPENHANDS_API_URL').toString().replace(/\/$/, ''),
     apiKey: env.OPENHANDS_API_KEY,
     routes,

@@ -22,8 +22,7 @@ export class JobStore {
   async load(): Promise<void> {
     try {
       const content = JSON.parse(await readFile(this.file, 'utf8'));
-      // v0.2.0 to v0.2.4 stored a bare array of jobs.
-      const jobs = Array.isArray(content) ? content : content?.jobs;
+      const jobs = content?.jobs;
       if (!Array.isArray(jobs)) throw Error('Invalid job store');
       for (const job of jobs) if (job && job.id) this.jobs.set(job.id, job);
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
