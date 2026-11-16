@@ -171,7 +171,16 @@ test('/status shows what waits for a human since when', async () => {
   pulls = [pull(101, ['ai:blocked'])];
   comments[101] = [comment('@marcel ForgeHands: handed over', clock - 4 * DAY)];
   await dispatcher.tick();
-  const status = buildStatus(config, jobs, clock, [...dispatcher.reminder.waiting.values()]);
+  const status = buildStatus(config, jobs, clock, undefined, [...dispatcher.reminder.waiting.values()]);
   assert.deepEqual(status.waiting_for_human, [{ repository: repo, issue: 1, pr: 101, since: '2026-11-12', reason: 'it is marked ai:blocked' }]);
   assert.match(renderStatus(status), /waiting for a human since 2026-11-12/);
+});
+
+test('in a dry run the reminder is only logged, never sent', async () => {
+  const { dispatcher } = await build({ DRY_RUN: '1' });
+  pulls = [pull(101, ['ai:blocked'])];
+  comments[101] = [comment('@marcel ForgeHands: handed over', clock - 4 * DAY)];
+  await dispatcher.tick();
+  assert.deepEqual(posts, []);
+  assert.ok(dispatcher.dry.writes.some((write) => /reminder 1 of 3/.test(JSON.stringify(write))));
 });
