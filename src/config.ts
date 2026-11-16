@@ -79,6 +79,21 @@ function parseHumanLogin(value: string | undefined): string | null {
   return login;
 }
 
+// REPO_WEIGHTS: {"owner/repo": 5, ...}. A repository without an entry has weight 1; a higher weight means a larger share of the starts.
+function parseRepoWeights(raw: string | undefined): Map<string, number> {
+  const weights = new Map<string, number>();
+  if (!raw || !raw.trim()) return weights;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error('REPO_WEIGHTS must be a JSON object such as {"owner/repo": 2}'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('REPO_WEIGHTS must be a JSON object such as {"owner/repo": 2}');
+  for (const [repo, weight] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!REPO.test(repo.toLowerCase())) throw new Error('Invalid REPO_WEIGHTS entry: ' + repo);
+    if (typeof weight !== 'number' || !(weight > 0) || weight > 1000) throw new Error('REPO_WEIGHTS: the weight of ' + repo + ' must be a number above 0 and at most 1000');
+    weights.set(repo.toLowerCase(), weight);
+  }
+  return weights;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const forgejoSecret = env.FORGEJO_WEBHOOK_SECRET || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
@@ -162,6 +177,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workspaceDir: env.WORKSPACE_DIR || '/projects',
     maxConcurrent: positiveInt(env.MAX_CONCURRENT, 4, 'MAX_CONCURRENT', 100),
     maxConcurrentPerTier: positiveInt(env.MAX_CONCURRENT_PER_TIER, 2, 'MAX_CONCURRENT_PER_TIER', 100),
+    // Which repository gets the next free slot: weights per repository (JSON object, default 1), see Dispatcher.pickNext.
+    repoWeights: parseRepoWeights(env.REPO_WEIGHTS),
     maxRunsPerHour: positiveInt(env.MAX_RUNS_PER_HOUR, 30, 'MAX_RUNS_PER_HOUR', 10000),
     maxRunMs: positiveInt(env.MAX_RUN_MINUTES, 120, 'MAX_RUN_MINUTES', 1440) * 60000,
     // Follow-up runs (routes on pull requests) per issue before ForgeHands stops and asks a human.
