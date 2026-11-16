@@ -8,7 +8,7 @@ export interface Logger {
   log?: (...args: unknown[]) => void;
 }
 
-export type RouteKind = 'issue' | 'pull_request' | 'ci_failure' | 'ci_success' | 'epic_done' | 'conflict';
+export type RouteKind = 'issue' | 'pull_request' | 'ci_failure' | 'ci_success' | 'epic_done' | 'conflict' | 'sensitive_review';
 
 export interface Route {
   profile: string;
@@ -127,6 +127,8 @@ export interface ForgeEvent extends BaseEvent {
   ci?: CiInfo;
   epic?: { children: { number: number; title: string }[] };
   base_sha?: string;
+  /** The changed files that match the deny list of the merge policy (security review runs only). */
+  protected_files?: string[];
 }
 
 /** A push to the default branch. */

@@ -161,6 +161,7 @@ export class Dispatcher {
     if (open.length) return { status: 'waiting' };
     // The earlier approval does not cover what this run will push or review.
     if (event.pull_request) await this.merger.clearApproval(event);
+    if (kind === 'ci_success') await this.startSecurityReview(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
   }
@@ -254,7 +255,7 @@ export class Dispatcher {
     const event = job.event;
     const kind = this.config.routes.get(job.label)?.kind;
     let start = !(await this.isStale(event));
-    if (start && kind === 'ci_success') start = await this.commitGreen(event);
+    if (start && (kind === 'ci_success' || kind === 'sensitive_review')) start = await this.commitGreen(event);
     if (start && kind === 'ci_failure') start = !(await this.commitRecovered(event));
     if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
       await this.roundsUsedUp(event);
@@ -264,6 +265,7 @@ export class Dispatcher {
     delete job.waiting_for_run;
     job.status = 'queued';
     await this.merger.clearApproval(event);
+    if (kind === 'ci_success') await this.startSecurityReview(event);
     return true;
   }
 
@@ -304,6 +306,45 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
       return false;
+    }
+  }
+
+  // A green commit of a pull request that changes a protected path (the deny list of the merge policy of its repository) also gets a
+  // security review, once per commit, when a route of kind sensitive_review exists. It is advisory: no label, no round, no merge.
+  async startSecurityReview(event: ForgeEvent): Promise<void> {
+    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'sensitive_review')?.[0];
+    if (!route || !event.pull_request || !event.ci || !this.config.forgejo) return;
+    const key = this.issueKey(event) + ':' + route + ':' + event.ci.commit_sha.slice(0, 8);
+    if (this.jobs.list().some((job) => job.key === key)) return;
+    const policy = this.config.mergePolicy.get(event.repository.full_name.toLowerCase());
+    if (!policy) return;
+    try {
+      const files = await this.merger.changedFiles(event.repository.full_name, event.pull_request.number);
+      const hit = [...new Set(files.filter((name) => policy.deny.some((pattern) => pattern.test(name))))];
+      if (!hit.length) return;
+      this.jobs.add({ key, label: route, event: { ...event, type: 'ci.sensitive', label: route, protected_files: hit.slice(0, 20) }, status: 'queued', created: this.now() });
+      await this.jobs.persist(this.now());
+    } catch (error) {
+      this.logger.error('could not start the security review of ' + this.issueKey(event) + ':', error.message);
+    }
+  }
+
+  // The security review is advisory: when its run ends without the comment, run it once more; after that it is only logged.
+  async checkSecurityReview(job: Job): Promise<void> {
+    const event = job.event;
+    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
+    try {
+      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
+      if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) return;
+      if (!job.verdict_retry) {
+        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
+        this.logger.error('security review ' + job.key + ' ended without a comment, running it once more');
+        return;
+      }
+      this.logger.error('security review ' + job.key + ' ended twice without a comment');
+    } catch (error) {
+      this.logger.error('could not check the security review of #' + event.pull_request.number + ':', error.message);
     }
   }
 
@@ -656,7 +697,9 @@ export class Dispatcher {
     }
     if (state !== null && TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
-      if (this.config.routes.get(job.label)?.kind === 'ci_success') await this.checkVerdict(job);
+      const done = this.config.routes.get(job.label)?.kind;
+      if (done === 'ci_success') await this.checkVerdict(job);
+      else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); }
       else if (state !== 'finished') await this.reportFailure(job, state);
       return true;
     }

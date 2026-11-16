@@ -15,7 +15,7 @@ export interface Status {
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
 // Read only, no event text beyond the issue title; it says nothing about Forgejo's side (the pull request itself).
 const KIND_TEXT: Record<string, string> = {
-  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round'
+  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review'
 };
 
 // One line for the current state of an issue, from its newest relevant run.
