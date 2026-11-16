@@ -87,7 +87,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       try {
         const result = normalized.type === 'pull_request.approved' ? { status: await dispatcher!.approve(normalized as ForgeEvent) }
           : normalized.type === 'issues.closed' ? { status: await dispatcher!.onClosed(normalized as ForgeEvent) }
-          : isPushEvent(normalized) ? { status: dispatcher!.onMainMoved(normalized) }
+          : isPushEvent(normalized) ? { status: (dispatcher!.closeMergedTickets(normalized).catch((error) => logger.error('closing merged tickets failed:', error.message)), dispatcher!.onMainMoved(normalized)) }
           : await dispatcher!.enqueue(normalized);
         remember();
         await store.mark(key);
