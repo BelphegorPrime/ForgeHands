@@ -8,7 +8,6 @@ import type { JobStore } from '../store/jobs.ts';
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
-const WEEK_MS = 7 * 24 * 3600 * 1000;
 // Routes that count as a follow-up round of an issue (a review run does not).
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
 const MAX_RATE_LIMIT_RETRIES = 12;
@@ -714,15 +713,7 @@ export class Dispatcher {
     if (running.filter((other) => this.config.routes.get(other.label)?.tier === route.tier).length >= tierLimit) return false;
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
     if (startedLastHour >= this.config.maxRunsPerHour) return false;
-    const budget = this.config.tierBudgets?.get(route.tier);
-    return budget === undefined || this.weeklySpend(route.tier, now) < budget;
-  }
-
-  // Cost of the runs of a tier started within the last 7 days (running ones count with their latest known cost).
-  weeklySpend(tier: string, now: number): number {
-    return this.jobs.list()
-      .filter((job) => job.started && job.started > now - WEEK_MS && this.config.routes.get(job.label)?.tier === tier)
-      .reduce((sum, job) => sum + (job.cost || 0), 0);
+    return true;
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {

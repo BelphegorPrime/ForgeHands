@@ -107,7 +107,6 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 | `ALLOWED_SENDERS` | Optional comma separated Forgejo logins that may trigger runs and steer agents through comments (else the sender of the label). |
 | `MAX_CONCURRENT`, `MAX_CONCURRENT_PER_TIER`, `MAX_RUNS_PER_HOUR` | Runs at once in total (default 4) and per `tier` (default 2), and started runs per hour (default 30, a guard against runaway fan-out). The rest waits in the queue. |
 | `REPO_WEIGHTS` | JSON, repository to weight, for example `{"owner/a": 2, "owner/b": 1}`; default weight 1. See [Scheduling](#scheduling). |
-| `TIER_WEEKLY_BUDGETS` | JSON, tier to USD per 7 days, for example `{"strong": 5}`. Read from the accumulated LLM cost OpenHands reports; once a tier's runs of the last 7 days add up to the budget its further runs wait. `max_budget` of a route stays the cap of one run. |
 | `MAX_RUN_MINUTES` | After this long a run stops holding its slot (default 120); the conversation itself is not touched. |
 | `AGENT_SECRETS` | Comma separated names of environment variables (for example `FORGEJO_TOKEN,FORGEJO_URL`) whose values are handed to every started conversation as secrets. OpenHands gives its saved secrets only to callers that pass them in the start request. The values stay in ForgeHands' environment, never in the ledger. |
 | `WORKSPACE_DIR` | Working directory of the conversations (default `/projects`). |

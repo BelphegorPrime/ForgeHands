@@ -44,7 +44,6 @@ export interface WebhookConfig extends BaseConfig {
 
 export interface DirectConfig extends BaseConfig {
   mode: 'direct';
-  tierBudgets: Map<string, number>;
   apiUrl: string;
   apiKey: string;
   routes: Map<string, Route>;
