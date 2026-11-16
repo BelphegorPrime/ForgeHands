@@ -181,6 +181,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),
     // An approval label without a verdict comment is checked again after this many seconds before it is taken off; 0 takes it off at once.
     approvalGraceMs: env.APPROVAL_GRACE_SECONDS === '0' ? 0 : positiveInt(env.APPROVAL_GRACE_SECONDS, 90, 'APPROVAL_GRACE_SECONDS', 3600) * 1000,
+    // A run whose conversation ends in `error` (the model failed, OpenHands was restarted) is started once more after a minute, this many
+    // times, before it counts as failed; 0 switches it off. A run that stays failed is reported on the issue or pull request.
+    errorRetries: env.ERROR_RETRIES === '0' ? 0 : positiveInt(env.ERROR_RETRIES, 1, 'ERROR_RETRIES', 5),
+    // When a worker run on an issue ends without finishing (paused at its iteration limit, stuck, timed out) the issue is probably too big:
+    // this label (the planner route, e.g. ai:plan) is added so that the planner splits it into slices. Empty: off, a human is called.
+    splitLabel: env.SPLIT_LABEL?.trim() || null,
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his

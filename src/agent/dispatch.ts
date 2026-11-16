@@ -12,6 +12,7 @@ const WEEK_MS = 7 * 24 * 3600 * 1000;
 // Routes that count as a follow-up round of an issue (a review run does not).
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
 const MAX_RATE_LIMIT_RETRIES = 12;
+const ERROR_RETRY_DELAY_MS = 60000;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -91,10 +92,32 @@ export class Dispatcher {
     return present.find((label) => !this.jobs.list().some((job) => job.key === base + ':' + label));
   }
 
+  // The human acted on a pull request (set a label, pushed a commit: the CI run of his commit names him as sender): the follow-up rounds
+  // so far no longer count, the pull request starts with a fresh budget, and a block set for used-up rounds comes off. Best effort.
+  async humanTookOver(event: ForgeEvent): Promise<void> {
+    const login = this.config.humanLogin?.toLowerCase();
+    if (!login || !event.pull_request || event.sender?.login?.toLowerCase() !== login) return;
+    const base = this.issueKey(event) + ':';
+    const spent = this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind));
+    if (!spent.length) return;
+    for (const job of spent) job.round_reset = true;
+    await this.jobs.persist(this.now());
+    this.logger.error(this.issueKey(event) + ': ' + login + ' acted on the pull request, the rounds start again');
+    if (!this.config.forgejo) return;
+    try {
+      const labels = await this.forgejoCall(event, 'GET', '/issues/' + event.pull_request.number + '/labels');
+      const blocked = (labels || []).find((label: Json) => label.name === this.config.blockedLabel);
+      if (blocked) await this.forgejoCall(event, 'DELETE', '/issues/' + event.pull_request.number + '/labels/' + blocked.id);
+    } catch (error) {
+      this.logger.error('could not lift the block of #' + event.pull_request.number + ':', error.message);
+    }
+  }
+
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
     const label = this.pickLabel(event);
     if (!label) return { status: 'duplicate_job' };
     if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
+    await this.humanTookOver(event);
     // A CI outcome belongs to one commit: the same commit starts one run, whatever the outcome of each workflow.
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
@@ -142,7 +165,7 @@ export class Dispatcher {
   // Follow-up runs (pull request routes) already made for the issue of this event.
   rounds(event: ForgeEvent): number {
     const base = this.issueKey(event) + ':';
-    return this.jobs.list().filter((job) => job.key.startsWith(base) && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
+    return this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
   }
 
@@ -621,17 +644,56 @@ export class Dispatcher {
         return true;
       }
     }
+    // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
+    if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
+      this.logger.error(job.key + ' ended with an error, running it once more');
+      Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,
+        error_retry: (job.error_retry || 0) + 1, next_try: now + ERROR_RETRY_DELAY_MS, retry_at: now + ERROR_RETRY_DELAY_MS });
+      return true;
+    }
     if (state !== null && TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       if (this.config.routes.get(job.label)?.kind === 'ci_success') await this.checkVerdict(job);
+      else if (state !== 'finished') await this.reportFailure(job, state);
       return true;
     }
     if (costChanged) return true;
     // Free the slot of a run that never ends; the conversation itself is left alone.
     if (job.started && job.started + this.config.maxRunMs < now) {
       Object.assign(job, { status: 'failed', result: 'timeout', finished: now });
+      await this.reportFailure(job, 'timeout');
       return true;
     }
     return false;
+  }
+
+  // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (paused, stuck,
+  // timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. Everything else is handed to the human,
+  // on the pull request (label and mention) or, without one, as a comment on the issue. Best effort: a failing call is only logged.
+  async reportFailure(job: Job, state: string): Promise<void> {
+    const event = job.event;
+    if (!this.config.forgejo || !event || state === 'deleted' || state === 'finished') return;
+    const kind = this.config.routes.get(job.label)?.kind;
+    const what = 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
+    try {
+      const exhausted = state === 'paused' || state === 'stuck' || state === 'timeout';
+      if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
+        const number = event.issue.number;
+        const known = await this.forgejoCall(event, 'GET', '/labels?limit=100');
+        let split = (known || []).find((entry: Json) => entry.name === this.config.splitLabel);
+        if (!split) split = await this.forgejoCall(event, 'POST', '/labels', { name: this.config.splitLabel, color: '#5319e7' });
+        const present = await this.forgejoCall(event, 'GET', '/issues/' + number + '/labels');
+        const failed = (present || []).find((entry: Json) => entry.name === job.label);
+        await this.forgejoCall(event, 'POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.' });
+        if (failed) await this.forgejoCall(event, 'DELETE', '/issues/' + number + '/labels/' + failed.id);
+        await this.forgejoCall(event, 'POST', '/issues/' + number + '/labels', { labels: [split.id] });
+        return;
+      }
+      const text = what + '. A human has to look at it.';
+      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text);
+      else await this.forgejoCall(event, 'POST', '/issues/' + event.issue.number + '/comments', { body: (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text });
+    } catch (error) {
+      this.logger.error('could not report the failure of ' + job.key + ':', error.message);
+    }
   }
 }
