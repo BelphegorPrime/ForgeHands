@@ -1,6 +1,6 @@
 import { URL } from 'node:url';
 import { globToRegExp } from './forgejo/glob.ts';
-import type { Config, Json, Route, RouteKind } from './types.ts';
+import type { MergeRule, Config, Json, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
@@ -50,8 +50,8 @@ function parseRoutes(text: string): Map<string, Route> {
 
 // MERGE_POLICY: {"owner/repo": {"deny": ["stacks/**", "compose.yaml"]}}. Only the repositories named here are merged by ForgeHands,
 // and only when none of the changed files matches a deny pattern. A repository without an entry is never merged automatically.
-function parseMergePolicy(text: string | undefined): Map<string, { deny: RegExp[] }> {
-  const policy = new Map<string, { deny: RegExp[] }>();
+function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
+  const policy = new Map<string, MergeRule>();
   if (!text) return policy;
   let parsed: Json;
   try { parsed = JSON.parse(text); } catch { throw new Error('MERGE_POLICY must be valid JSON'); }
@@ -60,7 +60,12 @@ function parseMergePolicy(text: string | undefined): Map<string, { deny: RegExp[
     if (!REPO.test(name.toLowerCase())) throw new Error('MERGE_POLICY: ' + name + ' is not owner/repository');
     const deny = rule?.deny ?? [];
     if (!Array.isArray(deny) || deny.some((glob: unknown) => typeof glob !== 'string' || !glob)) throw new Error('MERGE_POLICY: deny of ' + name + ' must be a list of patterns');
-    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp) });
+    // Optional: why a pattern needs a human, said in the comment that hands such a pull request over.
+    const reasons = rule?.reasons ?? {};
+    if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons) || Object.entries(reasons).some(([pattern, reason]) => !deny.includes(pattern) || typeof reason !== 'string' || !reason.trim())) {
+      throw new Error('MERGE_POLICY: reasons of ' + name + ' must map patterns of its deny list to a text');
+    }
+    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp), patterns: [...deny], reasons: deny.map((pattern: string) => (reasons as Record<string, string>)[pattern]?.trim() || null) });
   }
   return policy;
 }

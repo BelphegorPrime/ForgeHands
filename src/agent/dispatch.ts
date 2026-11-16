@@ -1,6 +1,6 @@
 import { buildPrompt } from './prompt.ts';
 import { forgejoCall } from '../forgejo/client.ts';
-import { Merger } from '../forgejo/merge.ts';
+import { Merger, WIP } from '../forgejo/merge.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -45,6 +45,8 @@ export class Dispatcher {
     this.logger = logger;
     this.now = now;
     this.merger = new Merger(config, send, logger);
+    this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
+      && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
   }
 
   issueKey(event: ForgeEvent): string {
@@ -363,15 +365,31 @@ export class Dispatcher {
     try {
       const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
-      if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) return;
+      if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) { await this.handOverAfterSecurity(job); return; }
       if (!job.verdict_retry) {
         Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
         this.logger.error('security review ' + job.key + ' ended without a comment, running it once more');
         return;
       }
       this.logger.error('security review ' + job.key + ' ended twice without a comment');
+      await this.handOverAfterSecurity(job);
     } catch (error) {
       this.logger.error('could not check the security review of #' + event.pull_request.number + ':', error.message);
+    }
+  }
+
+  // The hand-over of an approved protected-path pull request waits for its security review (see Merger.handle); when that run has ended
+  // (with its comment, without one, or failed) the approval is looked at again, which hands the pull request over with what was found.
+  async handOverAfterSecurity(job: Job): Promise<void> {
+    const event = job.event;
+    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
+    try {
+      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== event.ci.commit_sha) return;
+      if (!(pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel)) return;
+      await this.merger.handle(event);
+    } catch (error) {
+      this.logger.error('could not hand #' + event.pull_request.number + ' over after its security review:', error.message);
     }
   }
 
@@ -547,12 +565,19 @@ export class Dispatcher {
     const issue = Number(match[1]);
     if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) return none;
     const labels = (pr.labels || []).map((label: Json) => label.name);
-    if (labels.includes(this.config.blockedLabel) || labels.includes(this.config.approvedLabel)) return none;
+    if (labels.includes(this.config.blockedLabel)) return none;
+    const approved = labels.includes(this.config.approvedLabel);
     const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
       issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
-    let reviewed = false;
-    try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; }
-    if (reviewed) return none;
+    let reviewed = approved;
+    if (!reviewed) { try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; } }
+    // An approved or reviewed pull request is not brought up to date: that would throw the review away, and it merges as it is. But one
+    // that conflicts can be merged by nobody (a human waiting to merge a protected path would find it so). Once the WIP marker is gone,
+    // which approval removes, Forgejo's mergeable is reliable: a conflict starts a conflict round, after which CI and review run again.
+    if (reviewed) {
+      if (pr.mergeable === false && !WIP.test(String(pr.title || '')) && (await this.startConflictRound(prEvent, tip))) return { changed: true, deferred: false };
+      return none;
+    }
     // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
     // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
     if (!(await this.touchesSameFiles(event, pr, tip))) return none;
@@ -822,7 +847,7 @@ export class Dispatcher {
       await this.checkBranchAfterRun(job);
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
-      else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); }
+      else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
       else if (state !== 'finished') await this.reportFailure(job, state);
       return true;
     }
