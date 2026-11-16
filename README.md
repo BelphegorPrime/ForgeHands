@@ -44,7 +44,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 `compose.yaml` binds the port to `127.0.0.1`. To accept Forgejo webhooks from another host, use a secured reverse proxy and an explicit network policy. To run without Docker: `npm start`. To build a local image: `docker build -t forgehands:local .` and `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`. Keep registry and webhook secrets out of committed files.
 
-Endpoints: `POST /webhooks/forgejo` (the webhook), `GET /healthz`, and in direct mode `GET /status` (page) and `GET /status.json`.
+Endpoints: `POST /webhooks/forgejo` (the webhook), `GET /healthz`, and in direct mode `GET /status` (page), `GET /status.json` and `GET /metrics` (Prometheus).
 
 ## Forgejo setup
 
@@ -215,6 +215,8 @@ Within a repository, work on a ticket that has begun (a round, a review, a CI fi
 ### Housekeeping and status
 
 Finished runs archive themselves (`ARCHIVE_AFTER_DAYS`): about once an hour ForgeHands adds the tag `archived=true` (other tags stay, so runs can still be found by `source`, `issue`, `pr`, `ci`, `epic`) to conversations that ended long enough ago, at most 20 per round. Archived runs stay in the ledger until it prunes them (30 days).
+
+`GET /metrics` (direct mode, protected by `STATUS_TOKEN` like the status page) is Prometheus text, written by hand, no dependency. Gauges from the ledger: `forgehands_jobs{status,kind}`, `forgehands_jobs_waiting`, `forgehands_queued_jobs{repository}`, `forgehands_tier_cooldown_active{tier}`. Counters since start (in memory, they reset on restart): `forgehands_webhook_deliveries_total{event,result}`, `forgehands_runs_started_total{kind}`, `forgehands_runs_finished_total{kind,state}`, `forgehands_merges_total{repository}`, `forgehands_merge_refusals_total{reason}`, `forgehands_blocks_total{reason}`, `forgehands_error_retries_total`, `forgehands_branch_updates_total`, `forgehands_branch_conflicts_total`, `forgehands_openhands_api_errors_total{class}`, `forgehands_forgejo_api_errors_total{class}`, `forgehands_escalated_rounds_total`, `forgehands_reminders_total`, `forgehands_dry_run_writes_total`; and the histogram `forgehands_run_duration_seconds{kind}`. Labels come from known sets only (repositories of `ALLOWED_REPOS`, route kinds, tiers, fixed reasons), never issue numbers.
 
 `GET /status` and `GET /status.json` show per issue what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, failed). Read only, no event text but the issue title. They are open unless `STATUS_TOKEN` is set (bearer or basic auth, compared in constant time); either way keep them behind the same internal reverse proxy as the webhook. Above the tickets a summary per repository covers the last 7 and 30 days of the ledger: tickets merged (and how many without a human: merged by ForgeHands and never blocked), blocked, split, median and p90 time from the first run to the merge, rounds per merged ticket, review and error retries, and cost. The page refreshes itself every 30 seconds; `/status.json` has the same numbers under `summary`. Merges by a human are noticed when the push to the default branch closes the ticket, so they count as merged but never as without a human. The labels on the pull request (`ai:approved`, `ai:changes`, `ai:blocked`) are Forgejo's side of the picture.
 

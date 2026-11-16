@@ -1,6 +1,7 @@
 import { forgejoCall } from './client.ts';
 import { DryLog } from '../dry.ts';
 import { isBotPull } from './bot.ts';
+import { metrics } from '../metrics.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 
 export const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
@@ -66,7 +67,7 @@ export class Merger {
       const sha = pr.head.sha;
       const labels = (pr.labels || []).map((label: Json) => label.name);
       if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
-      if (labels.includes(this.config.blockedLabel)) return 'blocked';
+      if (labels.includes(this.config.blockedLabel)) return metrics.refused('blocked');
       // The approval label is a claim; the review comment is the proof. Without a verdict for this very commit nothing is merged.
       const review = await this.reviewOf(repository, number, sha);
       // The reviewer sometimes sets the label a moment before it posts the verdict comment. A label that arrives first is looked at
@@ -78,10 +79,10 @@ export class Merger {
       if (!review.ok) {
         this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'blocked');
         await this.rejectApproval(repository, number, sha, review.reason);
-        return 'no_valid_review';
+        return metrics.refused('no_valid_review');
       }
       const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(sha) + '/status');
-      if (status?.state !== 'success' || !(status.total_count > 0)) return 'ci_not_green';
+      if (status?.state !== 'success' || !(status.total_count > 0)) return metrics.refused('ci_not_green');
       const changed = await this.changedFiles(repository, number);
       const protectedFiles = changed.filter((name) => policy.deny.some((pattern) => pattern.test(name)));
       // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable). Approved and green is
@@ -97,15 +98,16 @@ export class Merger {
         // review of this commit is still under way the hand-over waits for it (the dispatcher hands over when that run ends).
         if (this.hasSecurityRoute() && this.securityPending(repository, number, sha) && !(await this.securityReview(repository, number, sha))) return 'awaiting_security_review';
         await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, current?.mergeable === false), true);
-        return 'protected_paths';
+        return metrics.refused('protected_paths');
       }
       if (current?.mergeable === false) {
         await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.', true);
-        return 'not_mergeable';
+        return metrics.refused('not_mergeable');
       }
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
         Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
       });
+      metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
       await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
@@ -117,7 +119,7 @@ export class Merger {
     } catch (error) {
       this.logger.error('auto-merge of ' + repository + '#' + number + ' failed:', error.message);
       await this.remark(repository, number, 'approved and green, but the merge failed (' + String(error.message).slice(0, 120) + '). A human has to look at this pull request.', true);
-      return 'merge_failed';
+      return metrics.refused('merge_failed');
     }
   }
 
@@ -198,6 +200,7 @@ export class Merger {
   }
 
   async rejectApproval(repository: string, number: number, sha: string, reason?: string): Promise<void> {
+    metrics.inc('forgehands_blocks_total', { reason: 'approval_not_trusted' });
     const event = { repository: { full_name: repository }, pull_request: { number } };
     await this.clearApproval(event);
     const what = reason === 'not_ok'

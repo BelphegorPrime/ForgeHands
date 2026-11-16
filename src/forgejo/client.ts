@@ -1,3 +1,4 @@
+import { metrics } from '../metrics.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import type { Config, Fetch, ForgejoAccess, Json } from '../types.ts';
 
@@ -17,7 +18,7 @@ export async function forgejoCall(config: ForgejoConfig, send: Fetch, repository
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(config.timeoutMs),
     redirect: 'error'
-  });
-  if (!response.ok) throw new Error(method + ' ' + path + ' -> HTTP ' + response.status);
+  }).catch((error) => { metrics.apiError('forgejo', null); throw error; });
+  if (!response.ok) { metrics.apiError('forgejo', response.status); throw new Error(method + ' ' + path + ' -> HTTP ' + response.status); }
   return response.json().catch(() => null);
 }

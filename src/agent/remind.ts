@@ -2,6 +2,7 @@ import { forgejoCall } from '../forgejo/client.ts';
 import { Merger } from '../forgejo/merge.ts';
 import { isBotPull } from '../forgejo/bot.ts';
 import { DryLog } from '../dry.ts';
+import { metrics } from '../metrics.ts';
 import type { DirectConfig, Fetch, Json, Logger } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -134,6 +135,7 @@ export class Reminder {
           + new Date(since).toISOString().slice(0, 10) + ' (' + reason + ').' + (number >= max ? ' This is the last reminder.' : '');
         await this.call(repository, 'POST', '/issues/' + pr.number + '/comments', { body: text });
         written += 1;
+        metrics.inc('forgehands_reminders_total');
         if (number >= max && this.config.staleLabel) await this.addLabel(repository, pr.number, this.config.staleLabel);
       } catch (error) {
         this.logger.error('could not remind of #' + pr.number + ':', error.message);

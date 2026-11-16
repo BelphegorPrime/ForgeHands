@@ -3,6 +3,7 @@ import { forgejoCall } from '../forgejo/client.ts';
 import { Merger, WIP } from '../forgejo/merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
+import { known, metrics } from '../metrics.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -456,11 +457,12 @@ export class Dispatcher {
   async roundsUsedUp(event: ForgeEvent): Promise<void> {
     const limit = this.roundLimit(event);
     this.logger.error(this.issueKey(event) + ': ' + limit + ' rounds used up, not starting another');
-    await this.markForHuman(event, 'ForgeHands: ' + limit + ' follow-up rounds for ' + (event.bot ? 'this dependency update' : 'issue #' + event.issue.number) + ' are used up. A human has to look at this pull request now.');
+    await this.markForHuman(event, 'ForgeHands: ' + limit + ' follow-up rounds for ' + (event.bot ? 'this dependency update' : 'issue #' + event.issue.number) + ' are used up. A human has to look at this pull request now.', 'rounds_used_up');
   }
 
   // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
-  async markForHuman(event: ForgeEvent, text: string): Promise<void> {
+  async markForHuman(event: ForgeEvent, text: string, reason = 'other'): Promise<void> {
+    metrics.inc('forgehands_blocks_total', { reason });
     this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
     if (!this.config.forgejo) return;
     const { number } = event.pull_request!;
@@ -518,7 +520,7 @@ export class Dispatcher {
       const names = (pr.labels || []).map((label: Json) => label.name);
       // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a review that asks for changes hands it to a human, as the reviewer should have.
       if (event.bot && !this.config.botFixRounds && names.includes(this.config.changesLabel) && ![this.config.approvedLabel, this.config.blockedLabel].some((name) => names.includes(name))) {
-        await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.');
+        await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
         return;
       }
       if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
@@ -528,7 +530,7 @@ export class Dispatcher {
         this.logger.error('review ' + job.key + ' ended without a verdict, running it once more');
         return;
       }
-      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.');
+      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.', 'no_verdict');
     } catch (error) {
       this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
     }
@@ -566,8 +568,16 @@ export class Dispatcher {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(this.config.timeoutMs),
       redirect: 'error'
-    });
+    }).catch((error) => { metrics.apiError('openhands', null); throw error; });
+    if (!response.ok) metrics.apiError('openhands', response.status);
     return response;
+  }
+
+  // A run ended for good (not queued again): count it by kind and end state and time it.
+  runEnded(job: Job, state: string, now: number): void {
+    const kind = this.config.routes.get(job.label)?.kind || 'issue';
+    metrics.inc('forgehands_runs_finished_total', { kind, state: known(state, ['finished', 'error', 'stuck', 'deleted', 'paused', 'timeout']) });
+    if (job.started) metrics.observe({ kind }, Math.max(0, now - job.started) / 1000);
   }
 
   // Ticks never overlap: a caller waits for the running one and then runs a fresh pass.
@@ -669,8 +679,10 @@ export class Dispatcher {
     try {
       await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
       this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
+      metrics.inc('forgehands_branch_updates_total');
     } catch (error) {
       if (!/HTTP 409\b/.test(error.message)) { this.logger.error('could not update #' + pr.number + ':', error.message); return none; }
+      metrics.inc('forgehands_branch_conflicts_total');
       if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
     }
     return none;
@@ -735,7 +747,7 @@ export class Dispatcher {
     const route = [...this.config.routes].find(([, entry]) => entry.kind === 'conflict')?.[0];
     const number = event.pull_request!.number;
     if (!route) {
-      await this.markForHuman(event, 'ForgeHands: the pull request conflicts with ' + (event.repository.default_branch || 'the default branch') + ' and no conflict round is configured. A human has to resolve it.');
+      await this.markForHuman(event, 'ForgeHands: the pull request conflicts with ' + (event.repository.default_branch || 'the default branch') + ' and no conflict round is configured. A human has to resolve it.', 'conflict');
       return false;
     }
     const key = this.issueKey(event) + ':' + route + ':' + tip.slice(0, 8);
@@ -853,6 +865,7 @@ export class Dispatcher {
     if (target && !job.escalated) {
       job.escalated = true;
       this.logger.error(job.key + ': round ' + this.rounds(job.event) + ' is escalated to ' + route.escalateTo);
+      metrics.inc('forgehands_escalated_rounds_total');
     }
     const { route: effective, fellBack } = this.effectiveRoute(job, now);
     job.fell_back = fellBack;
@@ -883,6 +896,7 @@ export class Dispatcher {
       const created = (await response.json()) as Json;
       if (!created?.id) throw new Error('response without conversation id');
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
+      metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
       job.error = error.message;
@@ -933,12 +947,14 @@ export class Dispatcher {
     // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
     if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
       this.logger.error(job.key + ' ended with an error, running it once more');
+      metrics.inc('forgehands_error_retries_total');
       Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,
         error_retry: (job.error_retry || 0) + 1, next_try: now + ERROR_RETRY_DELAY_MS, retry_at: now + ERROR_RETRY_DELAY_MS });
       return true;
     }
     if (state !== null && TERMINAL.has(state)) {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
+      this.runEnded(job, state, now);
       await this.checkBranchAfterRun(job);
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
@@ -950,6 +966,7 @@ export class Dispatcher {
     // Free the slot of a run that never ends; the conversation itself is left alone.
     if (job.started && job.started + this.config.maxRunMs < now) {
       Object.assign(job, { status: 'failed', result: 'timeout', finished: now });
+      this.runEnded(job, 'timeout', now);
       await this.reportFailure(job, 'timeout');
       return true;
     }
@@ -980,7 +997,7 @@ export class Dispatcher {
         return;
       }
       const text = what + '. A human has to look at it.';
-      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text);
+      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run');
       else await this.forgejoCall(event, 'POST', '/issues/' + event.issue.number + '/comments', { body: (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text });
     } catch (error) {
       this.logger.error('could not report the failure of ' + job.key + ':', error.message);

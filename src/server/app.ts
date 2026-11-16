@@ -4,6 +4,7 @@ import { deliveryId, signPayload, verifyForgejoSignature } from '../webhook/secu
 import { normalizeEvent } from '../webhook/events.ts';
 import { buildStatus, renderStatus } from './status.ts';
 import { hasToken } from './auth.ts';
+import { gaugeSamples, known, metrics, WEBHOOK_EVENTS } from '../metrics.ts';
 import { isPushEvent } from '../types.ts';
 import { DryLog, isDry } from '../dry.ts';
 import type { Config, DirectConfig, Fetch, ForgeEvent, Logger } from '../types.ts';
@@ -42,12 +43,16 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     if (req.method === 'GET' && req.url === '/healthz') {
       return json(res, 200, { status: 'ok' });
     }
-    // Read only view of the work in flight (direct mode): /status for people, /status.json for tools.
-    if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json') && dispatcher) {
+    // Read only views of the work in flight (direct mode): /status for people, /status.json for tools, /metrics for Prometheus.
+    if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json' || req.url === '/metrics') && dispatcher) {
       // With STATUS_TOKEN: `Authorization: Bearer <token>`, or basic auth with the token as password (so that a browser can open it).
       if (config.statusToken && !hasToken(req.headers.authorization, config.statusToken)) {
         res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': 'Basic realm="ForgeHands", charset="UTF-8"' });
         return res.end(JSON.stringify({ error: 'unauthorized' }));
+      }
+      if (req.url === '/metrics') {
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end(metrics.render(gaugeSamples(config as DirectConfig, dispatcher.jobs, dispatcher.cooldowns, Date.now())));
       }
       const status = buildStatus(config as DirectConfig, dispatcher.jobs, Date.now(), dispatcher.dry, [...dispatcher.reminder.waiting.values()]);
       if (req.url === '/status.json') return json(res, 200, status);
@@ -60,10 +65,12 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
       return json(res, 415, { error: 'expected_json' });
     }
+    const delivered = (result: string) => metrics.inc('forgehands_webhook_deliveries_total', { event: known(req.headers['x-forgejo-event'], WEBHOOK_EVENTS), result });
     let raw;
     try { raw = await readBody(req, config.maxBodyBytes); }
     catch (error) { return json(res, error.status || 400, { error: 'invalid_body' }); }
     if (!verifyForgejoSignature(config.forgejoSecret, raw, req.headers['x-forgejo-signature'])) {
+      delivered('rejected_signature');
       return json(res, 401, { error: 'invalid_signature' });
     }
     let body;
@@ -79,18 +86,19 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
       pushes: direct && config.updateBranches,
       bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, fixRounds: config.botFixRounds } : undefined });
-    if (!normalized) { remember(); return json(res, 202, { status: 'ignored' }); }
+    if (!normalized) { remember(); delivered('ignored'); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     // The CI outcome of a bot's pull request is let in by BOT_AUTHORS (the operator's own list), not by who triggered the run. Labels still need an allowed sender.
     if (config.allowedSenders && !((normalized as ForgeEvent).bot && normalized.type.startsWith('ci.')) && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
       remember();
+      delivered('ignored');
       return json(res, 202, { status: 'ignored' });
     }
     const id = deliveryId(req.headers, raw, event);
     const key = normalized.repository.full_name.toLowerCase() + ':' + id;
     const state = store.acquire(key);
-    if (state === 'completed') return json(res, 200, { status: 'duplicate', delivery_id: id });
-    if (state === 'inflight') return json(res, 503, { error: 'delivery_in_progress' });
+    if (state === 'completed') { delivered('duplicate'); return json(res, 200, { status: 'duplicate', delivery_id: id }); }
+    if (state === 'inflight') { delivered('failed'); return json(res, 503, { error: 'delivery_in_progress' }); }
     normalized.delivery_id = id;
     if (config.mode === 'direct') {
       try {
@@ -100,8 +108,10 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
           : await dispatcher!.enqueue(normalized);
         remember();
         await store.mark(key);
+        delivered('accepted');
         return json(res, 202, { status: result.status, delivery_id: id });
       } catch (error) {
+        delivered('failed');
         logger.error('Enqueue failed:', error.message);
         return json(res, 500, { error: 'enqueue_failed' });
       } finally {
@@ -129,12 +139,15 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
         redirect: 'error'
       });
       if (!response.ok) {
+        delivered('failed');
         logger.error('OpenHands webhook returned', response.status);
         return json(res, 502, { error: 'upstream_rejected', status_code: response.status });
       }
       await store.mark(key);
+      delivered('accepted');
       return json(res, 202, { status: 'forwarded', delivery_id: id });
     } catch (error) {
+      delivered('failed');
       logger.error('OpenHands webhook delivery failed:', error.message);
       return json(res, 502, { error: 'upstream_unavailable' });
     } finally {

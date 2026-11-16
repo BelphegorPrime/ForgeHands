@@ -1,3 +1,4 @@
+import { metrics } from './metrics.ts';
 import type { Config, Logger } from './types.ts';
 
 const MAX_KEPT = 200;
@@ -26,6 +27,7 @@ export class DryLog {
 
   record(target: string, method: string, path: string, body?: unknown): void {
     const text = body === undefined ? null : JSON.stringify(body).slice(0, 300);
+    metrics.inc('forgehands_dry_run_writes_total');
     this.writes.push({ at: new Date().toISOString(), target, method, path, body: text });
     if (this.writes.length > MAX_KEPT) this.writes.shift();
     this.logger.error('DRY RUN, not sent: ' + method + ' ' + target + path + (text ? ' ' + text : ''));
