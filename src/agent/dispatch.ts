@@ -639,15 +639,15 @@ export class Dispatcher {
 
   // Which queued job gets the next free slot. Between repositories the starts are shared by weight (REPO_WEIGHTS, default 1; a higher weight
   // means more of the starts): the repository with the fewest recent starts per unit of weight goes first, so weights 2, 1 and 5 give 2 of 8,
-  // 1 of 8 and 5 of 8 starts when all three have work. Within a repository it is the oldest ticket (lowest issue number) that can start now,
-  // not the one that was queued first. A repository without a startable job does not take a share: the others use it.
+  // 1 of 8 and 5 of 8 starts when all three have work. Within a repository see `before`: begun tickets first, then the oldest ticket (lowest
+  // issue number) that can start now, not the one that was queued first. A repository without a startable job does not take a share: the others use it.
   pickNext(now: number, tried: Set<string>): Job | null {
     const heads = new Map<string, Job>();
     for (const job of this.jobs.list('queued')) {
       if (tried.has(job.id) || (job.next_try && job.next_try > now) || !this.hasRoom(job, now)) continue;
       const repo = job.event.repository.full_name.toLowerCase();
       const best = heads.get(repo);
-      if (!best || job.event.issue.number < best.event.issue.number || (job.event.issue.number === best.event.issue.number && job.created < best.created)) heads.set(repo, job);
+      if (!best || this.before(job, best)) heads.set(repo, job);
     }
     if (!heads.size) return null;
     const recent = new Map<string, number>();
@@ -662,6 +662,15 @@ export class Dispatcher {
       if (!pick || score < pick.score || (score === pick.score && (weight > pick.weight || (weight === pick.weight && repo < pick.repo)))) pick = { repo, job, score, weight };
     }
     return pick!.job;
+  }
+
+  // Order within a repository: work on a ticket that has begun (a round, a review, a fix, a conflict, an epic review) before a new ticket, so
+  // that what was started gets finished; then the lowest issue number; then the job that was queued first.
+  before(a: Job, b: Job): boolean {
+    const begun = (job: Job) => (job.event.pull_request || job.event.type === 'epic.done' ? 0 : 1);
+    if (begun(a) !== begun(b)) return begun(a) < begun(b);
+    if (a.event.issue.number !== b.event.issue.number) return a.event.issue.number < b.event.issue.number;
+    return a.created < b.created;
   }
 
   hasRoom(job: Job, now: number): boolean {
