@@ -1,10 +1,11 @@
-import { forgejoCall } from '../forgejo/client.ts';
-import { Merger } from '../forgejo/merge.ts';
-import { isBotPull } from '../forgejo/bot.ts';
+import { createForge, createTransport } from '../forge/index.ts';
+import { Merger } from '../forge/merge.ts';
+import { isBotPull } from '../forge/bot.ts';
 import { DryLog } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import type { DirectConfig, Fetch, Json, Logger } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
+import type { Forge } from '../forge/index.ts';
 
 const DAY_MS = 86400000;
 // Forgejo calls stay bounded: per pass this many agent pull requests are looked at (comments and more are read for each), this many
@@ -30,6 +31,8 @@ export class Reminder {
   logger: Logger;
   merger: Merger;
   dry: DryLog;
+  forge: Forge;
+  transport: ReturnType<typeof createTransport>;
   last = 0;
   waiting = new Map<string, Waiting>(); // repository#pr -> what waits for the human (shown by /status)
 
@@ -40,10 +43,12 @@ export class Reminder {
     this.send = send;
     this.logger = logger;
     this.merger = merger;
+    this.transport = createTransport(config, send, this.dry);
+    this.forge = createForge(config, (repository, method, path, body) => this.call(repository, method, path, body));
   }
 
   call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
-    return forgejoCall(this.config, this.send, repository, method, path, body, this.dry);
+    return this.transport(repository, method, path, body);
   }
 
   // At most once a day. Returns true when a waiting job was started (the ledger changed).
@@ -67,7 +72,7 @@ export class Reminder {
     const waiting = this.jobs.list(true).filter((job) => job.status === 'waiting' && !job.waiting_for_run).slice(0, MAX_WAITING_JOBS);
     for (const job of waiting) {
       try {
-        const dependencies = await this.call(job.event.repository.full_name, 'GET', '/issues/' + job.event.issue.number + '/dependencies');
+        const dependencies = await this.forge.dependencies(job.event.repository.full_name, job.event.issue.number);
         if (!Array.isArray(dependencies) || dependencies.some((issue: Json) => issue.state === 'open')) continue;
         job.status = 'queued';
         delete job.waiting_for;
@@ -86,7 +91,7 @@ export class Reminder {
     if (labels.includes(blockedLabel)) return 'it is marked ' + blockedLabel;
     const policy = this.config.mergePolicy.get(repository.toLowerCase());
     if (labels.includes(approvedLabel) && policy) {
-      const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(pr.head.sha) + '/status');
+      const status = await this.forge.commitStatus(repository, pr.head.sha);
       if (status?.state === 'success' && status.total_count > 0) {
         const files = await this.merger.changedFiles(repository, pr.number);
         if (files.some((name) => policy.deny.some((pattern) => pattern.test(name)))) return 'it is approved and green, but touches protected paths, so it is left to you to merge';
@@ -102,7 +107,7 @@ export class Reminder {
 
   async remindRepository(repository: string, now: number, seen: Map<string, Waiting>, budget: number): Promise<number> {
     const { remindAfterDays: days, remindMax: max, humanLogin } = this.config;
-    const pulls = await this.call(repository, 'GET', '/pulls?state=open&limit=50');
+    const pulls = await this.forge.listPulls(repository, { state: 'open', limit: 50 });
     let written = 0;
     let looked = 0;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
@@ -116,7 +121,7 @@ export class Reminder {
         const labels: string[] = (pr.labels || []).map((label: Json) => label.name);
         const reason = bot ? (labels.includes(this.config.blockedLabel) ? 'it is marked ' + this.config.blockedLabel : null) : await this.reasonFor(repository, pr, labels, now);
         if (!reason) continue;
-        const comments = ((await this.call(repository, 'GET', '/issues/' + pr.number + '/comments?limit=100')) || []) as Json[];
+        const comments = ((await this.forge.listComments(repository, pr.number, 100)) || []) as Json[];
         const at = (comment: Json) => Date.parse(comment.created_at) || 0;
         const newest = (list: Json[]) => list.map(at).reduce((a, b) => Math.max(a, b), 0);
         const own = comments.filter((comment) => OWN.test(String(comment.body || '').trimStart()));
@@ -133,7 +138,7 @@ export class Reminder {
         const number = streak.length + 1;
         const text = '@' + humanLogin + ' ForgeHands: reminder ' + number + ' of ' + max + ': this pull request has been waiting for you since '
           + new Date(since).toISOString().slice(0, 10) + ' (' + reason + ').' + (number >= max ? ' This is the last reminder.' : '');
-        await this.call(repository, 'POST', '/issues/' + pr.number + '/comments', { body: text });
+        await this.forge.addComment(repository, pr.number, text);
         written += 1;
         metrics.inc('forgehands_reminders_total');
         if (number >= max && this.config.staleLabel) await this.addLabel(repository, pr.number, this.config.staleLabel);
@@ -145,9 +150,7 @@ export class Reminder {
   }
 
   async addLabel(repository: string, number: number, name: string): Promise<void> {
-    const known = await this.call(repository, 'GET', '/labels?limit=100');
-    let label = (known || []).find((entry: Json) => entry.name === name);
-    if (!label) label = await this.call(repository, 'POST', '/labels', { name, color: '#cccccc' });
-    await this.call(repository, 'POST', '/issues/' + number + '/labels', { labels: [label.id] });
+    const label = await this.forge.findOrCreateLabel(repository, name, '#cccccc');
+    await this.forge.addLabels(repository, number, [label]);
   }
 }

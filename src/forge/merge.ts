@@ -1,10 +1,10 @@
-import { forgejoCall } from './client.ts';
+import { createForge, createTransport } from './index.ts';
 import { DryLog } from '../dry.ts';
 import { isBotPull } from './bot.ts';
 import { metrics } from '../metrics.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
+import type { Forge } from './types.ts';
 
-export const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
 const PAGE = 50;
 const MAX_FILES = 1000;
 
@@ -16,6 +16,9 @@ export class Merger {
   logger: Logger;
   later: (run: () => void, ms: number) => void;
   dry: DryLog;
+  forge: Forge;
+  // The wire: what every call of this merger passes through. A test replaces it; the paths stay the forge's.
+  transport: ReturnType<typeof createTransport>;
   // Set by the dispatcher: is a security review of this commit still queued or running? Then the hand-over waits for it.
   securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
   // Tells the ledger that ForgeHands merged a ticket or handed it to a human (ticket: "repo#issue" or "repo!pr<n>"); the dispatcher sets it, see Dispatcher.noteTicket.
@@ -28,16 +31,18 @@ export class Merger {
     this.logger = logger;
     this.later = later;
     this.dry = dry;
+    this.transport = createTransport(config, send, dry);
+    this.forge = createForge(config, (repository, method, path, body) => this.call(repository, method, path, body));
   }
 
   call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
-    return forgejoCall(this.config, this.send, repository, method, path, body, this.dry);
+    return this.transport(repository, method, path, body);
   }
 
   async changedFiles(repository: string, number: number): Promise<string[]> {
     const names: string[] = [];
     for (let page = 1; names.length < MAX_FILES; page++) {
-      const files = await this.call(repository, 'GET', '/pulls/' + number + '/files?limit=' + PAGE + '&page=' + page);
+      const files = await this.forge.pullFiles(repository, number, PAGE, page);
       if (!Array.isArray(files) || !files.length) break;
       for (const file of files) names.push(file.filename, ...(file.previous_filename ? [file.previous_filename] : []));
       if (files.length < PAGE) break;
@@ -48,7 +53,7 @@ export class Merger {
   // `human`: the comment hands the pull request to a human, so it mentions him (and is the only kind that does).
   async remark(repository: string, number: number, text: string, human = false): Promise<void> {
     const mention = human && this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '';
-    try { await this.call(repository, 'POST', '/issues/' + number + '/comments', { body: mention + 'ForgeHands: ' + text }); }
+    try { await this.forge.addComment(repository, number, mention + 'ForgeHands: ' + text); }
     catch (error) { this.logger.error('could not comment on #' + number + ':', error.message); }
   }
 
@@ -59,7 +64,7 @@ export class Merger {
     if (!policy || !this.config.forgejo) return 'no_merge_policy';
     const number = event.pull_request!.number;
     try {
-      const pr = await this.call(repository, 'GET', '/pulls/' + number);
+      const pr = await this.forge.getPull(repository, number);
       if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
       // Judged from the pull request as Forgejo has it now, not from the event: an agent branch, or a pull request of a listed bot.
       const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes }, pr, repository);
@@ -81,7 +86,7 @@ export class Merger {
         await this.rejectApproval(repository, number, sha, review.reason);
         return metrics.refused('no_valid_review');
       }
-      const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(sha) + '/status');
+      const status = await this.forge.commitStatus(repository, sha);
       if (status?.state !== 'success' || !(status.total_count > 0)) return metrics.refused('ci_not_green');
       const changed = await this.changedFiles(repository, number);
       const protectedFiles = changed.filter((name) => policy.deny.some((pattern) => pattern.test(name)));
@@ -89,9 +94,9 @@ export class Merger {
       // the end of the work in progress, for a human as much as for ForgeHands: the marker goes before either merges it. Only after
       // the title is clean does `mergeable` say anything about conflicts, so look at the pull request again.
       let current = pr;
-      if (WIP.test(pr.title || '')) {
-        await this.call(repository, 'PATCH', '/pulls/' + number, { title: pr.title.replace(WIP, '') });
-        current = await this.call(repository, 'GET', '/pulls/' + number);
+      if (this.forge.isWip(pr.title || '')) {
+        await this.forge.setPullTitle(repository, number, this.forge.stripWip(pr.title));
+        current = await this.forge.getPull(repository, number);
       }
       if (protectedFiles.length) {
         // The human gets one comment with everything he needs: why a human, which paths, what the security review found. While a security
@@ -104,16 +109,14 @@ export class Merger {
         await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.', true);
         return metrics.refused('not_mergeable');
       }
-      await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
-        Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
-      });
+      await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
       await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
       if (bot) return 'merged';
       const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
-      try { await this.call(repository, 'PATCH', '/issues/' + issue, { state: 'closed' }); }
+      try { await this.forge.closeIssue(repository, issue); }
       catch (error) { this.logger.error('could not close issue #' + issue + ':', error.message); }
       return 'merged';
     } catch (error) {
@@ -126,7 +129,7 @@ export class Merger {
   // The verdict word of the latest security review comment for this commit ("OK" or "CONCERNS"), or null. Advisory, written by the
   // sensitive reviewer: `## Security review: OK|CONCERNS` and the first eight characters of the commit.
   async securityReview(repository: string, number: number, sha: string): Promise<string | null> {
-    const comments = await this.call(repository, 'GET', '/issues/' + number + '/comments?limit=100');
+    const comments = await this.forge.listComments(repository, number, 100);
     const found = (Array.isArray(comments) ? comments : [])
       .map((comment: Json) => ({ at: Date.parse(comment.created_at), text: String(comment.body || '').slice(0, 600) }))
       .filter((entry) => /security review\s*:\s*(ok|concerns)\b/i.test(entry.text.slice(0, 200)) && entry.text.includes(sha.slice(0, 8)))
@@ -176,13 +179,12 @@ export class Merger {
   async reviewOf(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
     let since = 0;
     try {
-      const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
-      const time = Date.parse(commit?.created || commit?.commit?.committer?.date || '');
+      const time = Date.parse((await this.forge.commitTime(repository, sha)) || '');
       if (Number.isFinite(time)) since = time;
     } catch (error) {
       this.logger.error('could not read the time of commit ' + sha.slice(0, 8) + ', counting every review comment:', error.message);
     }
-    const comments = await this.call(repository, 'GET', '/issues/' + number + '/comments?limit=100');
+    const comments = await this.forge.listComments(repository, number, 100);
     const verdicts = (Array.isArray(comments) ? comments : [])
       .filter((comment: Json) => Date.parse(comment.created_at) >= since && String(comment.body || '').length >= this.config.minReviewChars)
       .map((comment: Json) => ({ at: Date.parse(comment.created_at), match: /verdict\s*:\s*(not\s+ok|ok)\b/i.exec(String(comment.body).slice(0, 300)) }))
@@ -208,10 +210,8 @@ export class Merger {
       : 'there is no review comment for commit ' + sha.slice(0, 8) + ' that starts with \"Verdict: OK\" and holds evidence (at least ' + this.config.minReviewChars + ' characters)';
     await this.remark(repository, number, 'the label ' + this.config.approvedLabel + ' was set, but ' + what + '. The approval is not trusted and was taken off. A human has to look at this pull request, or push a commit to run the review again.', true);
     try {
-      const known = await this.call(repository, 'GET', '/labels?limit=100');
-      let label = (known || []).find((entry: Json) => entry.name === this.config.blockedLabel);
-      if (!label) label = await this.call(repository, 'POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
-      await this.call(repository, 'POST', '/issues/' + number + '/labels', { labels: [label.id] });
+      const label = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
+      await this.forge.addLabels(repository, number, [label]);
     } catch (error) {
       this.logger.error('could not mark the pull request:', error.message);
     }
@@ -223,9 +223,9 @@ export class Merger {
     const repository = event.repository.full_name;
     const number = event.pull_request!.number;
     try {
-      const labels = await this.call(repository, 'GET', '/issues/' + number + '/labels');
-      const approved = (labels || []).find((label: Json) => label.name === this.config.approvedLabel);
-      if (approved) await this.call(repository, 'DELETE', '/issues/' + number + '/labels/' + approved.id);
+      const labels = await this.forge.labelsOf(repository, number);
+      const approved = (labels || []).find((label) => label.name === this.config.approvedLabel);
+      if (approved) await this.forge.removeLabel(repository, number, approved);
     } catch (error) {
       this.logger.error('could not clear the approval of #' + number + ':', error.message);
     }
