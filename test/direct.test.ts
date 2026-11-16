@@ -1083,7 +1083,7 @@ test('merge: a protected path stops it with a comment, whichever page of files i
   const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: files }));
   assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
   assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
-  assert.match(forgejo.calls.find((call) => call.method === 'POST').body.body, /protected paths \(\.github\/workflows\/image\.yaml\)/);
+  assert.match(forgejo.calls.find((call) => call.method === 'POST').body.body, /- `\.github\/\*\*` \(\.github\/workflows\/image\.yaml\)/);
 });
 
 test('merge: nothing happens without policy, approval, green CI, a clean merge, an open agent branch', async () => {
@@ -1858,6 +1858,26 @@ test('an approval label that arrives before the verdict comment is checked again
   assert.throws(() => loadConfig(env(withMerge({ APPROVAL_GRACE_SECONDS: '-1' }))), /APPROVAL_GRACE_SECONDS/);
 });
 
+test('the hand-over names why a human is needed (MERGE_POLICY reasons) and waits for a security review still under way', async () => {
+  const policy = JSON.stringify({ 'owner/hello': { deny: ['compose.yaml', '.github/**'], reasons: { 'compose.yaml': 'it deploys the stack' } } });
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }, { filename: '.github/workflows/a.yaml' }] });
+  const { merger, forgejo } = await mergerFor(routes, { MERGE_POLICY: policy, HUMAN_LOGIN: 'marcel' });
+  assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
+  const text = commentsOf(forgejo).at(-1);
+  assert.match(text, /- `compose\.yaml`: it deploys the stack \(compose\.yaml\)/);
+  assert.match(text, /- `\.github\/\*\*` \(\.github\/workflows\/a\.yaml\)/);
+  const waiting = await mergerFor(routes, { MERGE_POLICY: policy, LABEL_ROUTES: sensitiveRoutes() });
+  waiting.merger.securityPending = () => true;
+  assert.equal(await waiting.merger.handle(approvedEvent()), 'awaiting_security_review');
+  assert.ok(!waiting.forgejo.wrote().includes('POST /issues/34/comments'), 'no hand-over while the security review runs');
+  waiting.merger.securityPending = () => false;
+  assert.equal(await waiting.merger.handle(approvedEvent()), 'protected_paths');
+  assert.match(commentsOf(waiting.forgejo).at(-1), /There is no security review of this commit yet\./);
+  for (const bad of [{ deny: ['a'], reasons: { b: 'x' } }, { deny: ['a'], reasons: { a: '' } }, { deny: ['a'], reasons: ['x'] }]) {
+    assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': bad }) }))), /reasons of owner\/hello/);
+  }
+});
+
 test('what does not count as a review: too short, no verdict line, a verdict deep in the text, older than the commit', async () => {
   const cases = {
     'too short': [verdict('## Verdict: OK looks fine')],
@@ -2116,6 +2136,20 @@ test('when a run on a pull request ends, a conflict with the default branch that
   states[conflictJob.conversation_id || 'none'] = 'finished';
   await dispatcher.tick();
   assert.equal(jobs.list().filter((job) => job.label === 'pr:conflict').length, rounds);
+});
+
+test('an approved pull request that conflicts gets a conflict round; without a conflict, or still titled WIP, it is left alone', async () => {
+  for (const [over, expected] of [
+    [{ title: 'Fix 34', mergeable: false }, 1],
+    [{ title: 'Fix 34', mergeable: true }, 0],
+    [{ title: 'WIP: Fix 34', mergeable: false }, 0]
+  ]) {
+    const { dispatcher, jobs } = await buildBranches([pull(34, { labels: [{ name: 'ai:approved' }], ...over })], {}, {});
+    for (const job of jobs.list()) jobs.remove(job.id); // (the ledger file is shared by the cases)
+    dispatcher.onMainMoved(movedEvent());
+    await afterDelay(dispatcher);
+    assert.equal(jobs.list().filter((job) => job.label === 'pr:conflict').length, expected, JSON.stringify(over));
+  }
 });
 
 test('a rebase that conflicts becomes a conflict round of the worker, once per moved default branch', async () => {

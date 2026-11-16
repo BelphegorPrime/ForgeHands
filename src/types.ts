@@ -20,6 +20,13 @@ export interface Route {
   escalateTo: string | null;
 }
 
+/** The deny list of a repository: a pattern (as written), its regular expression and why it needs a human (optional). */
+export interface MergeRule {
+  deny: RegExp[];
+  patterns: string[];
+  reasons: (string | null)[];
+}
+
 export interface ForgejoAccess {
   url: string;
   token: string;
@@ -51,7 +58,7 @@ export interface DirectConfig extends BaseConfig {
   apiUrl: string;
   apiKey: string;
   routes: Map<string, Route>;
-  mergePolicy: Map<string, { deny: RegExp[] }>;
+  mergePolicy: Map<string, MergeRule>;
   mergeMethod: string;
   changesLabel: string;
   agentSecrets: Record<string, string>;

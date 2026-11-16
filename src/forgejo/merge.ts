@@ -2,7 +2,7 @@ import { forgejoCall } from './client.ts';
 import { DryLog } from '../dry.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 
-const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
+export const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
 const PAGE = 50;
 const MAX_FILES = 1000;
 
@@ -14,6 +14,8 @@ export class Merger {
   logger: Logger;
   later: (run: () => void, ms: number) => void;
   dry: DryLog;
+  // Set by the dispatcher: is a security review of this commit still queued or running? Then the hand-over waits for it.
+  securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -74,8 +76,8 @@ export class Merger {
       }
       const status = await this.call(repository, 'GET', '/commits/' + encodeURIComponent(sha) + '/status');
       if (status?.state !== 'success' || !(status.total_count > 0)) return 'ci_not_green';
-      const protectedFiles = (await this.changedFiles(repository, number))
-        .filter((name) => policy.deny.some((pattern) => pattern.test(name)));
+      const changed = await this.changedFiles(repository, number);
+      const protectedFiles = changed.filter((name) => policy.deny.some((pattern) => pattern.test(name)));
       // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable). Approved and green is
       // the end of the work in progress, for a human as much as for ForgeHands: the marker goes before either merges it. Only after
       // the title is clean does `mergeable` say anything about conflicts, so look at the pull request again.
@@ -85,8 +87,10 @@ export class Merger {
         current = await this.call(repository, 'GET', '/pulls/' + number);
       }
       if (protectedFiles.length) {
-        const security = await this.securityLine(repository, number, sha);
-        await this.remark(repository, number, 'approved and green, but not merged automatically: it touches protected paths (' + [...new Set(protectedFiles)].slice(0, 10).join(', ') + '). It is ready for a human to merge.' + security, true);
+        // The human gets one comment with everything he needs: why a human, which paths, what the security review found. While a security
+        // review of this commit is still under way the hand-over waits for it (the dispatcher hands over when that run ends).
+        if (this.hasSecurityRoute() && this.securityPending(repository, number, sha) && !(await this.securityReview(repository, number, sha))) return 'awaiting_security_review';
+        await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, current?.mergeable === false), true);
         return 'protected_paths';
       }
       if (current?.mergeable === false) {
@@ -120,9 +124,31 @@ export class Merger {
     return found ? /concerns/i.test(found.text.slice(0, 200)) ? 'CONCERNS' : 'OK' : null;
   }
 
+  hasSecurityRoute(): boolean {
+    return [...this.config.routes.values()].some((route) => route.kind === 'sensitive_review');
+  }
+
+  // The comment that hands a protected-path pull request to the human: what is done, why a human, which paths (with the reason of the
+  // policy where it has one), what the security review found and, if Forgejo already reports a conflict, that it is being resolved.
+  async handOverText(repository: string, number: number, sha: string, policy: { patterns: string[]; deny: RegExp[]; reasons: (string | null)[] },
+    files: string[], conflict: boolean): Promise<string> {
+    const groups = new Map<number, string[]>();
+    for (const file of [...new Set(files)]) {
+      const index = policy.deny.findIndex((pattern) => pattern.test(file));
+      groups.set(index, [...(groups.get(index) || []), file]);
+    }
+    const lines = [...groups].map(([index, list]) => '- `' + policy.patterns[index] + '`' + (policy.reasons[index] ? ': ' + policy.reasons[index] : '')
+      + ' (' + list.slice(0, 5).join(', ') + (list.length > 5 ? ', and ' + (list.length - 5) + ' more' : '') + ')');
+    const security = await this.securityLine(repository, number, sha);
+    return ['approved and green, but not merged automatically: it touches protected paths. It is ready for a human to merge.',
+      'The reviewer approved commit ' + sha.slice(0, 8) + ' and CI is green. A human merges it because the merge policy keeps these paths for a person:\n' + lines.join('\n'),
+      ...(security ? [security.trim()] : []),
+      ...(conflict ? ['Forgejo reports a conflict with the default branch; a conflict round resolves it before the merge.'] : [])].join('\n\n');
+  }
+
   // One sentence for the comment that hands a protected-path pull request to the human. Empty without a security review route.
   async securityLine(repository: string, number: number, sha: string): Promise<string> {
-    if (![...this.config.routes.values()].some((route) => route.kind === 'sensitive_review')) return '';
+    if (!this.hasSecurityRoute()) return '';
     try {
       const verdict = await this.securityReview(repository, number, sha);
       if (verdict === 'CONCERNS') return ' The security review of this commit has CONCERNS: read its comment before you merge.';
