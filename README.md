@@ -104,7 +104,7 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 
 | Variable | Meaning |
 | --- | --- |
-| `LABEL_ROUTES` | JSON, route name to route: `{"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, "ai:ready": {"profile": "<uuid>", "tier": "free"}}`. Optional per route: `max_concurrent`, `on` (below). The first label listed wins when an issue is opened with several. |
+| `LABEL_ROUTES` | JSON, route name to route: `{"ai:plan": {"profile": "<agent profile uuid>", "tier": "strong", "max_iterations": 80, "max_budget": 1.5}, "ai:ready": {"profile": "<uuid>", "tier": "free"}}`. Optional per route: `max_concurrent`, `on` (below), `escalate_to` (a round route only, see Follow-up rounds). The first label listed wins when an issue is opened with several. |
 | `ALLOWED_SENDERS` | Optional comma separated Forgejo logins that may trigger runs and steer agents through comments (else the sender of the label). |
 | `MAX_CONCURRENT`, `MAX_CONCURRENT_PER_TIER`, `MAX_RUNS_PER_HOUR` | Runs at once in total (default 4) and per `tier` (default 2), and started runs per hour (default 30, a guard against runaway fan-out). The rest waits in the queue. |
 | `REPO_WEIGHTS` | JSON, repository to weight, for example `{"owner/a": 2, "owner/b": 1}`; default weight 1. See [Scheduling](#scheduling). |
@@ -131,6 +131,7 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `MIN_REVIEW_CHARS` | 300 | A review comment must be at least this long to count as evidence. |
 | `APPROVAL_GRACE_SECONDS` | 90 | An approval label without a verdict comment is looked at once more after this long before it is taken off; `0` takes it off at once. |
 | `MAX_ROUNDS` | 3 | Follow-up rounds per issue. |
+| `ESCALATE_FROM_ROUND` | `MAX_ROUNDS` | From this round on, a round route with `escalate_to` runs with the profile and tier of that route. At most `MAX_ROUNDS`. |
 | `EPIC_LABEL` | `ai:plan,ai:close` | Labels that mark an epic. |
 
 ### Humans, failures, housekeeping
@@ -157,6 +158,8 @@ The issue text goes into the first message between markers and is marked as untr
 ### Follow-up rounds
 
 A route with `"on": "pull_request"` (for example `"ai:changes": {"profile": "<worker uuid>", "tier": "free", "max_iterations": 120, "on": "pull_request"}`) fires when its label is put on the pull request of an agent issue (head branch `ai/issue-<n>`; others are ignored). The run belongs to issue `<n>`: it checks out the branch, reads reviews, the conversation and the issue comments, fixes, pushes to the **same** branch, comments and removes the label so that the next round can be asked for with it. Labels of a pull request are kept apart from those of the issue with the same number. The verdict is a label because Forgejo refuses a formal review of one's own pull request when agent and human share an account.
+
+**Escalation.** A round route (`pull_request`, `ci_failure`, `conflict`) may name `"escalate_to": "<another route>"`, for example `"ai:changes": {"profile": "...", "on": "pull_request", "escalate_to": "ai:escalate"}`. The last round (the `MAX_ROUNDS`-th, or from `ESCALATE_FROM_ROUND` on) then starts with the profile and tier of the target route, so a stronger model gets the last try before a human is called. Everything else stays: branch, kind, prompt, the iteration and budget limits of the own route, and it counts as a round. The tier limits and cooldowns apply to the target's tier. The job records `escalated` and `/status` shows it. A human action that resets the rounds resets the escalation. Without `escalate_to` nothing changes. The target's profile is the operator's choice in `LABEL_ROUTES`; the label itself is not needed, so no one can trigger it from an issue.
 
 `MAX_ROUNDS` limits rounds per issue (fix rounds and conflict rounds count, reviews do not). When used up, ForgeHands starts nothing, comments and adds `BLOCKED_LABEL`. Whatever the human (`HUMAN_LOGIN`) does on such a pull request, setting a label or pushing a commit (its CI run names him), starts the rounds again and takes `BLOCKED_LABEL` off, whatever caused the block; agents' events never reset it. Stopping a run with `POST /api/conversations/<id>/pause` frees its slot at the next poll (the job ends as `failed` with result `paused`).
 

@@ -2199,3 +2199,83 @@ test('the webhook turns a push to the default branch into a scheduled look at th
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// escalate_to: the last round runs with the profile and tier of another route
+const escalating = (extra = {}, route = {}) => withChanges({ MAX_ROUNDS: '3', ...extra, LABEL_ROUTES: JSON.stringify({
+  'ai:ready': { profile: WORKER, tier: 'free' },
+  'ai:changes': { profile: CHANGES, tier: 'free', max_iterations: 90, on: 'pull_request', escalate_to: 'ai:escalate', ...route },
+  'ai:escalate': { profile: ESCALATE, tier: 'strong' } }) });
+
+test('escalate_to has to name another configured route, on a round route', () => {
+  assert.equal(loadConfig(env(escalating())).routes.get('ai:changes').escalateTo, 'ai:escalate');
+  assert.equal(loadConfig(env(withChanges())).routes.get('ai:changes').escalateTo, null);
+  assert.throws(() => loadConfig(env(escalating({}, { escalate_to: 'ai:nope' }))), /escalate_to/);
+  assert.throws(() => loadConfig(env(escalating({}, { escalate_to: 'ai:changes' }))), /escalate_to/);
+  assert.throws(() => loadConfig(env(withChanges({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, escalate_to: 'ai:escalate' }, 'ai:escalate': { profile: ESCALATE } }) }))), /round/);
+  assert.equal(loadConfig(env(escalating())).escalateFromRound, 3);
+  assert.equal(loadConfig(env(escalating({ ESCALATE_FROM_ROUND: '2' }))).escalateFromRound, 2);
+  assert.throws(() => loadConfig(env(escalating({ ESCALATE_FROM_ROUND: '4' }))), /ESCALATE_FROM_ROUND/);
+});
+
+async function runRounds(extra, count, route) {
+  const { dispatcher, jobs } = await build(escalating(extra, route));
+  for (let round = 0; round < count; round++) {
+    assert.equal((await dispatcher.enqueue(prEvent([], { sender: { login: 'openhands' } }))).status, 'queued'); // an agent's event, no reset
+    await dispatcher.tick();
+    states[jobs.list().at(-1).conversation_id] = 'finished';
+    await dispatcher.tick();
+  }
+  return { dispatcher, jobs };
+}
+
+test('only the last round starts with the profile and tier of the escalation target', async () => {
+  const { jobs, dispatcher } = await runRounds({}, 3);
+  assert.deepEqual(starts().map((c) => c.body.agent_profile_id), [CHANGES, CHANGES, ESCALATE]);
+  assert.equal(starts()[2].body.max_iterations, 90, 'the limits of the own route stay');
+  assert.deepEqual(jobs.list().map((job) => job.escalated), [undefined, undefined, true]);
+  assert.equal(dispatcher.rounds(prEvent()), 3, 'it counts as a round');
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'rounds_exceeded');
+});
+
+test('ESCALATE_FROM_ROUND escalates earlier', async () => {
+  await runRounds({ ESCALATE_FROM_ROUND: '2' }, 3);
+  assert.deepEqual(starts().map((c) => c.body.agent_profile_id), [CHANGES, ESCALATE, ESCALATE]);
+});
+
+test('without escalate_to nothing changes', async () => {
+  await runRounds({}, 3, { escalate_to: undefined });
+  assert.deepEqual(starts().map((c) => c.body.agent_profile_id), [CHANGES, CHANGES, CHANGES]);
+});
+
+test('the escalated round waits for room in the tier of the target', async () => {
+  const { jobs, dispatcher } = await build(escalating({ MAX_CONCURRENT_PER_TIER: '1', MAX_ROUNDS: '1' }, { escalate_to: 'ai:escalate' }));
+  await dispatcher.enqueue(event('ai:escalate', 7)); // an issue worker in the strong tier
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].status, 'running');
+  await dispatcher.enqueue(prEvent());
+  await dispatcher.tick();
+  assert.equal(jobs.list()[1].status, 'queued', 'the strong tier is full, although the own tier (free) is not');
+  states[jobs.list()[0].conversation_id] = 'finished';
+  await dispatcher.tick();
+  await dispatcher.tick();
+  assert.equal(jobs.list()[1].status, 'running');
+  assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE);
+});
+
+test('a round reset by the human resets the escalation', async () => {
+  const { jobs, dispatcher } = await runRounds({ HUMAN_LOGIN: 'marcel' }, 3);
+  assert.equal((await dispatcher.enqueue(prEvent([], { sender: { login: 'openhands' } }))).status, 'rounds_exceeded');
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  await dispatcher.tick();
+  assert.equal(starts().at(-1).body.agent_profile_id, CHANGES, 'a fresh budget starts with the own profile');
+  assert.equal(jobs.list().at(-1).escalated, undefined);
+});
+
+test('/status says that a round was escalated', async () => {
+  const { config, jobs, dispatcher } = await build(escalating({ MAX_ROUNDS: '1' }));
+  await dispatcher.enqueue(prEvent());
+  await dispatcher.tick();
+  const status = buildStatus(config, jobs, clock);
+  assert.equal(status.issues[0].runs[0].escalated, 'ai:escalate');
+  assert.match(status.issues[0].state, /escalated to ai:escalate/);
+});
