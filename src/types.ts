@@ -65,6 +65,8 @@ export interface DirectConfig extends BaseConfig {
   branchUpdateMinIntervalMs: number;
   minReviewChars: number;
   approvalGraceMs: number;
+  errorRetries: number;
+  splitLabel: string | null;
   archiveAfterDays: number;
   humanLogin: string | null;
   approvedLabel: string;
@@ -162,6 +164,7 @@ export interface Job {
   verdict_retry?: number;
   round_reset?: boolean;
   archived?: boolean;
+  error_retry?: number;
 }
 
 export type NewJob = Omit<Job, 'id' | 'attempts'> & { attempts?: number };
