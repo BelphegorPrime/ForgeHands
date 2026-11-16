@@ -2313,3 +2313,120 @@ test('/status says that a round was escalated', async () => {
   assert.equal(status.issues[0].runs[0].escalated, 'ai:escalate');
   assert.match(status.issues[0].state, /escalated to ai:escalate/);
 });
+
+// ---- fallback_to: while the tier of the route is on a quota hold, the profile and tier of another route take over
+const FREE = '55555555-5555-4555-8555-555555555555';
+const falling = (extra = {}, route = {}, free = {}) => ({ MAX_ROUNDS: '3', MAX_CONCURRENT_PER_TIER: '1', MAX_CONCURRENT: '5', ...extra, LABEL_ROUTES: JSON.stringify({
+  'ai:ready': { profile: WORKER, tier: 'cheap', max_iterations: 70, fallback_to: 'ai:ready-free', ...route },
+  'ai:ready-free': { profile: FREE, tier: 'free', max_iterations: 20, ...free },
+  'ai:escalate': { profile: ESCALATE, tier: 'strong' } }) });
+
+test('fallback_to has to name another configured route that has no fallback of its own', () => {
+  assert.equal(loadConfig(env(falling())).routes.get('ai:ready').fallbackTo, 'ai:ready-free');
+  assert.equal(loadConfig(env(falling())).routes.get('ai:escalate').fallbackTo, null);
+  assert.throws(() => loadConfig(env(falling({}, { fallback_to: 'ai:nope' }))), /fallback_to/);
+  assert.throws(() => loadConfig(env(falling({}, { fallback_to: 'ai:ready' }))), /fallback_to/);
+  assert.throws(() => loadConfig(env(falling({}, {}, { fallback_to: 'ai:escalate' }))), /fallback_to/);
+});
+
+test('a job whose tier is on hold starts with the profile and tier of the fallback route', async () => {
+  const { jobs, dispatcher } = await build(falling());
+  dispatcher.cooldowns.set('cheap', clock + 60000);
+  await dispatcher.enqueue(event('ai:ready', 1));
+  await dispatcher.tick();
+  const job = jobs.list()[0];
+  assert.equal(job.status, 'running');
+  assert.equal(starts()[0].body.agent_profile_id, FREE);
+  assert.equal(starts()[0].body.max_iterations, 70, 'the limits of the own route stay');
+  assert.equal(job.fell_back, 'ai:ready-free');
+  assert.equal(dispatcher.tierOf(job), 'free');
+  const status = buildStatus(dispatcher.config, jobs, clock);
+  assert.equal(status.issues[0].runs[0].fell_back, 'ai:ready-free');
+  assert.match(status.issues[0].state, /fallback to ai:ready-free/);
+});
+
+test('without a hold the job starts normally; without fallback_to it waits; with the fallback tier on hold too it waits', async () => {
+  let { jobs, dispatcher } = await build(falling());
+  await dispatcher.enqueue(event('ai:ready', 1));
+  await dispatcher.tick();
+  assert.equal(starts().at(-1).body.agent_profile_id, WORKER);
+  assert.equal(jobs.list()[0].fell_back, undefined);
+  assert.equal(dispatcher.tierOf(jobs.list()[0]), 'cheap');
+
+  calls = [];
+  ({ jobs, dispatcher } = await build(falling({}, { fallback_to: undefined })));
+  dispatcher.cooldowns.set('cheap', clock + 60000);
+  await dispatcher.enqueue(event('ai:ready', 2));
+  await dispatcher.tick();
+  assert.equal(jobs.list().at(-1).status, 'queued');
+  assert.equal(starts().length, 0);
+
+  ({ jobs, dispatcher } = await build(falling()));
+  dispatcher.cooldowns.set('cheap', clock + 60000);
+  dispatcher.cooldowns.set('free', clock + 60000);
+  await dispatcher.enqueue(event('ai:ready', 3));
+  await dispatcher.tick();
+  assert.equal(jobs.list().at(-1).status, 'queued');
+  assert.equal(starts().length, 0);
+});
+
+test('the running fallback job counts in the tier of the fallback route', async () => {
+  const { jobs, dispatcher } = await build(falling());
+  dispatcher.cooldowns.set('cheap', clock + 60000);
+  await dispatcher.enqueue(event('ai:ready', 1));
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].fell_back, 'ai:ready-free');
+  await dispatcher.enqueue(event('ai:ready', 2));
+  await dispatcher.tick();
+  assert.equal(jobs.list()[1].status, 'queued', 'the free tier is full (limit 1)');
+  assert.equal(starts().length, 1);
+});
+
+test('a quota error of a fallback run holds the fallback tier and the job decides afresh', async () => {
+  const config = loadConfig(env(falling({ MAX_CONCURRENT_PER_TIER: '2' })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => new URL(url).pathname.endsWith('/events/search') ? { ok: true, status: 200, json: async () => ({ items: [rateLimitError(600)] }) } : api(url, request);
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  dispatcher.cooldowns.set('cheap', clock + 60000);
+  await dispatcher.enqueue(event('ai:ready', 1));
+  await dispatcher.tick();
+  const job = jobs.list()[0];
+  assert.equal(job.fell_back, 'ai:ready-free');
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.status, 'queued');
+  assert.equal(job.fell_back, undefined);
+  assert.ok(dispatcher.cooldowns.get('free') > clock, 'the fallback tier is held');
+  assert.equal(dispatcher.cooldowns.get('cheap'), clock + 60000, 'the original tier is not');
+  clock += 61000; // cheap is back, free still on hold
+  job.next_try = undefined; // (the retry time of the job would otherwise be the end of the free hold)
+  await dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.fell_back, undefined);
+  assert.equal(starts().at(-1).body.agent_profile_id, WORKER);
+});
+
+test('an escalated round whose escalation tier is on hold and has no fallback waits; with a fallback it falls back from the target', async () => {
+  const routes = (target = {}) => ({ MAX_ROUNDS: '1', LABEL_ROUTES: JSON.stringify({
+    'ai:ready': { profile: WORKER, tier: 'free' },
+    'ai:changes': { profile: CHANGES, tier: 'free', max_iterations: 90, on: 'pull_request', escalate_to: 'ai:escalate' },
+    'ai:escalate': { profile: ESCALATE, tier: 'strong', ...target },
+    'ai:escalate-free': { profile: FREE, tier: 'cheap' } }) });
+  let { jobs, dispatcher } = await build(routes());
+  dispatcher.cooldowns.set('strong', clock + 60000);
+  await dispatcher.enqueue(prEvent());
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].status, 'queued');
+  assert.equal(starts().length, 0, 'the own tier (free) is not on hold, but the escalation target is');
+
+  ({ jobs, dispatcher } = await build(routes({ fallback_to: 'ai:escalate-free' })));
+  dispatcher.cooldowns.set('strong', clock + 60000);
+  await dispatcher.enqueue(prEvent());
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].status, 'running');
+  assert.equal(jobs.list()[0].escalated, true);
+  assert.equal(jobs.list()[0].fell_back, 'ai:escalate-free');
+  assert.equal(starts()[0].body.agent_profile_id, FREE);
+});

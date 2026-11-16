@@ -18,6 +18,7 @@ export interface Route {
   maxConcurrent: number | null;
   kind: RouteKind;
   escalateTo: string | null;
+  fallbackTo: string | null;
 }
 
 /** The deny list of a repository: a pattern (as written), its regular expression and why it needs a human (optional). */
@@ -182,6 +183,8 @@ export interface Job {
   verdict_retry?: number;
   round_reset?: boolean;
   escalated?: boolean;
+  /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */
+  fell_back?: string;
   archived?: boolean;
   error_retry?: number;
   /** Dry run: the first message the conversation would have started with. */

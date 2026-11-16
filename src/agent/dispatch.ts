@@ -194,7 +194,19 @@ export class Dispatcher {
 
   // The tier a job runs in (or will run in): the one of the escalation target for an escalated round.
   tierOf(job: Job): string | undefined {
+    if (job.fell_back) return this.config.routes.get(job.fell_back)?.tier;
     return (this.escalationTarget(job) ?? this.config.routes.get(job.label))?.tier;
+  }
+
+  // The route a job starts with: the escalation target or its own route; when the tier of that is on a quota hold and the route has a
+  // "fallback_to" whose tier is free, the fallback route (profile and tier; the limits, branch, kind and prompt stay those of the own route).
+  effectiveRoute(job: Job, now: number): { route: Route; fellBack?: string } {
+    const base = this.escalationTarget(job) ?? this.route(job.label);
+    if (base.fallbackTo && (this.cooldowns.get(base.tier) || 0) > now) {
+      const fallback = this.config.routes.get(base.fallbackTo);
+      if (fallback && (this.cooldowns.get(fallback.tier) || 0) <= now) return { route: fallback, fellBack: base.fallbackTo };
+    }
+    return { route: base };
   }
 
   forgejoCall(event: NormalizedEvent, method: string, path: string, body?: unknown): Promise<Json> {
@@ -766,11 +778,10 @@ export class Dispatcher {
   hasRoom(job: Job, now: number): boolean {
     const running = this.jobs.list('running');
     if (running.length >= this.config.maxConcurrent) return false;
-    const route = this.route(job.label);
-    const target = this.escalationTarget(job);
-    const tier = (target ?? route).tier;
+    const effective = this.effectiveRoute(job, now).route;
+    const tier = effective.tier;
     if ((this.cooldowns.get(tier) || 0) > now) return false;
-    const tierLimit = (target ?? route).maxConcurrent ?? this.config.maxConcurrentPerTier;
+    const tierLimit = effective.maxConcurrent ?? this.config.maxConcurrentPerTier;
     if (running.filter((other) => this.tierOf(other) === tier).length >= tierLimit) return false;
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
     if (startedLastHour >= this.config.maxRunsPerHour) return false;
@@ -799,9 +810,12 @@ export class Dispatcher {
       job.escalated = true;
       this.logger.error(job.key + ': round ' + this.rounds(job.event) + ' is escalated to ' + route.escalateTo);
     }
+    const { route: effective, fellBack } = this.effectiveRoute(job, now);
+    job.fell_back = fellBack;
+    if (fellBack) this.logger.error(job.key + ': the tier of its route is out of quota, starting with the fallback route ' + fellBack);
     const body: Json = {
       workspace: { working_dir: this.config.workspaceDir },
-      agent_profile_id: (target ?? route).profile,
+      agent_profile_id: effective.profile,
       max_iterations: route.maxIterations,
       tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
@@ -816,7 +830,7 @@ export class Dispatcher {
     // `started` stays set so that the hourly limit and the round count behave as live.
     if (isDry(this.config, job.event.repository.full_name)) {
       Object.assign(job, { status: 'dry', started: now, finished: now, result: 'dry', dry_prompt: body.initial_message.content[0].text });
-      this.logger.error('DRY RUN, not started: ' + job.key + ' (' + route.profile + ', tier ' + route.tier + ')');
+      this.logger.error('DRY RUN, not started: ' + job.key + ' (' + effective.profile + ', tier ' + effective.tier + ')');
       return true;
     }
     try {
@@ -862,7 +876,7 @@ export class Dispatcher {
           const until = now + wait;
           this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
-          Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: until });
+          Object.assign(job, { status: 'queued', started: undefined, fell_back: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: until });
           return true;
         }
       }
