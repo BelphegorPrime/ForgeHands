@@ -176,6 +176,16 @@ test('/status shows what waits for a human since when', async () => {
   assert.match(renderStatus(status), /waiting for a human since 2026-11-12/);
 });
 
+test('a blocked dependency bot pull request is reminded, an unblocked one is not', async () => {
+  const { dispatcher } = await build({ BOT_AUTHORS: 'renovate' });
+  const bot = (number, labels) => pull(number, labels, { head: { ref: 'renovate/x', sha: 'abc', repo: { full_name: repo } }, user: { login: 'renovate' } });
+  pulls = [bot(201, ['ai:blocked']), bot(202, [])];
+  comments[201] = [comment('@marcel ForgeHands: handed over', clock - 4 * DAY)];
+  await dispatcher.tick();
+  assert.equal(reminders().length, 1);
+  assert.ok(posts.some((post) => post.path === '/issues/201/comments'));
+});
+
 test('in a dry run the reminder is only logged, never sent', async () => {
   const { dispatcher } = await build({ DRY_RUN: '1' });
   pulls = [pull(101, ['ai:blocked'])];

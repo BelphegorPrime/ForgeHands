@@ -1,5 +1,6 @@
 import { forgejoCall } from '../forgejo/client.ts';
 import { Merger } from '../forgejo/merge.ts';
+import { isBotPull } from '../forgejo/bot.ts';
 import { DryLog } from '../dry.ts';
 import type { DirectConfig, Fetch, Json, Logger } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
@@ -105,12 +106,14 @@ export class Reminder {
     let looked = 0;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
       const match = /^ai\/issue-(\d+)$/.exec(pr?.head?.ref || '');
-      if (!match || pr.state !== 'open' || pr.merged) continue;
+      // A dependency bot's pull request (BOT_AUTHORS) has no ticket: it is reminded only when it is marked blocked.
+      const bot = !match && isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes }, pr, repository);
+      if ((!match && !bot) || pr.state !== 'open' || pr.merged) continue;
       if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) continue;
       if (looked++ >= MAX_PULLS) break;
       try {
         const labels: string[] = (pr.labels || []).map((label: Json) => label.name);
-        const reason = await this.reasonFor(repository, pr, labels, now);
+        const reason = bot ? (labels.includes(this.config.blockedLabel) ? 'it is marked ' + this.config.blockedLabel : null) : await this.reasonFor(repository, pr, labels, now);
         if (!reason) continue;
         const comments = ((await this.call(repository, 'GET', '/issues/' + pr.number + '/comments?limit=100')) || []) as Json[];
         const at = (comment: Json) => Date.parse(comment.created_at) || 0;
@@ -122,7 +125,7 @@ export class Reminder {
         const streak = reminders.filter((comment) => at(comment) > human);
         const handover = newest(own.filter((comment) => !reminders.includes(comment)));
         const since = handover || (streak.length ? at(streak[0]) - days * DAY_MS : Date.parse(pr.updated_at) || now);
-        seen.set(repository.toLowerCase() + '#' + pr.number, { repository, issue: Number(match[1]), pr: pr.number, since, reason });
+        seen.set(repository.toLowerCase() + '#' + pr.number, { repository, issue: match ? Number(match[1]) : pr.number, pr: pr.number, since, reason });
         if (written >= budget || streak.length >= max) continue;
         if (human && now - human < days * DAY_MS) continue;
         if (now - (newest(own) || Date.parse(pr.updated_at) || 0) < days * DAY_MS) continue;
