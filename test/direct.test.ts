@@ -1873,6 +1873,29 @@ const movedEvent = (after = TIP) => normalizeEvent('push', pushPayload({ after }
 const updates = (forgejo) => forgejo.calls.filter((call) => call.method === 'POST' && call.path.endsWith('/update')).map((call) => call.path.split('/').at(-2));
 const afterDelay = async (dispatcher) => { clock += 61000; await dispatcher.tick(); };
 
+test('after a push to the default branch the tickets of merged agent pull requests are closed, once, and only those', async () => {
+  const config = loadConfig(env(withBranches({})));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const forgejo = fakeForgejo({
+    ['GET ' + API + '/pulls']: [
+      { number: 71, merged: true, head: { ref: 'ai/issue-53' }, base: { ref: 'main' } },
+      { number: 72, merged: true, head: { ref: 'ai/issue-54' }, base: { ref: 'main' } },
+      { number: 73, merged: false, head: { ref: 'ai/issue-55' }, base: { ref: 'main' } },
+      { number: 74, merged: true, head: { ref: 'feature/x' }, base: { ref: 'main' } },
+      { number: 75, merged: true, head: { ref: 'ai/issue-56' }, base: { ref: 'release' } }
+    ],
+    ['GET ' + API + '/issues/53']: { number: 53, state: 'open' },
+    ['GET ' + API + '/issues/54']: { number: 54, state: 'closed' },
+    ['POST ' + API + '/issues/53/comments']: {}, ['PATCH ' + API + '/issues/53']: {}
+  });
+  const dispatcher = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
+  assert.equal(await dispatcher.closeMergedTickets(movedEvent()), 1);
+  assert.deepEqual(forgejo.wrote(), ['POST /issues/53/comments', 'PATCH /issues/53'], 'only the open ticket of a merged agent pull request into the default branch');
+  const offline = new Dispatcher(loadConfig(env({ ...withBranches({}), FORGEJO_URL: '', FORGEJO_TOKEN: '', AGENT_SECRETS: '' })), jobs, forgejo.send, quiet, () => clock);
+  assert.equal(await offline.closeMergedTickets(movedEvent()), 0, 'without Forgejo access nothing happens');
+});
+
 test('a push to the default branch is an event; other branches, deletions, other repositories and a disabled feature are not', () => {
   const moved = movedEvent();
   assert.equal(moved.type, 'push.default');

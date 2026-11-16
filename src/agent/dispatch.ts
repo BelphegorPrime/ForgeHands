@@ -223,6 +223,32 @@ export class Dispatcher {
     return outcome.join(', ') || 'nothing_ready';
   }
 
+  // A pull request of an agent issue (branch ai/issue-<n>) that was merged by somebody else (a human, for protected paths) leaves its ticket
+  // open, because the agents' pull request texts do not always say "Closes #n"; the tickets that wait for it then wait for ever. After a
+  // push to the default branch, close the tickets whose agent pull request was merged into it. Closing sends the usual "issue closed"
+  // event, which starts what waits. Best effort.
+  async closeMergedTickets(event: PushEvent): Promise<number> {
+    if (!this.config.forgejo) return 0;
+    const call = (method: string, path: string, body?: unknown) => forgejoCall(this.config, this.send, event.repository.full_name, method, path, body);
+    let closed = 0;
+    try {
+      const pulls = await call('GET', '/pulls?state=closed&sort=recentupdate&limit=20');
+      for (const pr of Array.isArray(pulls) ? pulls : []) {
+        const match = /^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''));
+        if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
+        const number = Number(match[1]);
+        const issue = await call('GET', '/issues/' + number);
+        if (!issue || issue.state !== 'open' || issue.pull_request) continue;
+        await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.' });
+        await call('PATCH', '/issues/' + number, { state: 'closed' });
+        closed += 1;
+      }
+    } catch (error) {
+      this.logger.error('could not close the tickets of merged pull requests:', error.message);
+    }
+    return closed;
+  }
+
   // All dependencies of the epic are closed: have it reviewed (and closed when its criteria are met). Once per run.
   async startEpicReview(event: ForgeEvent, epic: Json): Promise<boolean> {
     const route = [...this.config.routes].find(([, entry]) => entry.kind === 'epic_done')?.[0];
