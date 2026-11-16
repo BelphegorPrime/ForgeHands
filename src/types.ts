@@ -17,6 +17,7 @@ export interface Route {
   maxBudget: number | null;
   maxConcurrent: number | null;
   kind: RouteKind;
+  escalateTo: string | null;
 }
 
 export interface ForgejoAccess {
@@ -61,6 +62,7 @@ export interface DirectConfig extends BaseConfig {
   repoWeights: Map<string, number>;
   maxRunMs: number;
   maxRounds: number;
+  escalateFromRound: number;
   forgejo: ForgejoAccess | null;
   blockedLabel: string;
   updateBranches: boolean;
@@ -172,6 +174,7 @@ export interface Job {
   rate_limited_since?: number;
   verdict_retry?: number;
   round_reset?: boolean;
+  escalated?: boolean;
   archived?: boolean;
   error_retry?: number;
   /** Dry run: the first message the conversation would have started with. */

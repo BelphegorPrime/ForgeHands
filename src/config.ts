@@ -42,8 +42,15 @@ function parseRoutes(text: string): Map<string, Route> {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100) as number,
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'].includes(route.on) ? route.on : 'issue') as RouteKind
+      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'].includes(route.on) ? route.on : 'issue') as RouteKind,
+      // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route.
+      escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to)
     });
+  }
+  for (const [label, route] of routes) {
+    if (route.escalateTo === null) continue;
+    if (!['pull_request', 'ci_failure', 'conflict'].includes(route.kind)) throw new Error('LABEL_ROUTES entry ' + label + ': escalate_to only applies to a route that is a round (on: pull_request, ci_failure or conflict)');
+    if (route.escalateTo === label || !routes.has(route.escalateTo)) throw new Error('LABEL_ROUTES entry ' + label + ': escalate_to must name another configured route');
   }
   return routes;
 }
@@ -160,6 +167,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     agentSecrets[name] = env[name]!;
   }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
+  const maxRounds = positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100) as number;
+  if (positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number > maxRounds) throw new Error('ESCALATE_FROM_ROUND must not be larger than MAX_ROUNDS');
   const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
   const mergeMethod = env.MERGE_METHOD || 'merge';
   if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
@@ -183,7 +192,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     maxRunsPerHour: positiveInt(env.MAX_RUNS_PER_HOUR, 30, 'MAX_RUNS_PER_HOUR', 10000),
     maxRunMs: positiveInt(env.MAX_RUN_MINUTES, 120, 'MAX_RUN_MINUTES', 1440) * 60000,
     // Follow-up runs (routes on pull requests) per issue before ForgeHands stops and asks a human.
-    maxRounds: positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100),
+    maxRounds,
+    // From this round on a route with "escalate_to" runs with the stronger profile; by default only the last round.
+    escalateFromRound: positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number,
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',

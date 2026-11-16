@@ -176,6 +176,25 @@ export class Dispatcher {
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
   }
 
+  // The round this job is: the rounds of its issue that come before it in the ledger (oldest first), plus itself. Only the ledger is read, so it is the same before
+  // and after the start. A round whose route has "escalate_to" runs with the profile and tier of that route from ESCALATE_FROM_ROUND on.
+  escalationTarget(job: Job): Route | undefined {
+    const own = this.config.routes.get(job.label);
+    if (!own?.escalateTo || !job.event.pull_request || !ROUND_KINDS.has(own.kind)) return undefined;
+    const target = this.config.routes.get(own.escalateTo);
+    if (job.escalated) return target;
+    const base = this.issueKey(job.event) + ':';
+    const all = this.jobs.list();
+    const before = all.slice(0, all.indexOf(job)).filter((other) => other.key.startsWith(base) && !other.round_reset && ROUND_KINDS.has(this.config.routes.get(other.label)?.kind)
+      && (other.started || other.status === 'queued' || other.status === 'running')).length;
+    return before + 1 >= this.config.escalateFromRound ? target : undefined;
+  }
+
+  // The tier a job runs in (or will run in): the one of the escalation target for an escalated round.
+  tierOf(job: Job): string | undefined {
+    return (this.escalationTarget(job) ?? this.config.routes.get(job.label))?.tier;
+  }
+
   forgejoCall(event: NormalizedEvent, method: string, path: string, body?: unknown): Promise<Json> {
     return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
   }
@@ -723,9 +742,11 @@ export class Dispatcher {
     const running = this.jobs.list('running');
     if (running.length >= this.config.maxConcurrent) return false;
     const route = this.route(job.label);
-    if ((this.cooldowns.get(route.tier) || 0) > now) return false;
-    const tierLimit = route.maxConcurrent ?? this.config.maxConcurrentPerTier;
-    if (running.filter((other) => this.config.routes.get(other.label)?.tier === route.tier).length >= tierLimit) return false;
+    const target = this.escalationTarget(job);
+    const tier = (target ?? route).tier;
+    if ((this.cooldowns.get(tier) || 0) > now) return false;
+    const tierLimit = (target ?? route).maxConcurrent ?? this.config.maxConcurrentPerTier;
+    if (running.filter((other) => this.tierOf(other) === tier).length >= tierLimit) return false;
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
     if (startedLastHour >= this.config.maxRunsPerHour) return false;
     return true;
@@ -747,9 +768,15 @@ export class Dispatcher {
       return true;
     }
     const route = this.route(job.label);
+    // The last round goes to the stronger profile of "escalate_to": same branch, same kind, same prompt and the limits of its own route.
+    const target = this.escalationTarget(job);
+    if (target && !job.escalated) {
+      job.escalated = true;
+      this.logger.error(job.key + ': round ' + this.rounds(job.event) + ' is escalated to ' + route.escalateTo);
+    }
     const body: Json = {
       workspace: { working_dir: this.config.workspaceDir },
-      agent_profile_id: route.profile,
+      agent_profile_id: (target ?? route).profile,
       max_iterations: route.maxIterations,
       tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
@@ -808,7 +835,7 @@ export class Dispatcher {
         if (now - since < this.config.quotaGiveUpMs) {
           const wait = Math.min(Math.max(error.waitMs ?? 15 * 60000, 60000), this.config.quotaHoldMaxMs);
           const until = now + wait;
-          this.cooldowns.set(this.route(job.label).tier, until);
+          this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
           Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: until });
           return true;
