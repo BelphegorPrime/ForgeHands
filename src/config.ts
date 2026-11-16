@@ -44,8 +44,16 @@ function parseRoutes(text: string): Map<string, Route> {
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
       kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'].includes(route.on) ? route.on : 'issue') as RouteKind,
       // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route.
-      escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to)
+      escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to),
+      // "fallback_to": "<label of another route>": while the tier of this route is out of quota, jobs start with the profile and tier of that route.
+      fallbackTo: route.fallback_to === undefined ? null : String(route.fallback_to)
     });
+  }
+  for (const [label, route] of routes) {
+    if (route.fallbackTo === null) continue;
+    const target = routes.get(route.fallbackTo);
+    if (route.fallbackTo === label || !target) throw new Error('LABEL_ROUTES entry ' + label + ': fallback_to must name another configured route');
+    if (target.fallbackTo !== null) throw new Error('LABEL_ROUTES entry ' + label + ': fallback_to must name a route without a fallback_to of its own');
   }
   for (const [label, route] of routes) {
     if (route.escalateTo === null) continue;
