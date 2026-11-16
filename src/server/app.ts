@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { deliveryId, signPayload, verifyForgejoSignature } from '../webhook/security.ts';
 import { normalizeEvent } from '../webhook/events.ts';
 import { buildStatus, renderStatus } from './status.ts';
+import { hasToken } from './auth.ts';
 import { isPushEvent } from '../types.ts';
 import { DryLog, isDry } from '../dry.ts';
 import type { Config, DirectConfig, Fetch, ForgeEvent, Logger } from '../types.ts';
@@ -43,6 +44,11 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     }
     // Read only view of the work in flight (direct mode): /status for people, /status.json for tools.
     if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json') && dispatcher) {
+      // With STATUS_TOKEN: `Authorization: Bearer <token>`, or basic auth with the token as password (so that a browser can open it).
+      if (config.statusToken && !hasToken(req.headers.authorization, config.statusToken)) {
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': 'Basic realm="ForgeHands", charset="UTF-8"' });
+        return res.end(JSON.stringify({ error: 'unauthorized' }));
+      }
       const status = buildStatus(config as DirectConfig, dispatcher.jobs, Date.now(), dispatcher.dry, [...dispatcher.reminder.waiting.values()]);
       if (req.url === '/status.json') return json(res, 200, status);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });

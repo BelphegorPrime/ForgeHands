@@ -99,6 +99,7 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 | `DATA_FILE`, `JOBS_FILE` | no | Delivery store (`./data/deliveries.json`) and issue ledger (`jobs.json` next to it). |
 | `PORT`, `HOST` | no | Listening port (`8080`) and address (`0.0.0.0`). |
 | `DRY_RUN`, `DRY_RUN_REPOS` | no | `DRY_RUN=1`: events are received and judged as usual, but every write is only logged: no OpenHands conversation (the job ends as `dry`, its first message kept in the ledger as `dry_prompt`), no Forgejo comment, label, merge, branch update or close, no webhook-mode forward. Reads stay real. `DRY_RUN_REPOS=owner/repo,...` (must be in `ALLOWED_REPOS`) limits it to those repositories. `/status` shows a banner and `/status.json` the latest would-be writes. |
+| `STATUS_TOKEN` | no | Direct mode: at least 16 characters; `/status` and `/status.json` then need `Authorization: Bearer <token>` or HTTP basic auth with the token as password. Without it they are open and ForgeHands logs a warning at start. |
 
 ### Direct mode: routes, who may trigger, limits
 
@@ -215,7 +216,7 @@ Within a repository, work on a ticket that has begun (a round, a review, a CI fi
 
 Finished runs archive themselves (`ARCHIVE_AFTER_DAYS`): about once an hour ForgeHands adds the tag `archived=true` (other tags stay, so runs can still be found by `source`, `issue`, `pr`, `ci`, `epic`) to conversations that ended long enough ago, at most 20 per round. Archived runs stay in the ledger until it prunes them (30 days).
 
-`GET /status` and `GET /status.json` show per issue what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, failed). Read only, no event text but the issue title, **not authenticated**, so it belongs behind the same internal reverse proxy as the webhook. The labels on the pull request (`ai:approved`, `ai:changes`, `ai:blocked`) are Forgejo's side of the picture.
+`GET /status` and `GET /status.json` show per issue what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, failed). Read only, no event text but the issue title. They are open unless `STATUS_TOKEN` is set (bearer or basic auth, compared in constant time); either way keep them behind the same internal reverse proxy as the webhook. Above the tickets a summary per repository covers the last 7 and 30 days of the ledger: tickets merged (and how many without a human: merged by ForgeHands and never blocked), blocked, split, median and p90 time from the first run to the merge, rounds per merged ticket, review and error retries, and cost. The page refreshes itself every 30 seconds; `/status.json` has the same numbers under `summary`. Merges by a human are noticed when the push to the default branch closes the ticket, so they count as merged but never as without a human. The labels on the pull request (`ai:approved`, `ai:changes`, `ai:blocked`) are Forgejo's side of the picture.
 
 ## Security and limitations
 

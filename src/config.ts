@@ -150,11 +150,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   for (const repo of dryRunRepos) {
     if (!allowedRepos.has(repo)) throw new Error('DRY_RUN_REPOS entry ' + repo + ' is not in ALLOWED_REPOS');
   }
+  // STATUS_TOKEN protects /status, /status.json and /metrics (direct mode); without it they are open, as before.
+  const statusToken = env.STATUS_TOKEN || null;
+  if (statusToken !== null && statusToken.length < 16) throw new Error('STATUS_TOKEN must be at least 16 characters');
   const dataFile = env.DATA_FILE || './data/deliveries.json';
   const common = {
     forgejoSecret,
     allowedRepos,
     allowedSenders,
+    statusToken,
     dataFile,
     port,
     host: env.HOST || '0.0.0.0',

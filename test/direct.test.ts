@@ -1028,7 +1028,10 @@ test('the approval label on a pull request becomes a merge event, a round label 
 
 test('merge: approved, green, nothing protected -> title cleaned, merged on the checked commit, issue closed', async () => {
   const { merger, forgejo } = await mergerFor(goodRoutes());
+  const notes = [];
+  merger.note = (...fact) => notes.push(fact);
   assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.deepEqual(notes, [[repo + '#26', 'merged']]);
   assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /pulls/34/merge', 'POST /issues/34/comments', 'PATCH /issues/26']);
   const byPath = (method, path) => forgejo.calls.find((call) => call.method === method && call.path === API + path);
   assert.equal(byPath('PATCH', '/pulls/34').body.title, 'Fix it');

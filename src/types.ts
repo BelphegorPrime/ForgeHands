@@ -37,6 +37,7 @@ interface BaseConfig {
   forgejoSecret: string;
   allowedRepos: Set<string>;
   allowedSenders: Set<string> | null;
+  statusToken: string | null;
   dataFile: string;
   port: number;
   host: string;
@@ -197,6 +198,12 @@ export interface Job {
   error_retry?: number;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
+  /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */
+  merged_at?: number;
+  merged_by?: 'agent' | 'human';
+  /** When the ticket was handed to a human (BLOCKED_LABEL), and when it was sent to the planner to be split (SPLIT_LABEL). */
+  blocked_at?: number;
+  split_at?: number;
 }
 
 export type NewJob = Omit<Job, 'id' | 'attempts'> & { attempts?: number };
