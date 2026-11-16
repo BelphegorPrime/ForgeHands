@@ -99,10 +99,13 @@ export class Dispatcher {
     if (!login || !event.pull_request || event.sender?.login?.toLowerCase() !== login) return;
     const base = this.issueKey(event) + ':';
     const spent = this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind));
-    if (!spent.length) return;
-    for (const job of spent) job.round_reset = true;
-    await this.jobs.persist(this.now());
-    this.logger.error(this.issueKey(event) + ': ' + login + ' acted on the pull request, the rounds start again');
+    if (spent.length) {
+      for (const job of spent) job.round_reset = true;
+      await this.jobs.persist(this.now());
+      this.logger.error(this.issueKey(event) + ': ' + login + ' acted on the pull request, the rounds start again');
+    }
+    // The block (BLOCKED_LABEL) has other causes than used-up rounds too (a review that ended twice without a verdict, an approval that was not
+    // trusted, a failed run): none of them outlasts the human looking at the pull request, and a merge refuses while the label is on.
     if (!this.config.forgejo) return;
     try {
       const labels = await this.forgejoCall(event, 'GET', '/issues/' + event.pull_request.number + '/labels');

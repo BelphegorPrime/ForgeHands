@@ -494,6 +494,7 @@ test('an action of the human on the pull request starts the rounds again and lif
   states[jobs.list().at(-1).conversation_id] = 'finished';
   await dispatcher.tick();
   const agent = (login) => prEvent([], { sender: { login } });
+  forgejo.length = 0; // the first round was started by the human too
   assert.equal((await dispatcher.enqueue(agent('openhands'))).status, 'rounds_exceeded', 'an agent does not reset the budget');
   assert.ok(!forgejo.some((call) => call.method === 'DELETE' && call.path.endsWith('/labels/9')));
   assert.equal((await dispatcher.enqueue(agent('Marcel'))).status, 'queued', 'the human starts a fresh budget');
@@ -561,6 +562,26 @@ test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to t
   await planner.finish('stuck');
   assert.match(planner.comments()[0], /^@marcel/, 'the planner itself is never sent to the planner');
   assert.throws(() => loadConfig(env({ ERROR_RETRIES: '-1' })), /ERROR_RETRIES/);
+});
+
+test('the human also lifts a block that did not come from used-up rounds (a review without verdict, an untrusted approval)', async () => {
+  const forgejo = [];
+  const config = loadConfig(env(withChanges({ HUMAN_LOGIN: 'marcel' })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    forgejo.push({ method: request.method, path: new URL(url).pathname });
+    const body = request.method === 'GET' && new URL(url).pathname.endsWith('/issues/34/labels') ? [{ id: 9, name: 'ai:blocked' }] : request.method === 'GET' ? [] : { id: 77 };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  assert.equal(jobs.list().length, 0, 'no round was ever started');
+  await dispatcher.enqueue(prEvent([], { sender: { login: 'openhands' } }));
+  assert.ok(!forgejo.some((call) => call.method === 'DELETE'), 'an agent never lifts it');
+  await dispatcher.enqueue(prEvent([], { sender: { login: 'marcel' } }));
+  assert.ok(forgejo.some((call) => call.method === 'DELETE' && call.path.endsWith('/issues/34/labels/9')), 'the human does');
 });
 
 test('rounds are limited per issue; the pull request is told and marked when they are used up', async () => {
