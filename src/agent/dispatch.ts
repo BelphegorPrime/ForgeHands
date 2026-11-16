@@ -1,6 +1,7 @@
 import { buildPrompt } from './prompt.ts';
 import { forgejoCall } from '../forgejo/client.ts';
 import { Merger } from '../forgejo/merge.ts';
+import { DryLog, isDry, isWrite } from '../dry.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -32,6 +33,7 @@ export class Dispatcher {
   current: Promise<void> | null = null;
   timer: NodeJS.Timeout | undefined;
   merger: Merger;
+  dry: DryLog;
   lastArchive = 0;
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
@@ -43,7 +45,8 @@ export class Dispatcher {
     this.send = send;
     this.logger = logger;
     this.now = now;
-    this.merger = new Merger(config, send, logger);
+    this.dry = new DryLog(logger);
+    this.merger = new Merger(config, send, logger, undefined, this.dry);
   }
 
   issueKey(event: ForgeEvent): string {
@@ -174,7 +177,7 @@ export class Dispatcher {
   }
 
   forgejoCall(event: NormalizedEvent, method: string, path: string, body?: unknown): Promise<Json> {
-    return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body);
+    return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
   }
 
   // The reviewer approved the pull request (label): merge it when the operator's policy for the repository allows.
@@ -229,7 +232,7 @@ export class Dispatcher {
   // event, which starts what waits. Best effort.
   async closeMergedTickets(event: PushEvent): Promise<number> {
     if (!this.config.forgejo) return 0;
-    const call = (method: string, path: string, body?: unknown) => forgejoCall(this.config, this.send, event.repository.full_name, method, path, body);
+    const call = (method: string, path: string, body?: unknown) => forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
     let closed = 0;
     try {
       const pulls = await call('GET', '/pulls?state=closed&sort=recentupdate&limit=20');
@@ -459,7 +462,13 @@ export class Dispatcher {
   }
   stop(): void { clearInterval(this.timer); }
 
-  async api(method: string, path: string, body?: unknown): Promise<Response> {
+  // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
+  // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.
+  async api(method: string, path: string, body?: unknown, repository?: string): Promise<Response> {
+    if (isWrite(method) && isDry(this.config, repository)) {
+      this.dry.record('OpenHands', method, path);
+      return new Response('{}', { status: 200 });
+    }
     const response = await this.send(this.config.apiUrl + path, {
       method,
       headers: { 'X-Session-API-Key': this.config.apiKey, 'content-type': 'application/json' },
@@ -649,6 +658,7 @@ export class Dispatcher {
     let done = 0;
     for (const job of this.jobs.list()) {
       if (job.archived || !job.conversation_id || !job.finished || job.finished > before || (job.status !== 'done' && job.status !== 'failed')) continue;
+      if (isDry(this.config, job.event.repository.full_name)) continue; // a dry run archives nothing, and must not mark it as done
       if (done++ >= 20) break;
       try {
         const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id));
@@ -656,7 +666,7 @@ export class Dispatcher {
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = (await response.json()) as Json;
         if ((data.execution_status || data.status) === 'running') continue;
-        const patched = await this.api('PATCH', '/api/conversations/' + encodeURIComponent(job.conversation_id), { tags: { ...(data.tags || {}), archived: 'true' } });
+        const patched = await this.api('PATCH', '/api/conversations/' + encodeURIComponent(job.conversation_id), { tags: { ...(data.tags || {}), archived: 'true' } }, job.event.repository.full_name);
         if (!patched.ok) throw new Error('HTTP ' + patched.status);
         job.archived = true;
         changed = true;
@@ -750,8 +760,15 @@ export class Dispatcher {
     if (secrets.length) {
       body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
     }
+    // A dry run judges and schedules as usual, but starts nothing: the job ends as `dry` with the message the agent would have got.
+    // `started` stays set so that the hourly limit and the round count behave as live.
+    if (isDry(this.config, job.event.repository.full_name)) {
+      Object.assign(job, { status: 'dry', started: now, finished: now, result: 'dry', dry_prompt: body.initial_message.content[0].text });
+      this.logger.error('DRY RUN, not started: ' + job.key + ' (' + route.profile + ', tier ' + route.tier + ')');
+      return true;
+    }
     try {
-      const response = await this.api('POST', '/api/conversations', body);
+      const response = await this.api('POST', '/api/conversations', body, job.event.repository.full_name);
       if (!response.ok) throw new Error('HTTP ' + response.status);
       const created = (await response.json()) as Json;
       if (!created?.id) throw new Error('response without conversation id');

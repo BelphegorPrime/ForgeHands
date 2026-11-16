@@ -1,3 +1,5 @@
+import { isDry } from '../dry.ts';
+import type { DryLog, DryWrite } from '../dry.ts';
 import type { DirectConfig } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -9,6 +11,7 @@ interface Run {
 export interface Status {
   generated: string;
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
+  dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; runs: Omit<Run, 'created'>[] }[];
 }
 
@@ -27,12 +30,13 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n: number) => '#' + n).join(', ');
   const last = runs[0];
   if (!last) return 'idle';
+  if (last.status === 'dry') return KIND_TEXT[last.kind] + ' would start (dry run)';
   if (last.status === 'failed') return KIND_TEXT[last.kind] + ' failed' + (last.result ? ' (' + last.result + ')' : '');
   if (rounds >= maxRounds) return 'rounds used up (' + rounds + '/' + maxRounds + ')';
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now()): Status {
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog): Status {
   const byIssue = new Map<string, { key: string; title: string; runs: Run[] }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -62,6 +66,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const running = jobs.list('running').length;
   return {
     generated: new Date(now).toISOString(),
+    dry_run: config.dryRun ? { repositories: config.dryRunRepos.size ? [...config.dryRunRepos] : 'all', would_write: dry?.writes.slice(-50) || [] } : null,
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
     issues
   };
@@ -72,8 +77,9 @@ const escape = (value: unknown): string => String(value ?? '').replace(/[&<>"']/
 export function renderStatus(status: Status): string {
   const rows = status.issues.map((issue) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
     + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>').join('\n');
+  const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
-    + '<h1>ForgeHands</h1><p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>'
+    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>'
     + '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n' + rows + '</table>';
 }

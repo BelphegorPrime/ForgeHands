@@ -114,6 +114,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const allowedSenders = env.ALLOWED_SENDERS
     ? new Set(env.ALLOWED_SENDERS.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean))
     : null;
+  // DRY_RUN=1: events are received and judged as usual, every write (Forgejo, OpenHands, the webhook forward) is only logged.
+  // DRY_RUN_REPOS narrows it to some repositories; on its own it would silently run live, so it is an error.
+  const dryRun = env.DRY_RUN === '1';
+  const dryRunRepos = new Set((env.DRY_RUN_REPOS || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
+  if (env.DRY_RUN !== undefined && env.DRY_RUN !== '' && env.DRY_RUN !== '0' && !dryRun) throw new Error('DRY_RUN must be 1 or 0');
+  if (dryRunRepos.size && !dryRun) throw new Error('DRY_RUN_REPOS needs DRY_RUN=1');
+  for (const repo of dryRunRepos) {
+    if (!allowedRepos.has(repo)) throw new Error('DRY_RUN_REPOS entry ' + repo + ' is not in ALLOWED_REPOS');
+  }
   const dataFile = env.DATA_FILE || './data/deliveries.json';
   const common = {
     forgejoSecret,
@@ -123,7 +132,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     port,
     host: env.HOST || '0.0.0.0',
     timeoutMs: 10000,
-    maxBodyBytes: 1024 * 1024
+    maxBodyBytes: 1024 * 1024,
+    dryRun,
+    dryRunRepos
   };
 
   if (!direct) {
