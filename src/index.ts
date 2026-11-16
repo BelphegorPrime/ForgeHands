@@ -13,6 +13,7 @@ let dispatcher = null;
 if (config.mode === 'direct') {
   const jobs = new JobStore(config.jobsFile);
   await jobs.load();
+  if (!config.statusToken) console.error('warning: STATUS_TOKEN is not set, /status and /status.json are open to everybody who can reach this port');
   dispatcher = new Dispatcher(config, jobs);
   dispatcher.start().catch((error) => console.error('dispatcher start failed:', error.message));
 }

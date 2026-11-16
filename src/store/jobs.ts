@@ -48,6 +48,18 @@ export class JobStore {
   activeByKey(key: string): Job | undefined {
     return this.list(true).find((job) => job.key === key);
   }
+  // A fact about a ticket (merged, blocked, split) is kept on its newest job; the summary on the status page reads it from there.
+  // `ticket` is the ledger key without the label: "repo#issue", or "repo!pr<n>" for a dependency bot's pull request.
+  noteTicket(ticket: string, patch: Partial<Pick<Job, 'merged_at' | 'merged_by' | 'blocked_at' | 'split_at'>>): boolean {
+    const prefix = ticket + ':';
+    const jobsOfTicket = this.list().filter((job) => job.key.startsWith(prefix));
+    const newest = jobsOfTicket.at(-1);
+    if (!newest) return false;
+    // A merge ForgeHands did itself is not taken for a human's when the push event of that very merge arrives first.
+    if (patch.merged_by === 'human' && jobsOfTicket.some((job) => job.merged_at)) return false;
+    Object.assign(newest, patch);
+    return true;
+  }
   add(job: NewJob): Job {
     const record: Job = { id: randomUUID(), attempts: 0, ...job };
     this.jobs.set(record.id, record);

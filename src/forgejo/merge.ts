@@ -17,6 +17,8 @@ export class Merger {
   dry: DryLog;
   // Set by the dispatcher: is a security review of this commit still queued or running? Then the hand-over waits for it.
   securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
+  // Tells the ledger that ForgeHands merged a ticket or handed it to a human (ticket: "repo#issue" or "repo!pr<n>"); the dispatcher sets it, see Dispatcher.noteTicket.
+  note: (ticket: string, fact: 'merged' | 'blocked') => void = () => {};
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -74,6 +76,7 @@ export class Merger {
         return 'awaiting_review';
       }
       if (!review.ok) {
+        this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'blocked');
         await this.rejectApproval(repository, number, sha, review.reason);
         return 'no_valid_review';
       }
@@ -103,6 +106,7 @@ export class Merger {
       await this.call(repository, 'POST', '/pulls/' + number + '/merge', {
         Do: this.config.mergeMethod, head_commit_id: sha, delete_branch_after_merge: true
       });
+      this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
       await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
       if (bot) return 'merged';
@@ -188,6 +192,11 @@ export class Merger {
   }
 
   // An approval without a review behind it: take it off, say so, hand the pull request to a human. Best effort.
+  // The ledger's name of a ticket: "repo#issue" for an agent branch (ai/issue-<n>), "repo!pr<n>" for a bot's pull request (no branch given).
+  ticketOf(repository: string, number: number, agentBranch: string | null): string {
+    return repository.toLowerCase() + (agentBranch === null ? '!pr' + number : '#' + /^ai\/issue-(\d+)$/.exec(agentBranch)![1]);
+  }
+
   async rejectApproval(repository: string, number: number, sha: string, reason?: string): Promise<void> {
     const event = { repository: { full_name: repository }, pull_request: { number } };
     await this.clearApproval(event);

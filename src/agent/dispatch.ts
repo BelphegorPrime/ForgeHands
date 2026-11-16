@@ -52,6 +52,13 @@ export class Dispatcher {
     this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
+    this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
+  }
+
+  // Facts for the summary on the status page (merged, handed to a human, split), kept on the ticket's newest job. Best effort.
+  noteTicket(ticket: string, patch: Parameters<JobStore['noteTicket']>[1]): void {
+    if (isDry(this.config, ticket.split(/[#!]/)[0])) return; // nothing really happened in a dry run
+    if (this.jobs.noteTicket(ticket, patch)) this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
   }
 
   // The ledger key of the work on an issue; a dependency bot's pull request has no issue and is kept per pull request ("repo!pr<n>").
@@ -295,6 +302,7 @@ export class Dispatcher {
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
         await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.' });
         await call('PATCH', '/issues/' + number, { state: 'closed' });
+        this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at) || this.now(), merged_by: 'human' });
         closed += 1;
       }
     } catch (error) {
@@ -453,6 +461,7 @@ export class Dispatcher {
 
   // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
   async markForHuman(event: ForgeEvent, text: string): Promise<void> {
+    this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
     if (!this.config.forgejo) return;
     const { number } = event.pull_request!;
     const call = (method: string, path: string, body?: unknown) => this.forgejoCall(event, method, path, body);
@@ -967,6 +976,7 @@ export class Dispatcher {
         await this.forgejoCall(event, 'POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.' });
         if (failed) await this.forgejoCall(event, 'DELETE', '/issues/' + number + '/labels/' + failed.id);
         await this.forgejoCall(event, 'POST', '/issues/' + number + '/labels', { labels: [split.id] });
+        this.noteTicket(this.issueKey(event), { split_at: this.now() });
         return;
       }
       const text = what + '. A human has to look at it.';
