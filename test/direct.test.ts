@@ -1666,6 +1666,23 @@ test('another failure, an unreadable error and too many retries end the run as b
   }
 });
 
+test('a reset time given only in words is understood; a few seconds next to no credits is not a reset time', async () => {
+  for (const [detail, expected] of [
+    ['RateLimitError: [opencode-go/deepseek] usage limit (reset after 4h 12m 5s)', 4 * 3600 + 12 * 60 + 5],
+    ['RateLimitError: rate limit (reset after 45m)', 45 * 60],
+    ['RateLimitError: Monthly usage limit reached. Resets in 2 days', 8 * 3600],
+    ['RateLimitError: You have no credits remaining. (reset after 3s) (HTTP 429)', 900]
+  ]) {
+    const { dispatcher, jobs } = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMRateLimitError', classification: { kind: 'rate_limit' }, detail }], 'words.json');
+    for (const old of jobs.list()) jobs.remove(old.id);
+    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined });
+    await dispatcher.tick();
+    states[job.conversation_id] = 'error';
+    await dispatcher.tick();
+    assert.equal(job.next_try - clock, expected * 1000, detail);
+  }
+});
+
 test('a run that reached its iteration limit is not run again: it ends as max_iterations', async () => {
   const limit = { kind: 'ConversationErrorEvent', code: 'MaxIterationsReached', detail: 'Agent reached maximum iterations limit (150).' };
   const { dispatcher, jobs, config } = await buildQuota([limit]);
@@ -2401,11 +2418,29 @@ test('a quota error of a fallback run holds the fallback tier and the job decide
   assert.ok(dispatcher.cooldowns.get('free') > clock, 'the fallback tier is held');
   assert.equal(dispatcher.cooldowns.get('cheap'), clock + 60000, 'the original tier is not');
   clock += 61000; // cheap is back, free still on hold
-  job.next_try = undefined; // (the retry time of the job would otherwise be the end of the free hold)
   await dispatcher.tick();
   assert.equal(job.status, 'running');
   assert.equal(job.fell_back, undefined);
   assert.equal(starts().at(-1).body.agent_profile_id, WORKER);
+});
+
+test('the run that hits the quota of its own tier starts again at once on the fallback, not after the hold', async () => {
+  const config = loadConfig(env(falling({ MAX_CONCURRENT_PER_TIER: '2' })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => new URL(url).pathname.endsWith('/events/search') ? { ok: true, status: 200, json: async () => ({ items: [rateLimitError(18000)] }) } : api(url, request);
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  await dispatcher.enqueue(event('ai:ready', 1));
+  await dispatcher.tick();
+  const job = jobs.list()[0];
+  assert.equal(job.fell_back, undefined, 'first run on its own tier');
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.ok(dispatcher.cooldowns.get('cheap') > clock + 17000000, 'its tier is held for the five hours the gateway gave');
+  assert.equal(job.status, 'running', 'and the same pass started it again');
+  assert.equal(job.fell_back, 'ai:ready-free');
+  assert.notEqual(starts().at(-1).body.agent_profile_id, WORKER, 'with the fallback profile');
 });
 
 test('an escalated round whose escalation tier is on hold and has no fallback waits; with a fallback it falls back from the target', async () => {

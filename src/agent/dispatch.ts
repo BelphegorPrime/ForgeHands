@@ -215,6 +215,15 @@ export class Dispatcher {
     return { route: base };
   }
 
+  // When a job that hit a quota hold may start again: the earliest end of the holds of the routes it can run on (its own or escalated route
+  // and that route's fallback), or undefined when one of them is free now (a fallback takes over at once).
+  earliestStart(job: Job, now: number): number | undefined {
+    const base = this.escalationTarget(job) ?? this.route(job.label);
+    const tiers = [base.tier, ...(base.fallbackTo && this.config.routes.get(base.fallbackTo) ? [this.config.routes.get(base.fallbackTo)!.tier] : [])];
+    const earliest = Math.min(...tiers.map((tier) => this.cooldowns.get(tier) || 0));
+    return earliest > now ? earliest : undefined;
+  }
+
   forgejoCall(event: NormalizedEvent, method: string, path: string, body?: unknown): Promise<Json> {
     return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
   }
@@ -466,7 +475,16 @@ export class Dispatcher {
       const errors = items.filter((item: Json) => item?.kind === 'ConversationErrorEvent');
       const limit = errors.find((item: Json) => item.code === 'LLMRateLimitError' || item.classification?.kind === 'rate_limit');
       if (limit) {
-        const seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(String(limit.detail || ''))?.[1]);
+        const detail = String(limit.detail || '');
+        let seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(detail)?.[1]);
+        // Some gateways (OmniRoute for opencode, combo errors) say it only in words: "reset after 2h 58m 45s", "Resets in 13 days". A text
+        // under a minute ("reset after 3s" next to "no credits remaining") is not a reset time; the default wait applies then.
+        if (!(seconds > 0)) {
+          const after = /reset(?:s)? after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i.exec(detail);
+          const days = /resets? in\s+(\d+)\s*days?/i.exec(detail);
+          const words = after ? (Number(after[1] || 0) * 3600 + Number(after[2] || 0) * 60 + Number(after[3] || 0)) : days ? Number(days[1]) * 86400 : 0;
+          seconds = words >= 60 ? words : 0;
+        }
         return { code: String(limit.code || 'LLMRateLimitError'), rateLimited: true, waitMs: seconds > 0 ? seconds * 1000 : null };
       }
       if (!errors.length) return null;
@@ -889,7 +907,9 @@ export class Dispatcher {
           const until = now + wait;
           this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
-          Object.assign(job, { status: 'queued', started: undefined, fell_back: undefined, conversation_id: undefined, next_try: until, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: until });
+          // The job may start again as soon as one of the routes it can run on is free: its own (or escalated) route, or that route's fallback.
+          const next = this.earliestStart(job, now);
+          Object.assign(job, { status: 'queued', started: undefined, fell_back: undefined, conversation_id: undefined, next_try: next, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: next });
           return true;
         }
       }
