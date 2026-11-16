@@ -1,6 +1,8 @@
 // Shared shapes. The Forgejo and OpenHands payloads are untrusted JSON: they are read as `Json` and narrowed in the normalizers.
 export type Json = any;
 
+import type { ForgeKind } from './forge/types.ts';
+
 export type Fetch = typeof fetch;
 
 export interface Logger {
@@ -34,6 +36,9 @@ export interface ForgejoAccess {
 }
 
 interface BaseConfig {
+  /** FORGE: which forge ForgeHands talks to. */
+  forge: ForgeKind;
+  /** The webhook secret (FORGE_WEBHOOK_SECRET or FORGEJO_WEBHOOK_SECRET); the field keeps its first name. */
   forgejoSecret: string;
   allowedRepos: Set<string>;
   allowedSenders: Set<string> | null;
@@ -72,6 +77,7 @@ export interface DirectConfig extends BaseConfig {
   maxRunMs: number;
   maxRounds: number;
   escalateFromRound: number;
+  /** API access (FORGE_URL and FORGE_TOKEN, or FORGEJO_URL and FORGEJO_TOKEN); the field keeps its first name. */
   forgejo: ForgejoAccess | null;
   blockedLabel: string;
   updateBranches: boolean;
@@ -131,7 +137,7 @@ export interface CiInfo {
 
 interface BaseEvent {
   type: string;
-  source: 'forgejo';
+  source: ForgeKind;
   repository: RepositoryInfo;
   sender: { login: string | null };
   delivery_id?: string;

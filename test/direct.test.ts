@@ -950,8 +950,8 @@ test('the webhook delivers a CI outcome of an agent pull request', async () => {
 });
 
 // ---- auto-merge of an approved pull request, by the operator's per-repository policy
-import { Merger } from '../src/forgejo/merge.ts';
-import { globToRegExp } from '../src/forgejo/glob.ts';
+import { Merger } from '../src/forge/merge.ts';
+import { globToRegExp } from '../src/forge/glob.ts';
 const MERGE = { 'owner/hello': { deny: ['compose.yaml', '.github/**', 'docs/**/*.secret'] } };
 const withMerge = (extra = {}) => withCi({ MERGE_POLICY: JSON.stringify(MERGE), ...extra });
 const API = '/api/v1/repos/owner/hello';

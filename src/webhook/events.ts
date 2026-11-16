@@ -1,4 +1,4 @@
-import { isBotPull, type BotRules } from '../forgejo/bot.ts';
+import { isBotPull, type BotRules } from '../forge/bot.ts';
 import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {

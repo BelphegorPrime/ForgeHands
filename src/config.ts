@@ -1,5 +1,7 @@
 import { URL } from 'node:url';
-import { globToRegExp } from './forgejo/glob.ts';
+import { globToRegExp } from './forge/glob.ts';
+import { FORGES } from './forge/index.ts';
+import type { ForgeKind } from './forge/types.ts';
 import type { Config, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -121,10 +123,23 @@ function parseRepoWeights(raw: string | undefined): Map<string, number> {
   return weights;
 }
 
+// The neutral FORGE_* name and its FORGEJO_* alias say the same thing. Both set and different is a mistake worth stopping for.
+export function forgeEnv(env: NodeJS.ProcessEnv, neutral: string, alias: string): string | undefined {
+  const a = env[neutral] || undefined;
+  const b = env[alias] || undefined;
+  if (a && b && a !== b) throw new Error(neutral + ' and ' + alias + ' are both set, with different values; set only ' + neutral);
+  return a ?? b;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger = console): Config {
   // Removed in 0.4.0: a weekly cost cap per tier. Ignored (not an error) so that an existing setup still starts.
   if (env.TIER_WEEKLY_BUDGETS) logger.error('TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0 (max_budget of a route still caps one run)');
-  const forgejoSecret = env.FORGEJO_WEBHOOK_SECRET || '';
+  const forge = (env.FORGE || 'forgejo').trim().toLowerCase();
+  if (!(FORGES as readonly string[]).includes(forge)) throw new Error('FORGE must be ' + FORGES.join(' or ') + ', not ' + forge + ' (gitea and gitlab are not supported yet)');
+  // FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names; FORGEJO_* keep working.
+  const forgeUrl = forgeEnv(env, 'FORGE_URL', 'FORGEJO_URL');
+  const forgeToken = forgeEnv(env, 'FORGE_TOKEN', 'FORGEJO_TOKEN');
+  const forgejoSecret = forgeEnv(env, 'FORGE_WEBHOOK_SECRET', 'FORGEJO_WEBHOOK_SECRET') || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
   const allowedRepos = new Set((env.ALLOWED_REPOS || '')
     .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
@@ -155,6 +170,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   if (statusToken !== null && statusToken.length < 16) throw new Error('STATUS_TOKEN must be at least 16 characters');
   const dataFile = env.DATA_FILE || './data/deliveries.json';
   const common = {
+    forge: forge as ForgeKind,
     forgejoSecret,
     allowedRepos,
     allowedSenders,
@@ -187,8 +203,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const agentSecrets: Record<string, string> = {};
   for (const name of (env.AGENT_SECRETS || '').split(',').map((value) => value.trim()).filter(Boolean)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(name)) throw new Error('Invalid AGENT_SECRETS name: ' + name);
-    if (!env[name]) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
-    agentSecrets[name] = env[name]!;
+    // The agent's prompt names FORGEJO_URL and FORGEJO_TOKEN, so the neutral names reach it under those.
+    const value = name === 'FORGE_URL' || name === 'FORGEJO_URL' ? forgeUrl : name === 'FORGE_TOKEN' || name === 'FORGEJO_TOKEN' ? forgeToken : env[name];
+    if (!value) throw new Error('AGENT_SECRETS names ' + name + ', but it is not set');
+    agentSecrets[name.replace(/^FORGE_/, 'FORGEJO_')] = value;
   }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
   const maxRounds = positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100) as number;
@@ -196,8 +214,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
   const mergeMethod = env.MERGE_METHOD || 'merge';
   if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
-  if (mergePolicy.size && !(env.FORGEJO_URL && env.FORGEJO_TOKEN)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN');
-  if (remindDays(env.REMIND_AFTER_DAYS) && !(env.FORGEJO_URL && env.FORGEJO_TOKEN && parseHumanLogin(env.HUMAN_LOGIN))) throw new Error('REMIND_AFTER_DAYS needs FORGEJO_URL, FORGEJO_TOKEN and HUMAN_LOGIN');
+  if (mergePolicy.size && !(forgeUrl && forgeToken)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN (or FORGE_URL and FORGE_TOKEN)');
+  if (remindDays(env.REMIND_AFTER_DAYS) && !(forgeUrl && forgeToken && parseHumanLogin(env.HUMAN_LOGIN))) throw new Error('REMIND_AFTER_DAYS needs FORGEJO_URL, FORGEJO_TOKEN and HUMAN_LOGIN (or FORGE_URL and FORGE_TOKEN)');
   return {
     ...common,
     mode: 'direct',
@@ -221,7 +239,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // From this round on a route with "escalate_to" runs with the stronger profile; by default only the last round.
     escalateFromRound: positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number,
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
-    forgejo: env.FORGEJO_URL && env.FORGEJO_TOKEN ? { url: httpUrl(env.FORGEJO_URL, 'FORGEJO_URL').toString().replace(/\/$/, ''), token: env.FORGEJO_TOKEN } : null,
+    forgejo: forgeUrl && forgeToken ? { url: httpUrl(forgeUrl, env.FORGE_URL ? 'FORGE_URL' : 'FORGEJO_URL').toString().replace(/\/$/, ''), token: forgeToken } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
     // When the default branch moves, open agent pull requests that fell behind and have no review or approval yet are brought up to
     // date (Forgejo's update, rebase style); one that conflicts gets a conflict round (route "on": "conflict"). 0 switches it off.

@@ -1,7 +1,7 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
-import { deliveryId, signPayload, verifyForgejoSignature } from '../webhook/security.ts';
-import { normalizeEvent } from '../webhook/events.ts';
+import { signPayload } from '../webhook/security.ts';
+import { createForge, createTransport } from '../forge/index.ts';
 import { buildStatus, renderStatus } from './status.ts';
 import { hasToken } from './auth.ts';
 import { gaugeSamples, known, metrics, WEBHOOK_EVENTS } from '../metrics.ts';
@@ -39,6 +39,8 @@ async function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
 
 export function createApp(config: Config, store: DeliveryStore, send: Fetch = fetch, logger: Logger = console, dispatcher: Dispatcher | null = null): Server {
   if (config.mode === 'direct' && !dispatcher) throw new Error('direct mode needs a dispatcher');
+  // Only the webhook half of the forge is used here: the signature check and the event normalization.
+  const forge = createForge(config, createTransport(config, send));
   return createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       return json(res, 200, { status: 'ok' });
@@ -59,29 +61,29 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(renderStatus(status));
     }
-    if (req.method !== 'POST' || req.url !== '/webhooks/forgejo') {
+    if (req.method !== 'POST' || req.url !== forge.webhookPath) {
       return json(res, 404, { error: 'not_found' });
     }
     if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
       return json(res, 415, { error: 'expected_json' });
     }
-    const delivered = (result: string) => metrics.inc('forgehands_webhook_deliveries_total', { event: known(req.headers['x-forgejo-event'], WEBHOOK_EVENTS), result });
+    const delivered = (result: string) => metrics.inc('forgehands_webhook_deliveries_total', { event: known(forge.eventName(req.headers), WEBHOOK_EVENTS), result });
     let raw;
     try { raw = await readBody(req, config.maxBodyBytes); }
     catch (error) { return json(res, error.status || 400, { error: 'invalid_body' }); }
-    if (!verifyForgejoSignature(config.forgejoSecret, raw, req.headers['x-forgejo-signature'])) {
+    if (!forge.verifyWebhook(config.forgejoSecret, raw, req.headers)) {
       delivered('rejected_signature');
       return json(res, 401, { error: 'invalid_signature' });
     }
     let body;
     try { body = JSON.parse(raw.toString('utf8')); }
     catch { return json(res, 400, { error: 'invalid_json' }); }
-    const event = req.headers['x-forgejo-event'];
+    const event = forge.eventName(req.headers);
     const direct = config.mode === 'direct';
     const previousLabels = direct ? dispatcher!.labelsBefore(body, config.allowedRepos) : null;
     const remember = () => { if (direct) dispatcher!.recordLabels(body, config.allowedRepos); };
     const routeLabels = (kind: string) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
-    const normalized = normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
+    const normalized = forge.normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
       pushes: direct && config.updateBranches,
@@ -94,7 +96,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       delivered('ignored');
       return json(res, 202, { status: 'ignored' });
     }
-    const id = deliveryId(req.headers, raw, event);
+    const id = forge.deliveryId(req.headers, raw, event);
     const key = normalized.repository.full_name.toLowerCase() + ':' + id;
     const state = store.acquire(key);
     if (state === 'completed') { delivered('duplicate'); return json(res, 200, { status: 'duplicate', delivery_id: id }); }

@@ -1,11 +1,12 @@
 import { buildPrompt } from './prompt.ts';
-import { forgejoCall } from '../forgejo/client.ts';
-import { Merger, WIP } from '../forgejo/merge.ts';
+import { createForge, createTransport } from '../forge/index.ts';
+import { Merger } from '../forge/merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { known, metrics } from '../metrics.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
+import type { Forge } from '../forge/index.ts';
 
 // `paused` counts: someone stopped the run on purpose (POST /pause), it does not end by itself and must not hold its slot or block the issue.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
@@ -35,6 +36,8 @@ export class Dispatcher {
   current: Promise<void> | null = null;
   timer: NodeJS.Timeout | undefined;
   merger: Merger;
+  forge: Forge;
+  transport: ReturnType<typeof createTransport>;
   dry: DryLog;
   reminder: Reminder;
   lastArchive = 0;
@@ -49,6 +52,8 @@ export class Dispatcher {
     this.logger = logger;
     this.now = now;
     this.dry = new DryLog(logger);
+    this.transport = createTransport(config, send, this.dry);
+    this.forge = createForge(config, (repository, method, path, body) => this.forgejoCall({ repository: { full_name: repository } }, method, path, body));
     this.merger = new Merger(config, send, logger, undefined, this.dry);
     this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
@@ -130,9 +135,10 @@ export class Dispatcher {
     // trusted, a failed run): none of them outlasts the human looking at the pull request, and a merge refuses while the label is on.
     if (!this.config.forgejo) return;
     try {
-      const labels = await this.forgejoCall(event, 'GET', '/issues/' + event.pull_request.number + '/labels');
-      const blocked = (labels || []).find((label: Json) => label.name === this.config.blockedLabel);
-      if (blocked) await this.forgejoCall(event, 'DELETE', '/issues/' + event.pull_request.number + '/labels/' + blocked.id);
+      const repository = event.repository.full_name;
+      const labels = await this.forge.labelsOf(repository, event.pull_request.number);
+      const blocked = (labels || []).find((label) => label.name === this.config.blockedLabel);
+      if (blocked) await this.forge.removeLabel(repository, event.pull_request.number, blocked);
     } catch (error) {
       this.logger.error('could not lift the block of #' + event.pull_request.number + ':', error.message);
     }
@@ -235,8 +241,9 @@ export class Dispatcher {
     return earliest > now ? earliest : undefined;
   }
 
-  forgejoCall(event: NormalizedEvent, method: string, path: string, body?: unknown): Promise<Json> {
-    return forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
+  // The wire of the dispatcher's forge: every call it makes passes here (and below that, through the dry run gate of the transport).
+  forgejoCall(event: { repository: { full_name: string } }, method: string, path: string, body?: unknown): Promise<Json> {
+    return this.transport(event.repository.full_name, method, path, body);
   }
 
   // The reviewer approved the pull request (label): merge it when the operator's policy for the repository allows.
@@ -249,7 +256,7 @@ export class Dispatcher {
   async openDependencies(event: NormalizedEvent, number: number): Promise<number[]> {
     if (!this.config.forgejo) return [];
     try {
-      const dependencies = await this.forgejoCall(event, 'GET', '/issues/' + number + '/dependencies');
+      const dependencies = await this.forge.dependencies(event.repository.full_name, number);
       return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => issue.number);
     } catch (error) {
       this.logger.error('could not read the dependencies of #' + number + ':', error.message);
@@ -261,7 +268,7 @@ export class Dispatcher {
   async onClosed(event: ForgeEvent): Promise<string> {
     if (!this.config.forgejo) return 'no_forgejo_access';
     let blocked: Json;
-    try { blocked = await this.forgejoCall(event, 'GET', '/issues/' + event.issue.number + '/blocks'); }
+    try { blocked = await this.forge.blocks(event.repository.full_name, event.issue.number); }
     catch (error) { this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message); return 'blocks_unknown'; }
     const outcome: string[] = [];
     let changed = false;
@@ -291,19 +298,19 @@ export class Dispatcher {
   // event, which starts what waits. Best effort.
   async closeMergedTickets(event: PushEvent): Promise<number> {
     if (!this.config.forgejo) return 0;
-    const call = (method: string, path: string, body?: unknown) => forgejoCall(this.config, this.send, event.repository.full_name, method, path, body, this.dry);
+    const repository = event.repository.full_name;
     let closed = 0;
     try {
-      const pulls = await call('GET', '/pulls?state=closed&sort=recentupdate&limit=20');
+      const pulls = await this.forge.listPulls(repository, { state: 'closed', sort: 'recentupdate', limit: 20 });
       for (const pr of Array.isArray(pulls) ? pulls : []) {
         const match = /^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''));
         if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
         const number = Number(match[1]);
-        const issue = await call('GET', '/issues/' + number);
+        const issue = await this.forge.getIssue(repository, number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
-        await call('POST', '/issues/' + number + '/comments', { body: 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.' });
-        await call('PATCH', '/issues/' + number, { state: 'closed' });
-        this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at) || this.now(), merged_by: 'human' });
+        await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.');
+        await this.forge.closeIssue(repository, number);
+        this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
       }
     } catch (error) {
@@ -320,12 +327,12 @@ export class Dispatcher {
     if (this.jobs.activeByKey(key)) return false;
     let children: { number: number; title: string }[] = [];
     try {
-      children = (await this.forgejoCall(event, 'GET', '/issues/' + epic.number + '/dependencies')).map((issue: Json) => ({ number: issue.number, title: String(issue.title || '').slice(0, 200) }));
+      children = (await this.forge.dependencies(event.repository.full_name, epic.number)).map((issue: Json) => ({ number: issue.number, title: String(issue.title || '').slice(0, 200) }));
     } catch (error) { this.logger.error('could not list the sub-issues of #' + epic.number + ':', error.message); }
     this.jobs.add({
       key, label: route, status: 'queued', created: this.now(),
       event: {
-        type: 'epic.done', source: 'forgejo', action: 'dependencies_closed', label: route, repository: event.repository,
+        type: 'epic.done', source: this.forge.kind, action: 'dependencies_closed', label: route, repository: event.repository,
         issue: { number: epic.number, title: String(epic.title || '').slice(0, 1000), body: String(epic.body || '').slice(0, 50000), html_url: epic.html_url || null, comments: epic.comments || 0, labels: (epic.labels || []).map((label: Json) => label.name) },
         epic: { children }, sender: event.sender
       }
@@ -362,7 +369,7 @@ export class Dispatcher {
   async isStale(event: ForgeEvent): Promise<boolean> {
     if (!this.config.forgejo) return false;
     try {
-      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request!.number);
+      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request!.number);
       return Boolean(pr?.head?.sha) && pr.head.sha !== event.ci!.commit_sha;
     } catch (error) {
       this.logger.error('could not read the head of #' + event.pull_request!.number + ':', error.message);
@@ -378,7 +385,7 @@ export class Dispatcher {
       return false;
     }
     try {
-      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(event.ci!.commit_sha) + '/status');
+      const status = await this.forge.commitStatus(event.repository.full_name, event.ci!.commit_sha);
       return status?.state === 'success' && status.total_count > 0;
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
@@ -390,7 +397,7 @@ export class Dispatcher {
   async commitRecovered(event: ForgeEvent): Promise<boolean> {
     if (!this.config.forgejo) return false;
     try {
-      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(event.ci!.commit_sha) + '/status');
+      const status = await this.forge.commitStatus(event.repository.full_name, event.ci!.commit_sha);
       return status?.state === 'pending' || status?.state === 'success';
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
@@ -423,7 +430,7 @@ export class Dispatcher {
     const event = job.event;
     if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
     try {
-      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
       if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) { await this.handOverAfterSecurity(job); return; }
       if (!job.verdict_retry) {
@@ -444,7 +451,7 @@ export class Dispatcher {
     const event = job.event;
     if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
     try {
-      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== event.ci.commit_sha) return;
       if (!(pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel)) return;
       await this.merger.handle(event);
@@ -466,13 +473,11 @@ export class Dispatcher {
     this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
     if (!this.config.forgejo) return;
     const { number } = event.pull_request!;
-    const call = (method: string, path: string, body?: unknown) => this.forgejoCall(event, method, path, body);
+    const repository = event.repository.full_name;
     try {
-      await call('POST', '/issues/' + number + '/comments', { body: (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + text });
-      const known = await call('GET', '/labels?limit=100');
-      let label = (known || []).find((entry: Json) => entry.name === this.config.blockedLabel);
-      if (!label) label = await call('POST', '/labels', { name: this.config.blockedLabel, color: '#b60205' });
-      await call('POST', '/issues/' + number + '/labels', { labels: [label.id] });
+      await this.forge.addComment(repository, number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + text);
+      const label = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
+      await this.forge.addLabels(repository, number, [label]);
     } catch (error) {
       this.logger.error('could not mark the pull request:', error.message);
     }
@@ -515,7 +520,7 @@ export class Dispatcher {
     const event = job.event;
     if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
     try {
-      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
+      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
       const names = (pr.labels || []).map((label: Json) => label.name);
       // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a review that asks for changes hands it to a human, as the reviewer should have.
@@ -634,7 +639,7 @@ export class Dispatcher {
   // merge as they are, and a conflict shows when the merge is tried.
   async refreshBranches(event: PushEvent): Promise<boolean> {
     const tip = event.after;
-    const pulls = await this.forgejoCall(event, 'GET', '/pulls?state=open&limit=50');
+    const pulls = await this.forge.listPulls(event.repository.full_name, { state: 'open', limit: 50 });
     let changed = false;
     let deferred = false;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
@@ -667,7 +672,7 @@ export class Dispatcher {
     // that conflicts can be merged by nobody (a human waiting to merge a protected path would find it so). Once the WIP marker is gone,
     // which approval removes, Forgejo's mergeable is reliable: a conflict starts a conflict round, after which CI and review run again.
     if (reviewed) {
-      if (pr.mergeable === false && !WIP.test(String(pr.title || '')) && (await this.startConflictRound(prEvent, tip))) return { changed: true, deferred: false };
+      if (pr.mergeable === false && !this.forge.isWip(String(pr.title || '')) && (await this.startConflictRound(prEvent, tip))) return { changed: true, deferred: false };
       return none;
     }
     // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
@@ -677,13 +682,15 @@ export class Dispatcher {
     if (hold) { this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); return { changed: false, deferred: true }; }
     this.lastUpdate.set(base + pr.number, this.now());
     try {
-      await this.forgejoCall(event, 'POST', '/pulls/' + pr.number + '/update?style=rebase');
+      if (await this.forge.updateBranch(event.repository.full_name, pr.number) === 'conflict') {
+        metrics.inc('forgehands_branch_conflicts_total');
+        if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
+        return none;
+      }
       this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
       metrics.inc('forgehands_branch_updates_total');
     } catch (error) {
-      if (!/HTTP 409\b/.test(error.message)) { this.logger.error('could not update #' + pr.number + ':', error.message); return none; }
-      metrics.inc('forgehands_branch_conflicts_total');
-      if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
+      this.logger.error('could not update #' + pr.number + ':', error.message);
     }
     return none;
   }
@@ -699,11 +706,10 @@ export class Dispatcher {
     try {
       const branch = event.repository.default_branch;
       if (!branch) return;
-      const head = await this.forgejoCall(event, 'GET', '/branches/' + encodeURIComponent(branch));
-      const tip = head?.commit?.id;
+      const tip = await this.forge.branchTip(event.repository.full_name, branch);
       if (typeof tip !== 'string' || !tip) return;
-      const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
-      const push = { type: 'push.default', source: 'forgejo', repository: event.repository, sender: event.sender, after: tip } as unknown as PushEvent;
+      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
+      const push = { type: 'push.default', source: this.forge.kind, repository: event.repository, sender: event.sender, after: tip } as unknown as PushEvent;
       const outcome = await this.refreshPull(push, pr, tip);
       if (outcome.deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event: push });
       if (outcome.changed) this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
@@ -716,9 +722,9 @@ export class Dispatcher {
   // changes too. Anything unclear (a failing call, a list that may be cut off) counts as yes.
   async touchesSameFiles(event: PushEvent, pr: Json, tip: string): Promise<boolean> {
     try {
-      const compare = await this.forgejoCall(event, 'GET', '/compare/' + pr.merge_base + '...' + tip);
-      const ours = await this.forgejoCall(event, 'GET', '/pulls/' + pr.number + '/files?limit=100');
-      if (!Array.isArray(compare?.files) || !Array.isArray(ours) || ours.length >= 100 || (compare.total_commits > 0 && compare.files.length === 0)) return true;
+      const compare = await this.forge.compare(event.repository.full_name, pr.merge_base, tip);
+      const ours = await this.forge.pullFiles(event.repository.full_name, pr.number, 100);
+      if (!Array.isArray(compare?.files) || !Array.isArray(ours) || ours.length >= 100 || ((compare.total_commits ?? 0) > 0 && compare.files.length === 0)) return true;
       const names = (list: Json[]) => list.flatMap((file) => [file.filename, file.previous_filename]).filter(Boolean);
       const theirs = new Set(names(compare.files));
       return names(ours).some((name) => theirs.has(name));
@@ -733,7 +739,7 @@ export class Dispatcher {
     const last = this.lastUpdate.get(event.repository.full_name.toLowerCase() + '#' + pr.number);
     if (last && this.now() - last < this.config.branchUpdateMinIntervalMs) return 'cooldown';
     try {
-      const status = await this.forgejoCall(event, 'GET', '/commits/' + encodeURIComponent(pr.head.sha) + '/status');
+      const status = await this.forge.commitStatus(event.repository.full_name, pr.head.sha);
       if (status?.state === 'pending' && status.total_count > 0) return 'CI is still running';
     } catch (error) {
       this.logger.error('could not read the status of #' + pr.number + ':', error.message);
@@ -985,20 +991,19 @@ export class Dispatcher {
       const exhausted = state === 'max_iterations' || state === 'paused' || state === 'stuck' || state === 'timeout';
       if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
         const number = event.issue.number;
-        const known = await this.forgejoCall(event, 'GET', '/labels?limit=100');
-        let split = (known || []).find((entry: Json) => entry.name === this.config.splitLabel);
-        if (!split) split = await this.forgejoCall(event, 'POST', '/labels', { name: this.config.splitLabel, color: '#5319e7' });
-        const present = await this.forgejoCall(event, 'GET', '/issues/' + number + '/labels');
-        const failed = (present || []).find((entry: Json) => entry.name === job.label);
-        await this.forgejoCall(event, 'POST', '/issues/' + number + '/comments', { body: 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.' });
-        if (failed) await this.forgejoCall(event, 'DELETE', '/issues/' + number + '/labels/' + failed.id);
-        await this.forgejoCall(event, 'POST', '/issues/' + number + '/labels', { labels: [split.id] });
+        const repository = event.repository.full_name;
+        const split = await this.forge.findOrCreateLabel(repository, this.config.splitLabel, '#5319e7');
+        const present = await this.forge.labelsOf(repository, number);
+        const failed = (present || []).find((entry) => entry.name === job.label);
+        await this.forge.addComment(repository, number, 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.');
+        if (failed) await this.forge.removeLabel(repository, number, failed);
+        await this.forge.addLabels(repository, number, [split]);
         this.noteTicket(this.issueKey(event), { split_at: this.now() });
         return;
       }
       const text = what + '. A human has to look at it.';
       if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run');
-      else await this.forgejoCall(event, 'POST', '/issues/' + event.issue.number + '/comments', { body: (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text });
+      else await this.forge.addComment(event.repository.full_name, event.issue.number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text);
     } catch (error) {
       this.logger.error('could not report the failure of ' + job.key + ':', error.message);
     }
