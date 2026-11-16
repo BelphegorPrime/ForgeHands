@@ -40,6 +40,9 @@ interface BaseConfig {
   host: string;
   timeoutMs: number;
   maxBodyBytes: number;
+  /** DRY_RUN: receive and judge as usual, change nothing. With `dryRunRepos` only those repositories are dry. */
+  dryRun: boolean;
+  dryRunRepos: Set<string>;
 }
 
 export interface WebhookConfig extends BaseConfig {
@@ -150,7 +153,8 @@ export type NormalizedEvent = ForgeEvent | PushEvent;
 
 export const isPushEvent = (event: NormalizedEvent): event is PushEvent => event.type === 'push.default';
 
-export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed';
+// `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
+export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry';
 
 export interface Job {
   id: string;
@@ -177,6 +181,8 @@ export interface Job {
   round_reset?: boolean;
   archived?: boolean;
   error_retry?: number;
+  /** Dry run: the first message the conversation would have started with. */
+  dry_prompt?: string;
 }
 
 export type NewJob = Omit<Job, 'id' | 'attempts'> & { attempts?: number };

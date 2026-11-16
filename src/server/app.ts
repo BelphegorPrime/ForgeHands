@@ -4,6 +4,7 @@ import { deliveryId, signPayload, verifyForgejoSignature } from '../webhook/secu
 import { normalizeEvent } from '../webhook/events.ts';
 import { buildStatus, renderStatus } from './status.ts';
 import { isPushEvent } from '../types.ts';
+import { DryLog, isDry } from '../dry.ts';
 import type { Config, DirectConfig, Fetch, ForgeEvent, Logger } from '../types.ts';
 import type { DeliveryStore } from '../store/deliveries.ts';
 import type { Dispatcher } from '../agent/dispatch.ts';
@@ -42,7 +43,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     }
     // Read only view of the work in flight (direct mode): /status for people, /status.json for tools.
     if (req.method === 'GET' && (req.url === '/status' || req.url === '/status.json') && dispatcher) {
-      const status = buildStatus(config as DirectConfig, dispatcher.jobs);
+      const status = buildStatus(config as DirectConfig, dispatcher.jobs, Date.now(), dispatcher.dry);
       if (req.url === '/status.json') return json(res, 200, status);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(renderStatus(status));
@@ -100,6 +101,13 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       }
     }
     const outgoing = Buffer.from(JSON.stringify(normalized));
+    // A dry run does not forward: the call is logged and the delivery counts as handled.
+    if (isDry(config, normalized.repository.full_name)) {
+      new DryLog(logger).record('OpenHands webhook', 'POST', '', normalized);
+      await store.mark(key);
+      store.release(key);
+      return json(res, 202, { status: 'dry_run', delivery_id: id });
+    }
     try {
       const response = await send(config.endpoint, {
         method: 'POST',

@@ -5,6 +5,8 @@ import { Dispatcher } from './agent/dispatch.ts';
 import { createApp } from './server/app.ts';
 
 const config = loadConfig();
+if (config.dryRun) console.error('WARNING: DRY RUN. Events are judged as usual, but nothing is written to Forgejo or OpenHands ('
+  + (config.dryRunRepos.size ? 'only for ' + [...config.dryRunRepos].join(', ') : 'all repositories') + ').');
 const store = new DeliveryStore(config.dataFile);
 await store.load();
 let dispatcher = null;

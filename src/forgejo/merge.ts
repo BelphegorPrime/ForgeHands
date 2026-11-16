@@ -1,4 +1,5 @@
 import { forgejoCall } from './client.ts';
+import { DryLog } from '../dry.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 
 export const WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
@@ -12,19 +13,21 @@ export class Merger {
   send: Fetch;
   logger: Logger;
   later: (run: () => void, ms: number) => void;
+  dry: DryLog;
   // Set by the dispatcher: is a security review of this commit still queued or running? Then the hand-over waits for it.
   securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
-    later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }) {
+    later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
     this.config = config;
     this.send = send;
     this.logger = logger;
     this.later = later;
+    this.dry = dry;
   }
 
   call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
-    return forgejoCall(this.config, this.send, repository, method, path, body);
+    return forgejoCall(this.config, this.send, repository, method, path, body, this.dry);
   }
 
   async changedFiles(repository: string, number: number): Promise<string[]> {
