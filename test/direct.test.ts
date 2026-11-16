@@ -2312,6 +2312,7 @@ test('/status says that a round was escalated', async () => {
   const status = buildStatus(config, jobs, clock);
   assert.equal(status.issues[0].runs[0].escalated, 'ai:escalate');
   assert.match(status.issues[0].state, /escalated to ai:escalate/);
+});
 
 // ---- pull requests of dependency bots (Renovate): the review and merge policy of agent pull requests, without a worker
 const BOT = { BOT_AUTHORS: 'Renovate, @dependabot', BOT_BRANCH_PREFIXES: 'renovate/' };
