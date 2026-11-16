@@ -160,6 +160,7 @@ export interface Job {
   retry_at?: number;
   rate_limited?: number;
   verdict_retry?: number;
+  round_reset?: boolean;
   archived?: boolean;
 }
 

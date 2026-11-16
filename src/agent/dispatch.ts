@@ -91,10 +91,32 @@ export class Dispatcher {
     return present.find((label) => !this.jobs.list().some((job) => job.key === base + ':' + label));
   }
 
+  // The human acted on a pull request (set a label, pushed a commit: the CI run of his commit names him as sender): the follow-up rounds
+  // so far no longer count, the pull request starts with a fresh budget, and a block set for used-up rounds comes off. Best effort.
+  async humanTookOver(event: ForgeEvent): Promise<void> {
+    const login = this.config.humanLogin?.toLowerCase();
+    if (!login || !event.pull_request || event.sender?.login?.toLowerCase() !== login) return;
+    const base = this.issueKey(event) + ':';
+    const spent = this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind));
+    if (!spent.length) return;
+    for (const job of spent) job.round_reset = true;
+    await this.jobs.persist(this.now());
+    this.logger.error(this.issueKey(event) + ': ' + login + ' acted on the pull request, the rounds start again');
+    if (!this.config.forgejo) return;
+    try {
+      const labels = await this.forgejoCall(event, 'GET', '/issues/' + event.pull_request.number + '/labels');
+      const blocked = (labels || []).find((label: Json) => label.name === this.config.blockedLabel);
+      if (blocked) await this.forgejoCall(event, 'DELETE', '/issues/' + event.pull_request.number + '/labels/' + blocked.id);
+    } catch (error) {
+      this.logger.error('could not lift the block of #' + event.pull_request.number + ':', error.message);
+    }
+  }
+
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
     const label = this.pickLabel(event);
     if (!label) return { status: 'duplicate_job' };
     if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
+    await this.humanTookOver(event);
     // A CI outcome belongs to one commit: the same commit starts one run, whatever the outcome of each workflow.
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
@@ -142,7 +164,7 @@ export class Dispatcher {
   // Follow-up runs (pull request routes) already made for the issue of this event.
   rounds(event: ForgeEvent): number {
     const base = this.issueKey(event) + ':';
-    return this.jobs.list().filter((job) => job.key.startsWith(base) && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
+    return this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
   }
 

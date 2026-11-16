@@ -475,6 +475,31 @@ test('the same label while a round runs starts no second round, a re-label after
   assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
 });
 
+test('an action of the human on the pull request starts the rounds again and lifts the block; an agent does not', async () => {
+  const forgejo = [];
+  const config = loadConfig(env(withChanges({ MAX_ROUNDS: '1', HUMAN_LOGIN: 'marcel' })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    forgejo.push({ method: request.method, path: new URL(url).pathname });
+    const body = request.method === 'GET' && new URL(url).pathname.endsWith('/issues/34/labels') ? [{ id: 9, name: 'ai:blocked' }] : request.method === 'GET' ? [] : { id: 77 };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  assert.equal((await dispatcher.enqueue(prEvent())).status, 'queued');
+  await dispatcher.tick();
+  states[jobs.list().at(-1).conversation_id] = 'finished';
+  await dispatcher.tick();
+  const agent = (login) => prEvent([], { sender: { login } });
+  assert.equal((await dispatcher.enqueue(agent('openhands'))).status, 'rounds_exceeded', 'an agent does not reset the budget');
+  assert.ok(!forgejo.some((call) => call.method === 'DELETE' && call.path.endsWith('/labels/9')));
+  assert.equal((await dispatcher.enqueue(agent('Marcel'))).status, 'queued', 'the human starts a fresh budget');
+  assert.ok(forgejo.some((call) => call.method === 'DELETE' && call.path === '/api/v1/repos/owner/hello/issues/34/labels/9'), 'the block comes off');
+  assert.equal(dispatcher.rounds(prEvent()), 1, 'only the new round counts');
+});
+
 test('rounds are limited per issue; the pull request is told and marked when they are used up', async () => {
   const forgejo = [];
   const config = loadConfig(env(withChanges({ MAX_ROUNDS: '2' })));
