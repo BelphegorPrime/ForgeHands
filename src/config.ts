@@ -42,7 +42,7 @@ function parseRoutes(text: string): Map<string, Route> {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100) as number,
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict'].includes(route.on) ? route.on : 'issue') as RouteKind
+      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'].includes(route.on) ? route.on : 'issue') as RouteKind
     });
   }
   return routes;
