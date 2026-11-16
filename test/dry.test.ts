@@ -164,3 +164,22 @@ test('dry run in webhook mode: the forward is logged, not sent', async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('dry run: a bot pull request is merged and reviewed as a dry run too, nothing reaches the client', async () => {
+  const dry = double({ strict: true });
+  const pull = { state: 'open', merged: false, mergeable: true, title: 'Update dependency', user: { login: 'renovate' }, head: { ref: 'renovate/x', sha: 'cafe0000cafe', repo: { full_name: dryRepo } }, labels: [{ name: 'ai:approved' }] };
+  const send = (url, request) => new URL(url).pathname === API + '/pulls/34' ? Promise.resolve({ ok: true, status: 200, json: async () => pull }) : dry.send(url, request);
+  const config = loadConfig(env({ DRY_RUN: '1', BOT_AUTHORS: 'renovate', LABEL_ROUTES: JSON.stringify({ 'ci:success': { profile: WORKER, tier: 'free', on: 'ci_success' } }) }));
+  const merger = new Merger(config, send, quiet);
+  assert.equal(await merger.handle({ repository: { full_name: dryRepo }, bot: true, pull_request: { number: 34, head_ref: 'renovate/x' }, issue: { number: 34 } }), 'merged');
+  assert.deepEqual(dry.writes(), []);
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  const ci = { type: 'ci.success', label: 'ci:success', bot: true, repository: { full_name: dryRepo, clone_url: null, default_branch: 'main' }, issue: { number: 34, title: 'Update', body: '', labels: [] },
+    pull_request: { number: 34, head_ref: 'renovate/x', html_url: null }, ci: { workflow: 'ci.yaml', commit_sha: 'cafe0000cafe' }, sender: { login: 'renovate' } };
+  assert.equal((await dispatcher.enqueue(ci)).status, 'queued');
+  await dispatcher.tick();
+  assert.equal(jobs.list()[0].status, 'dry');
+  assert.match(jobs.list()[0].dry_prompt, /dependency update by a bot/);
+  assert.deepEqual(dry.writes(), []);
+});

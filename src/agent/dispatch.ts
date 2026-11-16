@@ -51,8 +51,14 @@ export class Dispatcher {
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
   }
 
+  // The ledger key of the work on an issue; a dependency bot's pull request has no issue and is kept per pull request ("repo!pr<n>").
   issueKey(event: ForgeEvent): string {
-    return event.repository.full_name.toLowerCase() + '#' + event.issue.number;
+    return event.repository.full_name.toLowerCase() + (event.bot ? '!pr' + event.pull_request!.number : '#' + event.issue.number);
+  }
+
+  // Follow-up rounds allowed on the work of this event: MAX_ROUNDS per issue, BOT_FIX_ROUNDS per bot pull request.
+  roundLimit(event: ForgeEvent): number {
+    return event.bot ? this.config.botFixRounds : this.config.maxRounds;
   }
 
   static labelsOf(payload: Json, allowedRepos: Set<string>): { key: string; labels: string[] } | null {
@@ -150,7 +156,7 @@ export class Dispatcher {
     if (kind === 'ci_success' && !(await this.commitGreen(event))) return { status: 'ci_not_green' };
     // A run killed from outside is reported as failure; if the commit is pending or green again there is nothing to fix.
     if (kind === 'ci_failure' && (await this.commitRecovered(event))) return { status: 'ci_not_red' };
-    if (event.pull_request && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
+    if (event.pull_request && ROUND_KINDS.has(kind) && this.rounds(event) >= this.roundLimit(event)) {
       await this.roundsUsedUp(event);
       return { status: 'rounds_exceeded' };
     }
@@ -307,7 +313,7 @@ export class Dispatcher {
     let start = !(await this.isStale(event));
     if (start && (kind === 'ci_success' || kind === 'sensitive_review')) start = await this.commitGreen(event);
     if (start && kind === 'ci_failure') start = !(await this.commitRecovered(event));
-    if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.config.maxRounds) {
+    if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.roundLimit(event)) {
       await this.roundsUsedUp(event);
       start = false;
     }
@@ -416,8 +422,9 @@ export class Dispatcher {
 
   // The rounds are used up: say so on the pull request and mark it for a human. Best effort, a failure is only logged.
   async roundsUsedUp(event: ForgeEvent): Promise<void> {
-    this.logger.error(this.issueKey(event) + ': ' + this.config.maxRounds + ' rounds used up, not starting another');
-    await this.markForHuman(event, 'ForgeHands: ' + this.config.maxRounds + ' follow-up rounds for issue #' + event.issue.number + ' are used up. A human has to look at this pull request now.');
+    const limit = this.roundLimit(event);
+    this.logger.error(this.issueKey(event) + ': ' + limit + ' rounds used up, not starting another');
+    await this.markForHuman(event, 'ForgeHands: ' + limit + ' follow-up rounds for ' + (event.bot ? 'this dependency update' : 'issue #' + event.issue.number) + ' are used up. A human has to look at this pull request now.');
   }
 
   // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
@@ -467,6 +474,11 @@ export class Dispatcher {
       const pr = await this.forgejoCall(event, 'GET', '/pulls/' + event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
       const names = (pr.labels || []).map((label: Json) => label.name);
+      // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a review that asks for changes hands it to a human, as the reviewer should have.
+      if (event.bot && !this.config.botFixRounds && names.includes(this.config.changesLabel) && ![this.config.approvedLabel, this.config.blockedLabel].some((name) => names.includes(name))) {
+        await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.');
+        return;
+      }
       if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
       // The first time, review once more: such a run mostly ends early (a blind command, a spent iteration budget), not for good.
       if (!job.verdict_retry) {
@@ -625,7 +637,8 @@ export class Dispatcher {
   // no later push brings it back into view. When the run ends, look at the pull request once: the same update, the same conflict round.
   async checkBranchAfterRun(job: Job): Promise<void> {
     const event = job.event;
-    if (!this.config.updateBranches || !this.config.forgejo || !event?.pull_request) return;
+    // A dependency bot keeps its own branch current (Renovate rebases itself).
+    if (!this.config.updateBranches || !this.config.forgejo || !event?.pull_request || event.bot) return;
     const kind = this.config.routes.get(job.label)?.kind;
     if (kind === 'conflict' || kind === 'sensitive_review') return;
     try {
@@ -684,7 +697,7 @@ export class Dispatcher {
     }
     const key = this.issueKey(event) + ':' + route + ':' + tip.slice(0, 8);
     if (this.jobs.list().some((job) => job.key === key)) return false;
-    if (this.rounds(event) >= this.config.maxRounds) { await this.roundsUsedUp(event); return false; }
+    if (this.rounds(event) >= this.roundLimit(event)) { await this.roundsUsedUp(event); return false; }
     this.jobs.add({ key, label: route, status: 'queued', created: this.now(), event: { ...event, type: 'pull_request.conflict', label: route, base_sha: tip } });
     await this.merger.clearApproval(event);
     this.logger.error(this.issueKey(event) + ': pull request #' + number + ' conflicts with the default branch, conflict round queued');
@@ -803,7 +816,7 @@ export class Dispatcher {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: (target ?? route).profile,
       max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', issue: String(job.event.issue.number), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
+      tags: { source: 'forgehands', ...(job.event.bot ? { bot: 'dependency' } : { issue: String(job.event.issue.number) }), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
       initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;

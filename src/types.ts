@@ -84,6 +84,9 @@ export interface DirectConfig extends BaseConfig {
   archiveAfterDays: number;
   humanLogin: string | null;
   approvedLabel: string;
+  botAuthors: Set<string>;
+  botBranchPrefixes: string[];
+  botFixRounds: number;
   epicLabels: Set<string>;
   pollMs: number;
   jobsFile: string;
@@ -139,6 +142,8 @@ export interface ForgeEvent extends BaseEvent {
   issue: IssueInfo;
   pull_request?: PullRequestRef;
   ci?: CiInfo;
+  /** A pull request of a dependency bot (BOT_AUTHORS): there is no ticket, `issue` carries the pull request's own number, title and text. */
+  bot?: boolean;
   epic?: { children: { number: number; title: string }[] };
   base_sha?: string;
   /** The changed files that match the deny list of the merge policy (security review runs only). */
