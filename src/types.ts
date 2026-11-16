@@ -83,6 +83,9 @@ export interface DirectConfig extends BaseConfig {
   quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
+  remindAfterDays: number;
+  remindMax: number;
+  staleLabel: string | null;
   humanLogin: string | null;
   approvedLabel: string;
   botAuthors: Set<string>;

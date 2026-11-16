@@ -2,6 +2,7 @@ import { buildPrompt } from './prompt.ts';
 import { forgejoCall } from '../forgejo/client.ts';
 import { Merger, WIP } from '../forgejo/merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
+import { Reminder } from './remind.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
@@ -34,6 +35,7 @@ export class Dispatcher {
   timer: NodeJS.Timeout | undefined;
   merger: Merger;
   dry: DryLog;
+  reminder: Reminder;
   lastArchive = 0;
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
@@ -49,6 +51,7 @@ export class Dispatcher {
     this.merger = new Merger(config, send, logger, undefined, this.dry);
     this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
+    this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
   }
 
   // The ledger key of the work on an issue; a dependency bot's pull request has no issue and is kept per pull request ("repo!pr<n>").
@@ -584,6 +587,7 @@ export class Dispatcher {
     }
     if (await this.refreshMoved(now)) changed = true;
     if (await this.archiveOld(now)) changed = true;
+    if (await this.reminder.run(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
   }
 
