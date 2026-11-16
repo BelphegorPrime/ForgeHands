@@ -11,11 +11,14 @@ export class Merger {
   config: DirectConfig;
   send: Fetch;
   logger: Logger;
+  later: (run: () => void, ms: number) => void;
 
-  constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console) {
+  constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
+    later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }) {
     this.config = config;
     this.send = send;
     this.logger = logger;
+    this.later = later;
   }
 
   call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
@@ -41,7 +44,7 @@ export class Merger {
   }
 
   // Returns the outcome as a status string; nothing here throws.
-  async handle(event: ForgeEvent): Promise<string> {
+  async handle(event: ForgeEvent, regraced = false): Promise<string> {
     const repository = event.repository.full_name;
     const policy = this.config.mergePolicy.get(repository.toLowerCase());
     if (!policy || !this.config.forgejo) return 'no_merge_policy';
@@ -56,6 +59,12 @@ export class Merger {
       if (labels.includes(this.config.blockedLabel)) return 'blocked';
       // The approval label is a claim; the review comment is the proof. Without a verdict for this very commit nothing is merged.
       const review = await this.reviewOf(repository, number, sha);
+      // The reviewer sometimes sets the label a moment before it posts the verdict comment. A label that arrives first is looked at
+      // once more after a short wait, instead of being taken off at once (the wait does not hold the webhook delivery).
+      if (!review.ok && review.reason === 'none' && !regraced && this.config.approvalGraceMs > 0) {
+        this.later(() => { this.handle(event, true).catch((error) => this.logger.error('late approval check failed:', error.message)); }, this.config.approvalGraceMs);
+        return 'awaiting_review';
+      }
       if (!review.ok) {
         await this.rejectApproval(repository, number, sha, review.reason);
         return 'no_valid_review';
