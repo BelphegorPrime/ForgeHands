@@ -179,6 +179,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // A merge needs a review comment for the current commit: it says "Verdict: OK" within its first 300 characters and has at least this
     // many characters (evidence, not a one-liner). A label alone is not a review.
     minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),
+    // An approval label without a verdict comment is checked again after this many seconds before it is taken off; 0 takes it off at once.
+    approvalGraceMs: env.APPROVAL_GRACE_SECONDS === '0' ? 0 : positiveInt(env.APPROVAL_GRACE_SECONDS, 90, 'APPROVAL_GRACE_SECONDS', 3600) * 1000,
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his

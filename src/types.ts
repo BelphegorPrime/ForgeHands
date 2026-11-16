@@ -64,6 +64,7 @@ export interface DirectConfig extends BaseConfig {
   branchUpdateDelayMs: number;
   branchUpdateMinIntervalMs: number;
   minReviewChars: number;
+  approvalGraceMs: number;
   archiveAfterDays: number;
   humanLogin: string | null;
   approvedLabel: string;

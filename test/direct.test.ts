@@ -717,10 +717,10 @@ const goodRoutes = (over = {}) => ({
   ['PATCH ' + API + '/pulls/34']: {}, ['POST ' + API + '/pulls/34/merge']: {}, ['POST ' + API + '/issues/34/comments']: {}, ['PATCH ' + API + '/issues/26']: {},
   ...over
 });
-async function mergerFor(routes, extra) {
-  const config = loadConfig(env(withMerge(extra)));
+async function mergerFor(routes, extra, later) {
+  const config = loadConfig(env(withMerge({ APPROVAL_GRACE_SECONDS: '0', ...extra })));
   const forgejo = fakeForgejo(routes);
-  return { config, forgejo, merger: new Merger(config, forgejo.send, quiet) };
+  return { config, forgejo, merger: new Merger(config, forgejo.send, quiet, later) };
 }
 const approvedEvent = () => ({ repository: { full_name: repo }, pull_request: { number: 34, head_ref: 'ai/issue-26' }, issue: { number: 26 } });
 
@@ -1549,6 +1549,25 @@ test('an approval without a review comment is not trusted: nothing is merged, th
   assert.match(text, /^@marcel ForgeHands: the label ai:approved was set, but there is no review comment for commit cafe0000 that starts with "Verdict: OK"/);
   assert.match(text, /The approval is not trusted and was taken off/);
   assert.ok(!forgejo.wrote().includes('POST /pulls/34/merge'));
+});
+
+test('an approval label that arrives before the verdict comment is checked again after the grace time, not taken off at once', async () => {
+  const timers = [];
+  const later = (run, ms) => timers.push({ run, ms });
+  const routes = goodRoutes({ ...commentsRoute([]), ...blockRoutes });
+  const waiting = await mergerFor(routes, { APPROVAL_GRACE_SECONDS: '90', HUMAN_LOGIN: 'marcel' }, later);
+  assert.equal(await waiting.merger.handle(approvedEvent()), 'awaiting_review');
+  assert.deepEqual(waiting.forgejo.wrote(), [], 'nothing is touched while waiting');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 90000);
+  // The verdict arrived meanwhile: the second look merges.
+  const merged = await mergerFor(goodRoutes(commentsRoute([verdict(VERDICT_OK, '2026-11-15T11:00:00Z')])), { APPROVAL_GRACE_SECONDS: '90' }, later);
+  assert.equal(await merged.merger.handle(approvedEvent(), true), 'merged');
+  // Still no verdict at the second look: the approval is taken off as before, and there is no third wait.
+  const still = await mergerFor(routes, { APPROVAL_GRACE_SECONDS: '90', HUMAN_LOGIN: 'marcel' }, later);
+  assert.equal(await still.merger.handle(approvedEvent(), true), 'no_valid_review');
+  assert.equal(timers.length, 1);
+  assert.throws(() => loadConfig(env(withMerge({ APPROVAL_GRACE_SECONDS: '-1' }))), /APPROVAL_GRACE_SECONDS/);
 });
 
 test('what does not count as a review: too short, no verdict line, a verdict deep in the text, older than the commit', async () => {
