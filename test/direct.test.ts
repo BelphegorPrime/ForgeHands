@@ -31,6 +31,7 @@ const env = (extra = {}) => ({
     'ai:escalate': { profile: ESCALATE, tier: 'strong' }
   }),
   MAX_CONCURRENT_PER_TIER: '2',
+  ERROR_RETRIES: '0',
   AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
   FORGEJO_TOKEN: 'tok-secret-value',
   FORGEJO_URL: 'https://forge.example',
@@ -64,7 +65,7 @@ const event = (label, number = 1, extra = {}) => ({
   issue: { number, title: 'T', body: 'B', html_url: 'https://forge.example/owner/hello/issues/' + number, labels: [label] },
   sender: { login: 'marcel' }, ...extra
 });
-const starts = () => calls.filter((c) => c.method === 'POST');
+const starts = () => calls.filter((c) => c.method === 'POST' && c.path.startsWith('/api/conversations'));
 
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-direct-')); clock = 1_000_000; calls = []; states = {}; costs = {}; failStarts = false; });
 afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })); // background saves may still be writing
@@ -498,6 +499,68 @@ test('an action of the human on the pull request starts the rounds again and lif
   assert.equal((await dispatcher.enqueue(agent('Marcel'))).status, 'queued', 'the human starts a fresh budget');
   assert.ok(forgejo.some((call) => call.method === 'DELETE' && call.path === '/api/v1/repos/owner/hello/issues/34/labels/9'), 'the block comes off');
   assert.equal(dispatcher.rounds(prEvent()), 1, 'only the new round counts');
+});
+
+async function buildWatched(extra) {
+  const forgejo = [];
+  const config = loadConfig(env(withChanges({ HUMAN_LOGIN: 'marcel', ...extra, LABEL_ROUTES: JSON.stringify({
+    'ai:plan': { profile: PLANNER, tier: 'strong' }, 'ai:ready': { profile: WORKER, tier: 'free' },
+    'ai:changes': { profile: CHANGES, tier: 'free', max_iterations: 90, on: 'pull_request' } }) })));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const send = async (url, request) => {
+    if (!String(url).startsWith('https://forge.example/')) return api(url, request);
+    const path = new URL(url).pathname.replace('/api/v1/repos/owner/hello', '');
+    forgejo.push({ method: request.method, path, body: request.body && JSON.parse(request.body) });
+    const labels = path.endsWith('/labels') && request.method === 'GET' && path !== '/labels' ? [{ id: 3, name: 'ai:ready' }] : request.method === 'GET' ? [{ id: 8, name: 'ai:plan' }, { id: 9, name: 'ai:blocked' }] : { id: 77 };
+    return { ok: true, status: 200, json: async () => labels };
+  };
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  const finish = async (state) => { await dispatcher.tick(); states[jobs.list().at(-1).conversation_id] = state; await dispatcher.tick(); };
+  return { forgejo, jobs, dispatcher, finish, comments: () => forgejo.filter((c) => c.method === 'POST' && c.path.endsWith('/comments')).map((c) => c.body.body) };
+}
+
+test('a run that ends with an error is started once more after a pause; a second error is reported to the human on the issue', async () => {
+  const { jobs, dispatcher, finish, comments } = await buildWatched({ ERROR_RETRIES: '1' });
+  await dispatcher.enqueue(event('ai:ready', 26));
+  await finish('error');
+  const job = jobs.list()[0];
+  assert.equal(job.status, 'queued');
+  assert.equal(job.error_retry, 1);
+  assert.equal(job.next_try, clock + 60000);
+  assert.deepEqual(comments(), [], 'nobody is called for the first error');
+  clock += 61000;
+  await finish('error');
+  assert.equal(jobs.list()[0].status, 'failed');
+  assert.match(comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "error"\. A human has to look at it\./);
+});
+
+test('a failed round on a pull request marks it for the human; a review run leaves that to the verdict check', async () => {
+  const { dispatcher, finish, comments, forgejo } = await buildWatched();
+  await dispatcher.enqueue(prEvent());
+  await finish('error');
+  assert.match(comments()[0], /^@marcel ForgeHands: the run for ai:changes on pull request #34 ended with "error"/);
+  assert.ok(forgejo.some((c) => c.method === 'POST' && c.path === '/issues/34/labels'), 'blocked label set');
+});
+
+test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to the planner; without it a human is called', async () => {
+  const split = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  await split.dispatcher.enqueue(event('ai:ready', 57));
+  await split.finish('paused');
+  assert.match(split.comments()[0], /^ForgeHands: the run for ai:ready ended with "paused", so the ticket is probably too big/);
+  assert.ok(split.forgejo.some((c) => c.method === 'DELETE' && c.path === '/issues/57/labels/3'), 'the worker label comes off');
+  assert.ok(split.forgejo.some((c) => c.method === 'POST' && c.path === '/issues/57/labels' && c.body.labels[0] === 8), 'the planner label goes on');
+  const plain = await buildWatched();
+  await plain.dispatcher.enqueue(event('ai:ready', 58));
+  await plain.finish('paused');
+  assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "paused"\. A human/);
+  assert.ok(!plain.forgejo.some((c) => c.method === 'DELETE'));
+  const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  await planner.dispatcher.enqueue(event('ai:plan', 59));
+  await planner.finish('stuck');
+  assert.match(planner.comments()[0], /^@marcel/, 'the planner itself is never sent to the planner');
+  assert.throws(() => loadConfig(env({ ERROR_RETRIES: '-1' })), /ERROR_RETRIES/);
 });
 
 test('rounds are limited per issue; the pull request is told and marked when they are used up', async () => {
