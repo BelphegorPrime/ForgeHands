@@ -70,6 +70,20 @@ function parseRoutes(text: string): Map<string, Route> {
 
 // MERGE_POLICY: {"owner/repo": {"deny": ["stacks/**", "compose.yaml"]}}. Only the repositories named here are merged by ForgeHands,
 // and only when none of the changed files matches a deny pattern. A repository without an entry is never merged automatically.
+// `two_keys` of a MERGE_POLICY entry: patterns inside the deny list that merge with an independent security review instead of a human.
+// Each one, taken as a literal path (wildcards become `x`), must match a deny pattern, otherwise it could never apply.
+function parseTwoKeys(name: string, value: unknown, deny: string[]): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((glob: unknown) => typeof glob !== 'string' || !glob.trim())) throw new Error('MERGE_POLICY: two_keys of ' + name + ' must be a list of patterns');
+  if (!deny.length && value.length) throw new Error('MERGE_POLICY: two_keys of ' + name + ' needs a deny list');
+  const denyRules = deny.map(globToRegExp);
+  for (const glob of value as string[]) {
+    const literal = glob.replace(/\*+/g, 'x').replace(/\?/g, 'x');
+    if (!denyRules.some((rule) => rule.test(literal))) throw new Error('MERGE_POLICY: two_keys pattern ' + glob + ' of ' + name + ' is not covered by a deny pattern');
+  }
+  return [...value as string[]];
+}
+
 function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
   const policy = new Map<string, MergeRule>();
   if (!text) return policy;
@@ -85,7 +99,9 @@ function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
     if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons) || Object.entries(reasons).some(([pattern, reason]) => !deny.includes(pattern) || typeof reason !== 'string' || !reason.trim())) {
       throw new Error('MERGE_POLICY: reasons of ' + name + ' must map patterns of its deny list to a text');
     }
-    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp), patterns: [...deny], reasons: deny.map((pattern: string) => (reasons as Record<string, string>)[pattern]?.trim() || null) });
+    const twoKeys = parseTwoKeys(name, rule?.two_keys, deny);
+    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp), patterns: [...deny], reasons: deny.map((pattern: string) => (reasons as Record<string, string>)[pattern]?.trim() || null),
+      twoKeys: twoKeys.map(globToRegExp), twoKeyPatterns: twoKeys });
   }
   return policy;
 }
@@ -102,6 +118,11 @@ function remindDays(value: string | undefined): number {
   const days = Number(value);
   if (!Number.isInteger(days) || days < 0 || days > 365) throw new Error('REMIND_AFTER_DAYS must be an integer between 0 and 365');
   return days;
+}
+
+function parseLogins(value: string | undefined): Set<string> | null {
+  const logins = (value || '').split(',').map((login) => login.trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
+  return logins.length ? new Set(logins) : null;
 }
 
 function parseHumanLogin(value: string | undefined): string | null {
@@ -239,6 +260,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const mergeMethod = env.MERGE_METHOD || 'merge';
   if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
   if (mergePolicy.size && !(forgeUrl && forgeToken)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN (or FORGE_URL and FORGE_TOKEN)');
+  if ([...mergePolicy.values()].some((rule) => rule.twoKeys.length) && !parseLogins(env.SECURITY_REVIEWERS)) throw new Error('MERGE_POLICY two_keys needs SECURITY_REVIEWERS: the logins whose security review comment counts as the second key (a user the worker does not control)');
   if (remindDays(env.REMIND_AFTER_DAYS) && !(forgeUrl && forgeToken && parseHumanLogin(env.HUMAN_LOGIN))) throw new Error('REMIND_AFTER_DAYS needs FORGEJO_URL, FORGEJO_TOKEN and HUMAN_LOGIN (or FORGE_URL and FORGE_TOKEN)');
   return {
     ...common,
@@ -293,6 +315,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
+    // Whose security review comments count (comma separated logins, case-insensitive). Empty: the comment of anybody counts, which is fine for
+    // the advisory display but not for two_keys, so two_keys needs it: the second key must be a user the author of the pull request does not control.
+    securityReviewers: parseLogins(env.SECURITY_REVIEWERS),
     // Once a day, remind HUMAN_LOGIN of agent pull requests that wait for him (marked blocked, approved on a protected path, untouched):
     // after this many days, then at most once per this many days and REMIND_MAX times per pull request; 0 (default) switches it off.
     // STALE_LABEL is added after the last reminder.
