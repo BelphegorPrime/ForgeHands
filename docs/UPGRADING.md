@@ -70,3 +70,12 @@ A repository that has no workflow file never produces a CI run, so until now the
 - **Merge.** `MERGE_POLICY` merges a pull request of such a repository on the approved review alone; the merge comment says `there is no CI in this repository` instead of `CI green`. Nothing is merged without `MERGE_POLICY` for the repository, as before.
 - **Not covered.** GitLab (the switch has no effect there).
 - **Rollback.** Set `REVIEW_WITHOUT_CI=0` (or go back to 0.4.9: it ignores the variable and never starts such a review).
+
+# Upgrading to 0.4.11: a comment restarts a failed run
+
+A comment of the operator (`HUMAN_LOGIN`) on an issue whose last run failed, or was handed to him, starts that run again, with the same label, and the run reads the comment. Until now such a run stayed failed until its label was taken off and put on again. README "Comments and earlier work" describes the rules.
+
+- **The hook must deliver `issue_comment`.** Add the **Issue comment** event to the webhook of each allowed repository (Forgejo and Gitea). The reference installation's hooks already do. Without the event nothing changes.
+- **Switches.** The feature needs `HUMAN_LOGIN`, which is off without it. `COMMENT_RESTARTS` (default `2`) caps the restarts per issue and label; `COMMENT_RESTARTS=0` switches the feature off. Any other value than an integer from 0 to 100 stops the start with `COMMENT_RESTARTS must be an integer between 0 and 100`.
+- **What changes without a switch.** Nothing else. A comment on a pull request, an edited or deleted comment, and a comment of anybody else are ignored as before. The ledger gains a `dedupe` section (the ids of comments that restarted a run, and the notices sent); 0.4.10 ignores it.
+- **Rollback.** Go back to 0.4.10: it ignores `issue_comment` events and the new ledger section, so comments no longer restart runs.

@@ -249,6 +249,72 @@ export class Dispatcher {
     return (await this.enqueueOne({ ...event, label: this.config.changesLabel })).status;
   }
 
+  // A comment of HUMAN_LOGIN on an open issue starts the last run of that issue again when that run failed or was handed to the human. The label of
+  // that run starts again exactly as if it had just been added (enqueueOne: quota fallback, tiers, same-files and dependency waits all apply). Only
+  // the latest run of the issue counts, and only when no run of it is active and the label is still on the issue. At most COMMENT_RESTARTS
+  // restarts per issue and label; then one notice on the issue and nothing more. A comment starts at most one run (its id is kept in the ledger).
+  async onComment(event: ForgeEvent): Promise<string> {
+    const human = this.config.humanLogin?.toLowerCase();
+    if (!human || !this.config.commentRestarts || !event.comment) return 'comment_restarts_off';
+    if (String(event.comment.login || '').toLowerCase() !== human) return 'not_the_human';
+    if (!this.config.forgejo) return 'no_forgejo_access';
+    const repository = event.repository.full_name;
+    const ticket = this.issueKey(event);
+    const commentKey = 'comment:' + ticket + '#' + event.comment.id;
+    if (this.jobs.noted(commentKey)) return 'duplicate_comment';
+    // The runs of the issue itself: a worker or planner label (kind issue). Round, review and epic runs are not restarted by a comment.
+    const runs = this.jobs.list().filter((job) => job.key.startsWith(ticket + ':') && this.config.routes.get(job.label)?.kind === 'issue');
+    if (runs.some((job) => ACTIVE_STATUSES.has(job.status))) return 'run_active';
+    const latest = runs.at(-1);
+    // The run that ended last must have failed (any result) or been handed to the human; a run that is done says nothing to a comment.
+    if (!latest || (latest.status !== 'failed' && !latest.blocked_at)) return 'no_failed_run';
+    // Only now the forge is asked: the issue must be open and still carry the label of that run.
+    let issue: Json;
+    try {
+      issue = await this.forge.getIssue(repository, event.issue.number);
+    } catch (error) {
+      this.logger.error('could not read #' + event.issue.number + ' after a comment:', error.message);
+      return 'issue_unreadable';
+    }
+    if (!issue || issue.state !== 'open' || issue.pull_request) return 'not_open';
+    const labels: string[] = (Array.isArray(issue.labels) ? issue.labels : []).map((label: Json) => label?.name).filter((name: unknown): name is string => typeof name === 'string');
+    const label = latest.label;
+    if (!labels.includes(label)) return 'label_gone';
+    const now = this.now();
+    const restarts = runs.filter((job) => job.label === label && job.event?.comment).length;
+    if (restarts >= this.config.commentRestarts) {
+      const noticeKey = 'limit:' + ticket + ':' + label;
+      if (!this.jobs.noted(noticeKey)) {
+        try {
+          await this.commentLimit(event, label, restarts);
+        } catch (error) {
+          this.logger.error('could not write the notice of ' + ticket + ':', error.message);
+          return 'notice_failed';
+        }
+        this.jobs.note(noticeKey, now);
+      }
+      this.jobs.note(commentKey, now);
+      await this.jobs.persist(now);
+      return 'restarts_used_up';
+    }
+    const result = await this.enqueueOne({ ...event, type: 'issues.labeled', label, issue: { ...event.issue, labels } });
+    if (result.status !== 'queued' && result.status !== 'waiting') return result.status;
+    this.jobs.note(commentKey, now);
+    await this.jobs.persist(now);
+    metrics.inc('forgehands_comment_restarts_total');
+    this.logger.error(repository + '#' + event.issue.number + ': ' + event.comment.login + ' commented, running ' + label + ' again');
+    return result.status;
+  }
+
+  // The notice that COMMENT_RESTARTS is used up: one comment on the issue, with the hand-over mention rules (HUMAN_MENTION) and a notification.
+  async commentLimit(event: ForgeEvent, label: string, restarts: number): Promise<void> {
+    metrics.inc('forgehands_blocks_total', { reason: 'comment_restarts' });
+    this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
+    this.tell('blocked', event, { why: 'comment_restarts' });
+    await this.forge.addComment(event.repository.full_name, event.issue.number, mentionOf(this.config) + 'ForgeHands: ' + label + ' was started again by comments ' + restarts
+      + ' times already (COMMENT_RESTARTS=' + this.config.commentRestarts + '). Comments start no more runs of it; a human has to look at this issue.', 'issue');
+  }
+
   async enqueueOne(event: ForgeEvent): Promise<{ status: string }> {
     const label = this.pickLabel(event);
     if (!label) return { status: 'duplicate_job' };
