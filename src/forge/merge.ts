@@ -2,6 +2,10 @@ import { createForge, createTransport } from './index.ts';
 import { DryLog } from '../dry.ts';
 import { isBotPull } from './bot.ts';
 import { metrics } from '../metrics.ts';
+import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
+import { immediateMessage } from '../notify/texts.ts';
+import type { Facts } from '../notify/texts.ts';
+import type { Notify } from '../notify/index.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 import type { Forge } from './types.ts';
 
@@ -23,6 +27,8 @@ export class Merger {
   securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
   // Tells the ledger that ForgeHands merged a ticket or handed it to a human (ticket: "repo#issue" or "repo!pr<n>"); the dispatcher sets it, see Dispatcher.noteTicket.
   note: (ticket: string, fact: 'merged' | 'blocked') => void = () => {};
+  // Tells the human by a message of ForgeHands' own (src/notify); the dispatcher sets it. Off by default.
+  notifier: Notify = NO_NOTIFY;
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -52,9 +58,15 @@ export class Merger {
 
   // `human`: the comment hands the pull request to a human, so it mentions him (and is the only kind that does).
   async remark(repository: string, number: number, text: string, human = false): Promise<void> {
-    const mention = human && this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '';
+    const mention = human ? mentionOf(this.config) : '';
     try { await this.forge.addComment(repository, number, mention + 'ForgeHands: ' + text); }
     catch (error) { this.logger.error('could not comment on #' + number + ':', error.message); }
+  }
+
+  // The message for the human about this pull request (kind: handover, blocked, conflict, failed); nothing is built when the kind is not wanted.
+  tell(kind: string, repository: string, number: number, facts: Partial<Facts>, htmlUrl?: unknown): void {
+    if (!this.notifier.wants(kind)) return;
+    this.notifier.notify(immediateMessage(this.config.notify.language, kind, { repository, number, link: pullUrl(this.config, repository, number, htmlUrl), ...facts }), repository);
   }
 
   // Returns the outcome as a status string; nothing here throws.
@@ -87,7 +99,7 @@ export class Merger {
       }
       if (!review.ok) {
         this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'blocked');
-        await this.rejectApproval(repository, number, sha, review.reason);
+        await this.rejectApproval(repository, number, sha, review.reason, pr);
         return metrics.refused('no_valid_review');
       }
       const status = await this.forge.commitStatus(repository, sha);
@@ -109,12 +121,14 @@ export class Merger {
         if (this.hasSecurityRoute() && this.securityPending(repository, number, sha) && !(await this.securityReview(repository, number, sha))) return 'awaiting_security_review';
         if (!(await this.twoKeysHold(repository, number, sha, policy, protectedFiles))) {
           await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, current?.mergeable === false), true);
+          await this.tellHandOver(repository, number, sha, policy, protectedFiles, current);
           return metrics.refused('protected_paths');
         }
         twoKeys = true;
       }
       if (current?.mergeable === false) {
         await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.', true);
+        this.tell('conflict', repository, number, { title: current?.title }, current?.html_url);
         return metrics.refused('not_mergeable');
       }
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
@@ -131,6 +145,7 @@ export class Merger {
     } catch (error) {
       this.logger.error('auto-merge of ' + repository + '#' + number + ' failed:', error.message);
       await this.remark(repository, number, 'approved and green, but the merge failed (' + String(error.message).slice(0, 120) + '). A human has to look at this pull request.', true);
+      this.tell('failed', repository, number, { why: 'merge_failed' });
       return metrics.refused('merge_failed');
     }
   }
@@ -186,6 +201,24 @@ export class Merger {
       ...(security ? [security.trim()] : []),
       ...(qualified && this.hasSecurityRoute() ? [qualified] : []),
       ...(conflict ? [this.forge.agent(repository).name + ' reports a conflict with the default branch; a conflict round resolves it before the merge.'] : [])].join('\n\n');
+  }
+
+  // The hand-over of a protected-path pull request as a message: the reason of the policy for the matching patterns (else the message says
+  // that protected paths are touched), how many files, and what the security review found. Best effort, never throws.
+  async tellHandOver(repository: string, number: number, sha: string, policy: { patterns: string[]; deny: RegExp[]; reasons: (string | null)[] }, files: string[], pr: Json): Promise<void> {
+    if (!this.notifier.wants('handover')) return;
+    try {
+      const unique = [...new Set(files)];
+      const reasons = [...new Set(unique.map((file) => policy.reasons[policy.deny.findIndex((pattern) => pattern.test(file))]).filter((reason): reason is string => Boolean(reason)))];
+      let security: Facts['security'] = 'none';
+      if (this.hasSecurityRoute()) {
+        const verdict = await this.securityReview(repository, number, sha).catch(() => null);
+        security = verdict === 'OK' ? 'ok' : verdict === 'CONCERNS' ? 'concerns' : 'none';
+      }
+      this.tell('handover', repository, number, { title: pr?.title, files: unique.length, reason: reasons.join('; '), security }, pr?.html_url);
+    } catch (error) {
+      this.logger.error('could not build the notification of #' + number + ':', error.message);
+    }
   }
 
   // One sentence for the comment that hands a protected-path pull request to the human. Empty without a security review route.
@@ -277,7 +310,7 @@ export class Merger {
     return repository.toLowerCase() + (agentBranch === null ? '!pr' + number : '#' + /^ai\/issue-(\d+)$/.exec(agentBranch)![1]);
   }
 
-  async rejectApproval(repository: string, number: number, sha: string, reason?: string): Promise<void> {
+  async rejectApproval(repository: string, number: number, sha: string, reason?: string, pr?: Json): Promise<void> {
     metrics.inc('forgehands_blocks_total', { reason: 'approval_not_trusted' });
     const event = { repository: { full_name: repository }, pull_request: { number } };
     await this.clearApproval(event);
@@ -287,6 +320,7 @@ export class Merger {
       : this.config.verdictSource === 'review' ? 'there is no approving review for commit ' + sha.slice(0, 8)
       : 'there is no review comment for commit ' + sha.slice(0, 8) + ' that starts with \"Verdict: OK\" and holds evidence (at least ' + this.config.minReviewChars + ' characters)';
     await this.remark(repository, number, 'the label ' + this.config.approvedLabel + ' was set, but ' + what + '. The approval is not trusted and was taken off. A human has to look at this pull request, or push a commit to run the review again.', true);
+    this.tell('blocked', repository, number, { why: 'approval_not_trusted', title: pr?.title }, pr?.html_url);
     try {
       const label = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
       await this.forge.addLabels(repository, number, [label]);

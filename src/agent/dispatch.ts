@@ -4,6 +4,10 @@ import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from '../forge/merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
+import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
+import { collectDigest, digestDue } from '../notify/digest.ts';
+import { digestMessage, immediateMessage } from '../notify/texts.ts';
+import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
@@ -46,6 +50,9 @@ export class Dispatcher {
   transport: ReturnType<typeof createTransport>;
   dry: DryLog;
   reminder: Reminder;
+  notifier: Notifier;
+  /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
+  digestDone: string | undefined;
   lastArchive = 0;
   /** Earliest time of the next look for closed issues (sweepClosed) and when each ticket was last found open. */
   nextClosedSweep = 0;
@@ -55,7 +62,7 @@ export class Dispatcher {
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
 
-  constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now) {
+  constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
     this.send = send;
@@ -67,7 +74,10 @@ export class Dispatcher {
     this.merger = new Merger(config, send, logger, undefined, this.dry);
     this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
+    this.notifier = notifier ?? Notifier.fromConfig(config, send, logger);
+    this.merger.notifier = this.notifier;
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
+    this.reminder.notifier = this.notifier;
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -538,19 +548,49 @@ export class Dispatcher {
   }
 
   // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
-  async markForHuman(event: ForgeEvent, text: string, reason = 'other'): Promise<void> {
+  async markForHuman(event: ForgeEvent, text: string, reason = 'other', facts: Partial<Facts> = {}): Promise<void> {
     metrics.inc('forgehands_blocks_total', { reason });
     this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
+    this.tell(reason === 'conflict' ? 'conflict' : reason === 'failed_run' ? 'failed' : 'blocked', event, { why: reason, ...facts });
     if (!this.config.forgejo) return;
     const { number } = event.pull_request!;
     const repository = event.repository.full_name;
     try {
-      await this.forge.addComment(repository, number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + text);
+      await this.forge.addComment(repository, number, mentionOf(this.config) + text);
       const label = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
       await this.forge.addLabels(repository, number, [label]);
     } catch (error) {
       this.logger.error('could not mark the pull request:', error.message);
     }
+  }
+
+  // A message for the human about the pull request (or, without one, the issue) of this event: kind handover, blocked, conflict or failed.
+  tell(kind: string, event: ForgeEvent, facts: Partial<Facts> = {}): void {
+    if (!this.notifier.wants(kind)) return;
+    const repository = event.repository.full_name;
+    const number = event.pull_request?.number ?? event.issue.number;
+    const link = event.pull_request ? pullUrl(this.config, repository, number, event.pull_request.html_url) : event.issue.html_url;
+    this.notifier.notify(immediateMessage(this.config.notify.language, kind, { repository, number, title: event.issue.title, link: link ?? undefined, ...facts }), repository);
+  }
+
+  // Once a day, at NOTIFY_DIGEST in NOTIFY_TIMEZONE (the first pass after that time), one message with what is for the human; none when there is
+  // nothing. The date of the last one is kept in the ledger, so a restart neither repeats the day nor skips it. A dry run keeps it in memory only.
+  async sendDigest(now: number): Promise<boolean> {
+    const { digest, timezone, language } = this.config.notify;
+    if (!digest || !this.notifier.wants('digest')) return false;
+    const dry = isDry(this.config);
+    const { due, date } = digestDue(digest, timezone, now, dry ? this.digestDone : this.jobs.meta.digest_sent);
+    if (!due) return false;
+    try {
+      const message = digestMessage(language, collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now), this.config.allowedRepos.size > 1);
+      if (message) this.notifier.notify(message);
+    } catch (error) {
+      this.logger.error('could not build the digest:', error.message);
+      return false;
+    }
+    if (dry) { this.digestDone = date; return false; }
+    this.jobs.meta.digest_sent = date;
+    return true;
   }
 
   // How long (ms) until the quota is back, when the run ended with a rate limit error; null for any other failure.
@@ -731,6 +771,7 @@ export class Dispatcher {
     if (await this.archiveOld(now)) changed = true;
     if (await this.sweepClosed(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
+    if (await this.sendDigest(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
   }
 
@@ -1269,8 +1310,11 @@ export class Dispatcher {
         return;
       }
       const text = what + '. A human has to look at it.';
-      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run');
-      else await this.forge.addComment(event.repository.full_name, event.issue.number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text, 'issue');
+      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run', { why: state });
+      else {
+        this.tell('failed', event, { why: state });
+        await this.forge.addComment(event.repository.full_name, event.issue.number, mentionOf(this.config) + 'ForgeHands: ' + text, 'issue');
+      }
     } catch (error) {
       this.logger.error('could not report the failure of ' + job.key + ':', error.message);
     }

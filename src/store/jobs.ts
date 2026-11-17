@@ -14,6 +14,8 @@ export class JobStore {
   file: string;
   jobs = new Map<string, Job>();
   labels = new Map<string, SeenLabels>(); // repo#issue -> { labels, seen }: the labels seen on the last event of an issue
+  /** Small facts that must outlive a restart and belong to no job: the date of the last digest (`digest_sent`, YYYY-MM-DD in NOTIFY_TIMEZONE). */
+  meta: { digest_sent?: string } = {};
   writes: Promise<void> = Promise.resolve();
 
   constructor(file: string) {
@@ -25,6 +27,7 @@ export class JobStore {
       const jobs = content?.jobs;
       if (!Array.isArray(jobs)) throw Error('Invalid job store');
       for (const job of jobs) if (job && job.id) this.jobs.set(job.id, job);
+      if (typeof content?.meta?.digest_sent === 'string') this.meta.digest_sent = content.meta.digest_sent;
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
       }
@@ -86,7 +89,7 @@ export class JobStore {
       for (const [key, value] of this.labels) if (value.seen < now - KEEP_MS) this.labels.delete(key);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels) }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;

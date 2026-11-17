@@ -3,6 +3,9 @@ import { Merger } from '../forge/merge.ts';
 import { isBotPull } from '../forge/bot.ts';
 import { DryLog } from '../dry.ts';
 import { metrics } from '../metrics.ts';
+import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
+import type { Notify } from '../notify/index.ts';
+import { immediateMessage } from '../notify/texts.ts';
 import type { DirectConfig, Fetch, Json, Logger } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
@@ -34,6 +37,8 @@ export class Reminder {
   forge: Forge;
   transport: ReturnType<typeof createTransport>;
   last = 0;
+  // Tells the human by a message of ForgeHands' own (src/notify); the dispatcher sets it. Off by default.
+  notifier: Notify = NO_NOTIFY;
   waiting = new Map<string, Waiting>(); // repository#pr -> what waits for the human (shown by /status)
 
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch, logger: Logger, merger: Merger, dry: DryLog = new DryLog(logger)) {
@@ -136,11 +141,15 @@ export class Reminder {
         if (human && now - human < days * DAY_MS) continue;
         if (now - (newest(own) || Date.parse(pr.updated_at) || 0) < days * DAY_MS) continue;
         const number = streak.length + 1;
-        const text = '@' + humanLogin + ' ForgeHands: reminder ' + number + ' of ' + max + ': this pull request has been waiting for you since '
+        const text = mentionOf(this.config) + 'ForgeHands: reminder ' + number + ' of ' + max + ': this pull request has been waiting for you since '
           + new Date(since).toISOString().slice(0, 10) + ' (' + reason + ').' + (number >= max ? ' This is the last reminder.' : '');
         await this.forge.addComment(repository, pr.number, text);
         written += 1;
         metrics.inc('forgehands_reminders_total');
+        if (this.notifier.wants('reminder')) {
+          this.notifier.notify(immediateMessage(this.config.notify.language, 'reminder', { repository, number: pr.number, title: pr.title, link: pullUrl(this.config, repository, pr.number, pr.html_url),
+            days: Math.floor((now - since) / DAY_MS), nth: number, of: max }), repository);
+        }
         if (number >= max && this.config.staleLabel) await this.addLabel(repository, pr.number, this.config.staleLabel);
       } catch (error) {
         this.logger.error('could not remind of #' + pr.number + ':', error.message);
