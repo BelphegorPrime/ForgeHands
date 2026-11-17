@@ -1,11 +1,11 @@
 import { DryLog } from '../dry.ts';
-import { GiteaForge, giteaAgentApi } from './gitea.ts';
-import { ForgejoForge, forgejoAgentApi, forgejoTransport } from './forgejo.ts';
-import { GitlabForge, gitlabAgentApi, gitlabTransport } from './gitlab.ts';
+import { GiteaForge, giteaAgentApi } from './gitea/index.ts';
+import { ForgejoForge, forgejoAgentApi, forgejoTransport } from './forgejo/index.ts';
+import { GitlabForge, gitlabAgentApi, gitlabTransport } from './gitlab/index.ts';
 import type { Config, Fetch, ForgejoAccess } from '../types.ts';
-import type { AgentApi, Forge, ForgeKind, Transport } from './types.ts';
+import type { AgentApi, Forge, ForgeKind, Transport } from '../types/forge.ts';
 
-export type { Forge, ForgeKind, Transport } from './types.ts';
+export type { Forge, ForgeKind, Transport } from '../types/forge.ts';
 
 export const FORGES: readonly ForgeKind[] = ['forgejo', 'gitea', 'gitlab'];
 

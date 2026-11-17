@@ -26,26 +26,26 @@ The gate sits in the transport (`src/forge/index.ts`, `src/dry.ts`), below the f
 
 ## The forge interface
 
-ForgeHands talks to a forge through one interface, `Forge` in `src/forge/types.ts`. The dispatcher, the merger, the reminders and the prompts use only that interface and never branch on the forge. It has two halves:
+ForgeHands talks to a forge through one interface, `Forge` in `src/types/forge.ts`. The dispatcher, the merger, the reminders and the prompts use only that interface and never branch on the forge. It has two halves:
 
 - **Webhooks in**: `webhookPath`, `verifyWebhook`, `eventName`, `deliveryId` and `normalizeEvent`, which turns a delivery into the one internal event shape (`issues.labeled`, `ci.failure`, `pull_request.review_approved`, a push, ...).
 - **Operations out**: pull requests (`getPull`, `listPulls`, `pullFiles`, `compare`, `updateBranch`, `mergePull`, the work-in-progress title helpers), reviews (`listReviews`, `listReviewComments`, `submitReview`), commits (`commitStatus`, `commitTime`, `branchTip`), issues (`getIssue`, `closeIssue`, `dependencies`, `blocks`) and comments and labels. Each maps the forge's answer into the shapes of that file (`PullRequest`, `CommitStatus`, `Review`, ...). `agent(repository)` returns the API paths the prompts give the agent.
 
 Every call goes through a `Transport`, one function per request. DRY_RUN stops writes there and API errors are counted there, so an implementation cannot write around either.
 
-Existing implementations: `src/forge/forgejo.ts`, `src/forge/gitea.ts` (a variant of Forgejo's: only the webhook differs, plus `src/webhook/gitea.ts`) and `src/forge/gitlab.ts` (its own, plus `src/webhook/gitlab.ts`). Read the closest one first.
+Existing implementations: `src/forge/forgejo/`, `src/forge/gitea/` (a variant of Forgejo's: only the webhook differs) and `src/forge/gitlab/` (its own). Read the closest one first.
 
 ### Adding a forge
 
-1. Add the name to `ForgeKind` in `src/forge/types.ts` and to `FORGES` in `src/forge/index.ts`. `FORGE` is validated against that list in `src/config.ts`.
-2. Write the implementation in `src/forge/<name>.ts`: a class that implements `Forge` (or extends the closest forge), its `AgentApi` paths, and, if the HTTP call differs (another auth header, another base path), its own transport that keeps the dry-run gate and the error counter. Map forge terms to the internal ones (GitLab's merge request is a `PullRequest`, a pipeline a `CommitStatus`).
-3. Write the webhook normalizer in `src/webhook/<name>.ts` if the payloads differ. Verify the signature or token in constant time, accept only the repositories of `ALLOWED_REPOS`, and never let a fork's branch count as an agent branch.
+1. Add the name to `ForgeKind` in `src/types/forge.ts` and to `FORGES` in `src/forge/index.ts`. `FORGE` is validated against that list in `src/config.ts`.
+2. Write the implementation in `src/forge/<name>/index.ts`: a class that implements `Forge` (or extends the closest forge), its `AgentApi` paths, and, if the HTTP call differs (another auth header, another base path), its own transport that keeps the dry-run gate and the error counter. Map forge terms to the internal ones (GitLab's merge request is a `PullRequest`, a pipeline a `CommitStatus`).
+3. Write the webhook normalizer in `src/forge/<name>/webhook.ts` if the payloads differ. Verify the signature or token in constant time, accept only the repositories of `ALLOWED_REPOS`, and never let a fork's branch count as an agent branch.
 4. Wire it in `createTransport`, `createForge` and `agentApi` in `src/forge/index.ts`.
 5. Add the event names the forge sends to `WEBHOOK_EVENTS` in `src/metrics.ts` (an unknown header value is counted as `other`, to keep the labels bounded).
 6. Write `test/<name>.test.ts` with fixture payloads for every event, calls per path, the signature check, and the dry run gate; see `test/gitea.test.ts` and `test/gitlab.test.ts`, and the fake forge in `test/forge.test.ts`.
 7. Document it in the README: a "<Name> setup" section (token, webhook and its events, what works and what does not), the row of "What works where", and the `FORGE` value in the Configuration table.
 
-If the interface itself has to change (GitLab needed a `Subject` because it numbers issues and merge requests apart), change it for all implementations in the same pull request and keep the prompts of the other forges byte-identical.
+If the interface itself has to change (GitLab needed a `Subject` because it numbers issues and merge requests apart), change it for all implementations in `src/types/forge.ts` in the same pull request and keep the prompts of the other forges byte-identical.
 
 ## Reporting what is not forge-neutral
 

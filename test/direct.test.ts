@@ -1003,8 +1003,8 @@ test('the webhook delivers a CI outcome of an agent pull request', async () => {
 });
 
 // ---- auto-merge of an approved pull request, by the operator's per-repository policy
-import { Merger } from '../src/forge/merge.ts';
-import { globToRegExp } from '../src/forge/glob.ts';
+import { Merger } from '../src/agent/merge.ts';
+import { globToRegExp } from '../src/utils/glob.ts';
 const MERGE = { 'owner/hello': { deny: ['compose.yaml', '.github/**', 'docs/**/*.secret'] } };
 const withMerge = (extra = {}) => withCi({ MERGE_POLICY: JSON.stringify(MERGE), ...extra });
 const API = '/api/v1/repos/owner/hello';
@@ -3072,7 +3072,7 @@ test('dry run: review mode reads the reviews but merges nothing', async () => {
   assert.ok(forgejo.calls.some((call) => call.path.endsWith('/pulls/34/reviews')));
 });
 
-import { normalizeGiteaEvent } from "../src/webhook/gitea.ts";
+import { normalizeGiteaEvent } from "../src/forge/gitea/webhook.ts";
 test("Gitea review events go through the same normalizer and carry the forge as source", () => {
   const e = normalizeGiteaEvent("pull_request_approved", reviewPayload("pull_request_review_approved"), new Set([repo]), [], { reviews: true });
   assert.equal(e.type, "pull_request.review_approved");
@@ -3316,7 +3316,8 @@ test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as
 });
 
 // ---- WAIT_FOR_SAME_FILES and a ticket sent to the planner
-import { parseDeclaredFiles, pathsOverlap } from '../src/agent/files.ts';
+import { parseDeclaredFiles } from '../src/agent/files.ts';
+import { pathsOverlap } from '../src/utils/path-overlap.ts';
 const filesBody = (...files) => '## Summary\nSomething.\n\n## Exact files\n' + files.map((file) => '- `' + file + '`').join('\n') + '\n\n## Tests\n- `not/declared.ts`\n';
 const ticket = (label, number, body, extra = {}) => event(label, number, { issue: { number, title: 'T', body, labels: [label] }, ...extra });
 const agentPull = (number, issue) => ({ number, state: 'open', merged: false, title: 'Fix', head: { ref: 'ai/issue-' + issue, sha: 'cafe' + number }, labels: [] });

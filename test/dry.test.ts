@@ -9,7 +9,7 @@ import { createApp } from '../src/server/app.ts';
 import { DeliveryStore } from '../src/store/deliveries.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { Dispatcher } from '../src/agent/dispatch.ts';
-import { Merger } from '../src/forge/merge.ts';
+import { Merger } from '../src/agent/merge.ts';
 import { buildStatus, renderStatus } from '../src/server/status.ts';
 import { loadConfig } from '../src/config.ts';
 

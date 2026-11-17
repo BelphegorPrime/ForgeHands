@@ -1,9 +1,9 @@
-import { metrics } from '../metrics.ts';
-import { DryLog, isDry, isWrite } from '../dry.ts';
-import { normalizeEvent } from '../webhook/events.ts';
-import { deliveryId, verifyForgejoSignature } from '../webhook/security.ts';
-import type { Config, Fetch, ForgejoAccess, Json } from '../types.ts';
-import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, ForgeKind, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from './types.ts';
+import { metrics } from '../../metrics.ts';
+import { DryLog, isDry, isWrite } from '../../dry.ts';
+import { normalizeEvent } from '../../webhook/events.ts';
+import { deliveryId, verifyForgejoSignature } from '../../webhook/security.ts';
+import type { Config, Fetch, ForgejoAccess, Json } from '../../types.ts';
+import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, ForgeKind, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from '../../types/forge.ts';
 
 export interface ForgejoConfig { forgejo?: ForgejoAccess | null; timeoutMs: number; dryRun: Config['dryRun']; dryRunRepos: Config['dryRunRepos'] }
 

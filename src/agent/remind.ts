@@ -1,6 +1,6 @@
 import { createForge, createTransport } from '../forge/index.ts';
-import { Merger } from '../forge/merge.ts';
-import { isBotPull } from '../forge/bot.ts';
+import { Merger } from './merge.ts';
+import { isBotPull } from './bot.ts';
 import { DryLog } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';

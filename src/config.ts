@@ -1,7 +1,7 @@
 import { URL } from 'node:url';
-import { globToRegExp } from './forge/glob.ts';
+import { globToRegExp } from './utils/glob.ts';
 import { FORGES } from './forge/index.ts';
-import type { ForgeKind } from './forge/types.ts';
+import type { ForgeKind } from './types/forge.ts';
 import { parseNotify } from './notify/config.ts';
 import type { Config, DirectConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 

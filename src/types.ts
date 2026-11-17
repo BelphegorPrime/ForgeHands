@@ -1,7 +1,7 @@
 // Shared shapes. The Forgejo and OpenHands payloads are untrusted JSON: they are read as `Json` and narrowed in the normalizers.
 export type Json = any;
 
-import type { ForgeKind } from './forge/types.ts';
+import type { ForgeKind } from './types/forge.ts';
 
 export type Fetch = typeof fetch;
 

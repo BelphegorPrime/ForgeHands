@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { Dispatcher } from '../src/agent/dispatch.ts';
-import { Merger } from '../src/forge/merge.ts';
+import { Merger } from '../src/agent/merge.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { Notifier, RETRY_DELAYS_MS, mentionOf } from '../src/notify/index.ts';
 import { immediateMessage, digestMessage, cleanTitle } from '../src/notify/texts.ts';

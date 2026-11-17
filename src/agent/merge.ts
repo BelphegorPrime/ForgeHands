@@ -1,4 +1,4 @@
-import { createForge, createTransport } from './index.ts';
+import { createForge, createTransport } from '../forge/index.ts';
 import { DryLog } from '../dry.ts';
 import { isBotPull } from './bot.ts';
 import { metrics } from '../metrics.ts';
@@ -7,7 +7,7 @@ import { immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
 import type { Notify } from '../notify/index.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
-import type { Forge } from './types.ts';
+import type { Forge } from '../types/forge.ts';
 
 const PAGE = 50;
 const MAX_FILES = 1000;

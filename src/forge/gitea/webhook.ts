@@ -1,5 +1,5 @@
-import type { ForgeEvent, Json, NormalizedEvent } from '../types.ts';
-import { normalizeEvent, type NormalizeOptions } from './events.ts';
+import type { ForgeEvent, Json, NormalizedEvent } from '../../types.ts';
+import { normalizeEvent, type NormalizeOptions } from '../../webhook/events.ts';
 
 // Gitea's webhooks, as ForgeHands reads them. The headers differ (X-Gitea-Event, X-Gitea-Signature), but the payloads of issues, pull
 // requests (label changes arrive as `label_updated` there too, under the headers `issues` and `pull_request`) and pushes are the ones

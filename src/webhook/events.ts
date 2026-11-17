@@ -1,4 +1,4 @@
-import { isBotPull, type BotRules } from '../forge/bot.ts';
+import { isBotPull, type BotRules } from '../agent/bot.ts';
 import type { BranchPushEvent, ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {

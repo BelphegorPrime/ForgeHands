@@ -1,6 +1,6 @@
-import { isBotPull } from '../forge/bot.ts';
-import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
-import type { NormalizeOptions } from './events.ts';
+import { isBotPull } from '../../agent/bot.ts';
+import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../../types.ts';
+import type { NormalizeOptions } from '../../webhook/events.ts';
 
 // GitLab's webhooks, turned into the same normalized events the Forgejo ones become. The header `X-Gitlab-Event` names the kind:
 // `Issue Hook`, `Merge Request Hook`, `Pipeline Hook` and `Push Hook`. Merge requests are the pull requests (`iid` is the number).

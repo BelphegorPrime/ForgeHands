@@ -9,7 +9,7 @@ ForgeHands is a bridge between a git forge (Forgejo, Gitea or GitLab) and OpenHa
 - **Policy lives in ForgeHands' environment, never in the repository it acts on.** Routes, limits, `MERGE_POLICY` and who may trigger are environment variables. A file in the target repository could be changed by the very agent pull request it should restrain.
 - **Text from the forge is untrusted input.** Issue and pull request text, comments and bot changelogs go into prompts between markers and are labelled as data. Only `ALLOWED_SENDERS` (else the sender of the label) can steer an agent.
 - **A human is mentioned only when one is needed** (`HUMAN_LOGIN`). Every new hand-over goes through the existing helpers (`markForHuman`, `remark`) so this stays in one place.
-- **The core talks to a forge only through the `Forge` interface** (`src/forge/types.ts`); forge specifics live in `src/forge/<name>.ts` and `src/webhook/<name>.ts`, and writes go through the transport, where `DRY_RUN` is enforced. Where to add a forge: CONTRIBUTING.md.
+- **The core talks to a forge only through the `Forge` interface** (`src/types/forge.ts`); forge specifics live in `src/forge/<name>/` (including provider-specific webhook normalizers), and writes go through the transport, where `DRY_RUN` is enforced. Where to add a forge: CONTRIBUTING.md.
 - **Network calls are best effort.** A failed forge or OpenHands call is logged and the tick goes on. The ledger (`src/store/jobs.ts`) is the state that survives a restart, so anything that must outlive one belongs there.
 
 ## Code style

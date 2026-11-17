@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { loadConfig } from '../src/config.ts';
 import { buildPrompt } from '../src/agent/prompt.ts';
 import { agentApi, createForge, createTransport } from '../src/forge/index.ts';
-import { GitlabForge } from '../src/forge/gitlab.ts';
+import { GitlabForge } from '../src/forge/gitlab/index.ts';
 
 const repo = 'group/sub/hello';
 const allowed = new Set([repo]);
@@ -351,7 +351,7 @@ test('reviews are read as native reviews: the verdict note names the commit, an 
 });
 
 test('the Merger in review mode accepts a GitLab approval of the head commit and refuses one of an older commit', async () => {
-  const { Merger } = await import('../src/forge/merge.ts');
+  const { Merger } = await import('../src/agent/merge.ts');
   const make = (head) => {
     const notes = [review(1, 'rev', '## Verdict: OK\n' + 'evidence '.repeat(100), SHA, '2026-01-01T00:00:00Z')];
     const send = async (url) => ({ ok: true, status: 200, json: async () => url.includes('/approvals') ? { approved_by: [{ user: { username: 'rev' } }] } : notes });

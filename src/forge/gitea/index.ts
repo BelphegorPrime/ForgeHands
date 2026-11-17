@@ -1,7 +1,7 @@
-import { normalizeGiteaEvent } from '../webhook/gitea.ts';
-import { verifyForgejoSignature } from '../webhook/security.ts';
-import { ForgejoForge, forgejoAgentApi } from './forgejo.ts';
-import type { AgentApi, Forge } from './types.ts';
+import { normalizeGiteaEvent } from './webhook.ts';
+import { verifyForgejoSignature } from '../../webhook/security.ts';
+import { ForgejoForge, forgejoAgentApi } from '../forgejo/index.ts';
+import type { AgentApi, Forge } from '../../types/forge.ts';
 
 // The API paths an agent calls itself: Gitea's v1 API is the one Forgejo has, and the agent's secrets keep the names FORGEJO_URL and
 // FORGEJO_TOKEN (the neutral FORGE_* names reach it under those). Gitea's workflows live in .gitea/workflows.

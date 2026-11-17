@@ -1,9 +1,9 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { metrics } from '../metrics.ts';
-import { DryLog, isDry, isWrite } from '../dry.ts';
-import { normalizeGitlabEvent } from '../webhook/gitlab.ts';
-import type { Config, Fetch, ForgejoAccess, Json } from '../types.ts';
-import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Subject, Transport, UpdateBranchResult } from './types.ts';
+import { metrics } from '../../metrics.ts';
+import { DryLog, isDry, isWrite } from '../../dry.ts';
+import { normalizeGitlabEvent } from './webhook.ts';
+import type { Config, Fetch, ForgejoAccess, Json } from '../../types.ts';
+import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Subject, Transport, UpdateBranchResult } from '../../types/forge.ts';
 
 export interface GitlabConfig { forgejo?: ForgejoAccess | null; timeoutMs: number; dryRun: Config['dryRun']; dryRunRepos: Config['dryRunRepos'] }
 
