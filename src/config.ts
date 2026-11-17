@@ -121,6 +121,12 @@ function remindDays(value: string | undefined): number {
   return days;
 }
 
+function parseBotRepos(value: string | undefined, allowed: Set<string>): Set<string> {
+  const repos = new Set((value || '').split(',').map((entry) => entry.trim().toLowerCase()).filter(Boolean));
+  for (const repo of repos) if (!allowed.has(repo)) throw new Error('BOT_REPOS: ' + repo + ' is not in ALLOWED_REPOS');
+  return repos;
+}
+
 function parseLogins(value: string | undefined): Set<string> | null {
   const logins = (value || '').split(',').map((login) => login.trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
   return logins.length ? new Set(logins) : null;
@@ -340,6 +346,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // review and merge policy as agent pull requests, without a worker. A red commit starts a fix round only with BOT_FIX_ROUNDS (per pull request).
     botAuthors: new Set((env.BOT_AUTHORS || '').split(',').map((value) => value.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)),
     botBranchPrefixes: (env.BOT_BRANCH_PREFIXES || '').split(',').map((value) => value.trim()).filter(Boolean),
+    // Only these repositories (comma separated owner/repository, each one of ALLOWED_REPOS) have bot pull requests; empty: all of them. A repository
+    // whose bot pull requests the operator merges himself (and wants the forge's own mail for) is left out.
+    botRepos: parseBotRepos(env.BOT_REPOS, allowedRepos),
     botFixRounds: env.BOT_FIX_ROUNDS === undefined || env.BOT_FIX_ROUNDS === '' || env.BOT_FIX_ROUNDS === '0' ? 0 : positiveInt(env.BOT_FIX_ROUNDS, 0, 'BOT_FIX_ROUNDS', 100) as number,
     epicLabels: new Set((env.EPIC_LABEL || 'ai:plan,ai:close').split(',').map((value) => value.trim()).filter(Boolean)),
     pollMs: 15000,

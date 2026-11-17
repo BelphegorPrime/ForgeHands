@@ -129,6 +129,7 @@ export interface DirectConfig extends BaseConfig {
   approvedLabel: string;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
+  botRepos: Set<string>;
   botFixRounds: number;
   epicLabels: Set<string>;
   pollMs: number;

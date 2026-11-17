@@ -79,7 +79,7 @@ export class Merger {
       const pr = await this.forge.getPull(repository, number);
       if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
       // Judged from the pull request as Forgejo has it now, not from the event: an agent branch, or a pull request of a listed bot.
-      const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes }, pr, repository);
+      const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
       const labels = (pr.labels || []).map((label: Json) => label.name);
