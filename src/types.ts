@@ -216,6 +216,8 @@ export interface Job {
   /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */
   fell_back?: string;
   archived?: boolean;
+  /** The issue of this job is closed in the forge: the status page lists it as closed, never as waiting or failed. */
+  archived_view?: boolean;
   error_retry?: number;
   delivery_retry?: number;
   /** Dry run: the first message the conversation would have started with. */
