@@ -54,4 +54,7 @@ If you want branch protection to see the reviews, move to native reviews. It nee
 2. Open `/status` (with `STATUS_TOKEN` if you set one) and look at the summary and the queue.
 3. Check `/healthz`, then remove `DRY_RUN` and restart.
 
-A rollback to 0.3.x should work, since the ledger is still `version: 2` and the new fields are additions (not tested). Features you switched on, such as reviews by users of their own or bot pull requests, are then not understood by 0.3.x.
+A rollback to 0.3.x works: v0.3.10 loads a `jobs.json` written by 0.4.0 (including `dry` jobs and the new ticket fields) and starts with a 0.4 configuration, because it ignores the route fields it does not know (`escalate_to`, `forgejo_token_secret`) and the new variables. Checked with the code of both releases; not tried against a live forge. Two things to do first:
+
+- **Take the reviewer tokens out of `AGENT_SECRETS`.** 0.3.x hands every entry of `AGENT_SECRETS` to every conversation; keeping a reviewer's token private to its route is a 0.4 feature. Left in, the worker would hold the reviewer's token too.
+- Features you switched on, such as reviews by users of their own, bot pull requests, escalation or reminders, are not understood by 0.3.x and simply do nothing; with `VERDICT_SOURCE=review` the reviewer posts a native review, but 0.3.x looks for a verdict comment and a label, finds none and hands the pull request to a human after two reviews, so switch to `comment` (and the old reviewer prompt) before you roll back.
