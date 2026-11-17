@@ -1,6 +1,6 @@
 {
   "name": "forgehands",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Forgejo to OpenHands Automation webhook bridge",
   "type": "module",
   "private": true,
