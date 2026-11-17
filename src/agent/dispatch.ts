@@ -50,6 +50,7 @@ export class Dispatcher {
   /** Earliest time of the next look for closed issues (sweepClosed) and when each ticket was last found open. */
   nextClosedSweep = 0;
   closedChecked = new Map<string, number>();
+  closeRefused = new Map<string, number>(); // repository#issue -> until when a refused close is not tried again
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
@@ -363,10 +364,20 @@ export class Dispatcher {
         const issue = await this.forge.getIssue(repository, number);
         if (issue && issue.state === 'closed' && !issue.pull_request) await this.markClosed(repository.toLowerCase() + '#' + number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
+        // A forge may refuse to close the ticket (Forgejo answers 412 while issues it depends on are open). That must neither stop the other
+        // tickets of this pass nor repeat every push (and comment every time): the refusal is remembered for six hours.
+        const ticket = repository.toLowerCase() + '#' + number;
+        if ((this.closeRefused.get(ticket) || 0) > this.now()) continue;
+        try {
+          await this.forge.closeIssue(repository, number);
+        } catch (error) {
+          this.closeRefused.set(ticket, this.now() + 6 * 3600000);
+          this.logger.error('could not close #' + number + ' of ' + repository + ' (its pull request #' + pr.number + ' is merged), trying again in six hours:', error.message);
+          continue;
+        }
         await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.', 'issue');
-        await this.forge.closeIssue(repository, number);
-        await this.markClosed(repository.toLowerCase() + '#' + number);
-        this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
+        await this.markClosed(ticket);
+        this.noteTicket(ticket, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
       }
     } catch (error) {

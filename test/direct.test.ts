@@ -2101,7 +2101,7 @@ test('after a push to the default branch the tickets of merged agent pull reques
   });
   const dispatcher = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
   assert.equal(await dispatcher.closeMergedTickets(movedEvent()), 1);
-  assert.deepEqual(forgejo.wrote(), ['POST /issues/53/comments', 'PATCH /issues/53'], 'only the open ticket of a merged agent pull request into the default branch');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /issues/53', 'POST /issues/53/comments'], 'only the open ticket of a merged agent pull request into the default branch (closed first, then told)');
   const offline = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
   offline.config = { ...config, forgejo: null };
   assert.equal(await offline.closeMergedTickets(movedEvent()), 0, 'without Forgejo access nothing happens');
@@ -3453,4 +3453,32 @@ test('a security review route may have a Forgejo user of its own: its token goes
   const worker = secretsOf(WORKER);
   assert.notEqual(worker.FORGEJO_TOKEN.value, 'security-token-value', 'the worker never gets it');
   assert.ok(!('SECURITY_TOKEN' in worker));
+});
+
+test('a ticket the forge refuses to close does not stop the others, and is not tried or commented on again for six hours', async () => {
+  const config = loadConfig(env(withBranches({})));
+  const jobs = new JobStore(join(dir, 'refused.json'));
+  await jobs.load();
+  let refuse = true;
+  const forgejo = fakeForgejo({
+    ['GET ' + API + '/pulls']: [
+      { number: 71, merged: true, head: { ref: 'ai/issue-53' }, base: { ref: 'main' } },
+      { number: 72, merged: true, head: { ref: 'ai/issue-54' }, base: { ref: 'main' } }
+    ],
+    ['GET ' + API + '/issues/53']: { number: 53, state: 'open' },
+    ['GET ' + API + '/issues/54']: { number: 54, state: 'open' },
+    ['PATCH ' + API + '/issues/53']: () => refuse ? { __status: 412 } : {},
+    ['PATCH ' + API + '/issues/54']: {},
+    ['POST ' + API + '/issues/53/comments']: {}, ['POST ' + API + '/issues/54/comments']: {}
+  });
+  const dispatcher = new Dispatcher(config, jobs, forgejo.send, quiet, () => clock);
+  assert.equal(await dispatcher.closeMergedTickets(movedEvent()), 1, 'the second ticket is closed although the first was refused');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /issues/53', 'PATCH /issues/54', 'POST /issues/54/comments'], 'no comment on the refused ticket');
+  const before = forgejo.wrote().length;
+  await dispatcher.closeMergedTickets(movedEvent());
+  assert.ok(!forgejo.wrote().slice(before).includes('PATCH /issues/53'), 'not tried again at the next push');
+  refuse = false;
+  clock += 7 * 3600000;
+  await dispatcher.closeMergedTickets(movedEvent());
+  assert.ok(forgejo.wrote().slice(before).includes('PATCH /issues/53'), 'tried again after six hours');
 });
