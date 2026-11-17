@@ -33,6 +33,9 @@ export interface MergeRule {
   deny: RegExp[];
   patterns: string[];
   reasons: (string | null)[];
+  /** Deny paths that may merge with an independent security review instead of a human (`two_keys`); empty by default. */
+  twoKeys: RegExp[];
+  twoKeyPatterns: string[];
 }
 
 export interface ForgejoAccess {

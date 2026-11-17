@@ -102,12 +102,16 @@ export class Merger {
         await this.forge.setPullTitle(repository, number, this.forge.stripWip(pr.title));
         current = await this.forge.getPull(repository, number);
       }
+      let twoKeys = false;
       if (protectedFiles.length) {
         // The human gets one comment with everything he needs: why a human, which paths, what the security review found. While a security
         // review of this commit is still under way the hand-over waits for it (the dispatcher hands over when that run ends).
         if (this.hasSecurityRoute() && this.securityPending(repository, number, sha) && !(await this.securityReview(repository, number, sha))) return 'awaiting_security_review';
-        await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, current?.mergeable === false), true);
-        return metrics.refused('protected_paths');
+        if (!(await this.twoKeysHold(repository, number, sha, policy, protectedFiles))) {
+          await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, current?.mergeable === false), true);
+          return metrics.refused('protected_paths');
+        }
+        twoKeys = true;
       }
       if (current?.mergeable === false) {
         await this.remark(repository, number, 'approved and green, but the pull request does not merge cleanly (conflict). A human has to look at it.', true);
@@ -116,7 +120,8 @@ export class Merger {
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
-      await this.remark(repository, number, 'merged: approved by the reviewer, CI green, no protected path touched.');
+      await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, CI green; the protected paths it touches are configured for two keys.'
+        : 'merged: approved by the reviewer, CI green, no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
       if (bot) return 'merged';
       const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
@@ -142,13 +147,28 @@ export class Merger {
     return found ? /concerns/i.test(found.text.slice(0, 200)) ? 'CONCERNS' : 'OK' : null;
   }
 
+  // Two keys: every protected file is also a `two_keys` file of the policy, a security review route exists and its comment for this very
+  // commit says OK (the second key, a different agent run than the reviewer's). Anything else leaves the pull request to the human.
+  twoKeyFiles(policy: { deny: RegExp[]; twoKeys?: RegExp[] }, files: string[]): string[] {
+    return (policy.twoKeys || []).length ? files.filter((file) => policy.twoKeys!.some((pattern) => pattern.test(file))) : [];
+  }
+
+  async twoKeysHold(repository: string, number: number, sha: string, policy: { deny: RegExp[]; twoKeys?: RegExp[] }, files: string[]): Promise<boolean> {
+    if (!this.hasSecurityRoute() || !files.length || this.twoKeyFiles(policy, files).length !== files.length) return false;
+    try { return (await this.securityReview(repository, number, sha)) === 'OK'; }
+    catch (error) {
+      this.logger.error('could not read the security review of #' + number + ':', error.message);
+      return false;
+    }
+  }
+
   hasSecurityRoute(): boolean {
     return [...this.config.routes.values()].some((route) => route.kind === 'sensitive_review');
   }
 
   // The comment that hands a protected-path pull request to the human: what is done, why a human, which paths (with the reason of the
   // policy where it has one), what the security review found and, if Forgejo already reports a conflict, that it is being resolved.
-  async handOverText(repository: string, number: number, sha: string, policy: { patterns: string[]; deny: RegExp[]; reasons: (string | null)[] },
+  async handOverText(repository: string, number: number, sha: string, policy: { patterns: string[]; deny: RegExp[]; reasons: (string | null)[]; twoKeys?: RegExp[] },
     files: string[], conflict: boolean): Promise<string> {
     const groups = new Map<number, string[]>();
     for (const file of [...new Set(files)]) {
@@ -158,9 +178,12 @@ export class Merger {
     const lines = [...groups].map(([index, list]) => '- `' + policy.patterns[index] + '`' + (policy.reasons[index] ? ': ' + policy.reasons[index] : '')
       + ' (' + list.slice(0, 5).join(', ') + (list.length > 5 ? ', and ' + (list.length - 5) + ' more' : '') + ')');
     const security = await this.securityLine(repository, number, sha);
+    const second = this.twoKeyFiles(policy, [...new Set(files)]);
+    const qualified = second.length ? 'Of these files, ' + second.slice(0, 5).join(', ') + (second.length > 5 ? ' and ' + (second.length - 5) + ' more' : '') + (second.length === new Set(files).size ? ' are all configured for two keys, but that needs a security review of this commit that says OK.' : ' would qualify for two keys, but not every protected file does.') : '';
     return ['approved and green, but not merged automatically: it touches protected paths. It is ready for a human to merge.',
       'The reviewer approved commit ' + sha.slice(0, 8) + ' and CI is green. A human merges it because the merge policy keeps these paths for a person:\n' + lines.join('\n'),
       ...(security ? [security.trim()] : []),
+      ...(qualified && this.hasSecurityRoute() ? [qualified] : []),
       ...(conflict ? [this.forge.agent(repository).name + ' reports a conflict with the default branch; a conflict round resolves it before the merge.'] : [])].join('\n\n');
   }
 

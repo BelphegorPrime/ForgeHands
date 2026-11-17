@@ -70,6 +70,20 @@ function parseRoutes(text: string): Map<string, Route> {
 
 // MERGE_POLICY: {"owner/repo": {"deny": ["stacks/**", "compose.yaml"]}}. Only the repositories named here are merged by ForgeHands,
 // and only when none of the changed files matches a deny pattern. A repository without an entry is never merged automatically.
+// `two_keys` of a MERGE_POLICY entry: patterns inside the deny list that merge with an independent security review instead of a human.
+// Each one, taken as a literal path (wildcards become `x`), must match a deny pattern, otherwise it could never apply.
+function parseTwoKeys(name: string, value: unknown, deny: string[]): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((glob: unknown) => typeof glob !== 'string' || !glob.trim())) throw new Error('MERGE_POLICY: two_keys of ' + name + ' must be a list of patterns');
+  if (!deny.length && value.length) throw new Error('MERGE_POLICY: two_keys of ' + name + ' needs a deny list');
+  const denyRules = deny.map(globToRegExp);
+  for (const glob of value as string[]) {
+    const literal = glob.replace(/\*+/g, 'x').replace(/\?/g, 'x');
+    if (!denyRules.some((rule) => rule.test(literal))) throw new Error('MERGE_POLICY: two_keys pattern ' + glob + ' of ' + name + ' is not covered by a deny pattern');
+  }
+  return [...value as string[]];
+}
+
 function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
   const policy = new Map<string, MergeRule>();
   if (!text) return policy;
@@ -85,7 +99,9 @@ function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
     if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons) || Object.entries(reasons).some(([pattern, reason]) => !deny.includes(pattern) || typeof reason !== 'string' || !reason.trim())) {
       throw new Error('MERGE_POLICY: reasons of ' + name + ' must map patterns of its deny list to a text');
     }
-    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp), patterns: [...deny], reasons: deny.map((pattern: string) => (reasons as Record<string, string>)[pattern]?.trim() || null) });
+    const twoKeys = parseTwoKeys(name, rule?.two_keys, deny);
+    policy.set(name.toLowerCase(), { deny: deny.map(globToRegExp), patterns: [...deny], reasons: deny.map((pattern: string) => (reasons as Record<string, string>)[pattern]?.trim() || null),
+      twoKeys: twoKeys.map(globToRegExp), twoKeyPatterns: twoKeys });
   }
   return policy;
 }

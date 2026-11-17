@@ -3056,3 +3056,75 @@ test("Gitea review events go through the same normalizer and carry the forge as 
   assert.equal(e.type, "pull_request.review_approved");
   assert.equal(e.source, "gitea");
 });
+
+// ---- two keys: protected paths that merge with an independent security review instead of a human
+const TWO_POLICY = JSON.stringify({ 'owner/hello': { deny: ['seed/infra/**', 'compose.yaml'], two_keys: ['seed/infra/tests/**', 'seed/infra/README.md'] } });
+const securityComment = (word, sha = 'cafe0000') => ({ created_at: '2026-11-15T11:01:00Z', user: { login: 'openhands' }, body: '## Security review: ' + word + '\nCommit ' + sha + ': ' + 'evidence '.repeat(40) });
+async function twoKeys(files, comments, extra = {}) {
+  const all = [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...comments];
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34/files']: files.map((filename) => ({ filename })), ['GET ' + API + '/issues/34/comments']: all, ['GET ' + API + '/issues/34/comments?limit=100']: all });
+  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), HUMAN_LOGIN: 'marcel', ...extra });
+  return { ...made, all };
+}
+
+test('two keys: only two_keys files under the deny list plus a security review OK merge', async () => {
+  const { merger, forgejo } = await twoKeys(['seed/infra/tests/a.test.ts', 'seed/infra/README.md', 'docs/x.md'], [securityComment('OK')]);
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.ok(forgejo.wrote().includes('POST /pulls/34/merge'));
+  assert.match(commentsOf(forgejo).at(-1), /merged: approved by the reviewer and the security review, CI green; the protected paths it touches are configured for two keys\./);
+});
+
+test('two keys: one deny file outside two_keys keeps the human, and the hand-over names what would have qualified', async () => {
+  const { merger, forgejo } = await twoKeys(['seed/infra/tests/a.test.ts', 'seed/infra/main.ts'], [securityComment('OK')]);
+  assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!forgejo.wrote().includes('POST /pulls/34/merge'));
+  assert.match(commentsOf(forgejo).at(-1), /seed\/infra\/tests\/a\.test\.ts would qualify for two keys/);
+});
+
+test('two keys: CONCERNS stays with the human, a missing review hands over, a pending one waits', async () => {
+  const files = ['seed/infra/tests/a.test.ts'];
+  const concerns = await twoKeys(files, [securityComment('CONCERNS')]);
+  assert.equal(await concerns.merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!concerns.forgejo.wrote().includes('POST /pulls/34/merge'));
+  const other = await twoKeys(files, [securityComment('OK', '11111111')]);
+  assert.equal(await other.merger.handle(approvedEvent()), 'protected_paths', 'a review of another commit is no key');
+  const missing = await twoKeys(files, []);
+  missing.merger.securityPending = () => true;
+  assert.equal(await missing.merger.handle(approvedEvent()), 'awaiting_security_review');
+  assert.ok(!missing.forgejo.wrote().includes('POST /pulls/34/merge'));
+  missing.merger.securityPending = () => false;
+  assert.equal(await missing.merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!missing.forgejo.wrote().includes('POST /pulls/34/merge'));
+});
+
+test('two keys: without a sensitive_review route nothing merges', async () => {
+  const { merger, forgejo } = await twoKeys(['seed/infra/tests/a.test.ts'], [securityComment('OK')], { LABEL_ROUTES: env().LABEL_ROUTES });
+  assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!forgejo.wrote().includes('POST /pulls/34/merge'));
+});
+
+test('two keys: a security review that arrives after the approval merges when the hand-over is looked at again', async () => {
+  const files = ['seed/infra/README.md'];
+  const { merger, forgejo, all } = await twoKeys(files, []);
+  merger.securityPending = () => true;
+  assert.equal(await merger.handle(approvedEvent()), 'awaiting_security_review');
+  all.push(securityComment('OK'));
+  merger.securityPending = () => false;
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.ok(forgejo.wrote().includes('POST /pulls/34/merge'));
+});
+
+test('two keys: the policy is validated, and an entry without two_keys behaves as before', () => {
+  const bad = (entry, pattern) => assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }) }))), pattern);
+  bad({ deny: ['a/**'], two_keys: 'a/x' }, /two_keys of owner\/hello must be a list of patterns/);
+  bad({ deny: ['a/**'], two_keys: [''] }, /two_keys of owner\/hello must be a list/);
+  bad({ deny: ['a/**'], two_keys: [1] }, /two_keys of owner\/hello must be a list/);
+  bad({ two_keys: ['a/x'] }, /needs a deny list/);
+  bad({ deny: ['a/**'], two_keys: ['b/**'] }, /not covered by a deny pattern/);
+  const rule = (entry) => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }) }))).mergePolicy.get('owner/hello');
+  const ok = rule({ deny: ['a/**', 'c.md'], two_keys: ['a/tests/**', 'c.md', 'a/*.md'] });
+  assert.deepEqual(ok.twoKeyPatterns, ['a/tests/**', 'c.md', 'a/*.md']);
+  assert.ok(ok.twoKeys[0].test('a/tests/x/y.ts'));
+  const plain = rule({ deny: ['a/**'] });
+  assert.deepEqual([plain.twoKeys, plain.twoKeyPatterns], [[], []]);
+});
