@@ -248,11 +248,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
       if (verdictSource === 'review' && route.kind === 'ci_success') throw new Error('LABEL_ROUTES entry ' + label + ': VERDICT_SOURCE=review needs "forgejo_token_secret" on every review route (on: ci_success), the reviewer needs a Forgejo user of its own');
       continue;
     }
-    if (route.kind !== 'ci_success') throw new Error('LABEL_ROUTES entry ' + label + ': forgejo_token_secret only applies to a review route (on: ci_success)');
+    if (route.kind !== 'ci_success' && route.kind !== 'sensitive_review') throw new Error('LABEL_ROUTES entry ' + label + ': forgejo_token_secret only applies to a review route (on: ci_success) or a security review route (on: sensitive_review)');
     if (!/^[A-Z][A-Z0-9_]*$/.test(name) || !(name in agentSecrets) || ['FORGEJO_TOKEN', 'FORGEJO_URL'].includes(name)) {
       throw new Error('LABEL_ROUTES entry ' + label + ': forgejo_token_secret must name an extra entry of AGENT_SECRETS (not FORGE_TOKEN or FORGE_URL)');
     }
     if (agentSecrets[name] === forgeToken) throw new Error('LABEL_ROUTES entry ' + label + ': ' + name + ' is the token of FORGE_TOKEN; the reviewer needs its own Forgejo user, the author of a pull request cannot approve it');
+  }
+  // Two keys name who may write the second key: a security route needs a token of its own for that, or the worker could sign as the security reviewer.
+  if ([...parseMergePolicy(env.MERGE_POLICY).values()].some((rule) => rule.twoKeys.length)) {
+    for (const [label, route] of routes) if (route.kind === 'sensitive_review' && !route.forgejoTokenSecret) throw new Error('LABEL_ROUTES entry ' + label + ': MERGE_POLICY two_keys needs "forgejo_token_secret" on every sensitive_review route, so that the worker cannot sign as the security reviewer');
   }
   const maxRounds = positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100) as number;
   if (positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number > maxRounds) throw new Error('ESCALATE_FROM_ROUND must not be larger than MAX_ROUNDS');
