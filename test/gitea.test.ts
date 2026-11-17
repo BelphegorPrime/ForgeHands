@@ -73,7 +73,7 @@ const normalize = async (kind, event, payload, extra = {}) => {
 test('FORGE=gitea is accepted and an unknown forge names the choices', () => {
   assert.equal(loadConfig(env()).forge, 'gitea');
   assert.equal(loadConfig(env({ FORGE: 'Gitea' })).forge, 'gitea');
-  assert.throws(() => loadConfig(env({ FORGE: 'github' })), /FORGE must be forgejo or gitea, not github/);
+  assert.throws(() => loadConfig(env({ FORGE: 'github' })), /FORGE must be forgejo, gitea or gitlab, not github/);
 });
 
 test('Gitea CI: a failed workflow_run becomes the same ci.failure event as a Forgejo action_run_failure', async () => {

@@ -5,7 +5,8 @@ import type { ForgeKind } from './forge/types.ts';
 import type { Config, DirectConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
+// owner/name; GitLab projects may sit in subgroups (group/sub/name).
+const REPO = /^[a-z0-9_.-]+(?:\/[a-z0-9_.-]+)+$/;
 
 function httpUrl(value: string, name: string): URL {
   let url: URL;
@@ -137,7 +138,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   // Removed in 0.4.0: a weekly cost cap per tier. Ignored (not an error) so that an existing setup still starts.
   if (env.TIER_WEEKLY_BUDGETS) logger.error('TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0 (max_budget of a route still caps one run)');
   const forge = (env.FORGE || 'forgejo').trim().toLowerCase();
-  if (!(FORGES as readonly string[]).includes(forge)) throw new Error('FORGE must be ' + FORGES.join(' or ') + ', not ' + forge);
+  if (!(FORGES as readonly string[]).includes(forge)) throw new Error('FORGE must be ' + FORGES.slice(0, -1).join(', ') + ' or ' + FORGES.at(-1) + ', not ' + forge);
   // FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names; FORGEJO_* keep working.
   const forgeUrl = forgeEnv(env, 'FORGE_URL', 'FORGEJO_URL');
   const forgeToken = forgeEnv(env, 'FORGE_TOKEN', 'FORGEJO_TOKEN');

@@ -43,15 +43,21 @@ export function forgejoAgentApi(repository: string): AgentApi {
     secrets: 'the FORGEJO_TOKEN and FORGEJO_URL secrets',
     issue: (number) => api + '/issues/' + number,
     issueComments: (number) => api + '/issues/' + number + '/comments',
+    pullComments: (number) => api + '/issues/' + number + '/comments',
     pull: (number) => api + '/pulls/' + number,
     pullDiff: (number) => api + '/pulls/' + number + '.diff',
     pullReviews: (number) => api + '/pulls/' + number + '/reviews',
     pulls: () => api + '/pulls?state=all',
     labels: () => api + '/labels',
     issueLabels: (number) => api + '/issues/' + number + '/labels',
+    pullLabels: (number) => api + '/issues/' + number + '/labels',
     issueLabel: (number, id) => api + '/issues/' + number + '/labels/' + id,
+    pullLabel: (number, id) => api + '/issues/' + number + '/labels/' + id,
     addLabelsBody: '{"labels":[<id>]}',
-    closeBody: '{"state":"closed"}'
+    addLabelsMethod: 'POST',
+    removeLabelMethod: 'DELETE',
+    closeBody: '{"state":"closed"}',
+    closeMethod: 'PATCH'
   };
 }
 

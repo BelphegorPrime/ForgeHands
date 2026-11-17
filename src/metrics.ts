@@ -33,7 +33,8 @@ const GAUGES: Record<string, string> = {
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
-  'pull_request_approved', 'pull_request_rejected', 'pull_request_review_approved', 'pull_request_review_rejected'];
+  'pull_request_approved', 'pull_request_rejected', 'pull_request_review_approved', 'pull_request_review_rejected',
+  'Issue Hook', 'Merge Request Hook', 'Pipeline Hook', 'Push Hook'];
 const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed'];
 const KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
 

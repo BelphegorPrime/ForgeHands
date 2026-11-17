@@ -349,7 +349,7 @@ export class Dispatcher {
         const number = Number(match[1]);
         const issue = await this.forge.getIssue(repository, number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
-        await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.');
+        await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.', 'issue');
         await this.forge.closeIssue(repository, number);
         this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
@@ -1044,17 +1044,17 @@ export class Dispatcher {
         const number = event.issue.number;
         const repository = event.repository.full_name;
         const split = await this.forge.findOrCreateLabel(repository, this.config.splitLabel, '#5319e7');
-        const present = await this.forge.labelsOf(repository, number);
+        const present = await this.forge.labelsOf(repository, number, 'issue');
         const failed = (present || []).find((entry) => entry.name === job.label);
-        await this.forge.addComment(repository, number, 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.');
-        if (failed) await this.forge.removeLabel(repository, number, failed);
-        await this.forge.addLabels(repository, number, [split]);
+        await this.forge.addComment(repository, number, 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.', 'issue');
+        if (failed) await this.forge.removeLabel(repository, number, failed, 'issue');
+        await this.forge.addLabels(repository, number, [split], 'issue');
         this.noteTicket(this.issueKey(event), { split_at: this.now() });
         return;
       }
       const text = what + '. A human has to look at it.';
       if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run');
-      else await this.forge.addComment(event.repository.full_name, event.issue.number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text);
+      else await this.forge.addComment(event.repository.full_name, event.issue.number, (this.config.humanLogin ? '@' + this.config.humanLogin + ' ' : '') + 'ForgeHands: ' + text, 'issue');
     } catch (error) {
       this.logger.error('could not report the failure of ' + job.key + ':', error.message);
     }

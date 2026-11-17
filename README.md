@@ -11,6 +11,8 @@ A small Node.js 26 service written in TypeScript (run by type stripping, no buil
 - [How the loop works](#how-the-loop-works-direct-mode)
 - [Run it](#run-it)
 - [Forgejo setup](#forgejo-setup)
+- [Gitea setup](#gitea-setup)
+- [GitLab setup](#gitlab-setup)
 - [OpenHands setup](#openhands-setup)
 - [Configuration](#configuration)
 - [Behaviour in detail](#behaviour-in-detail)
@@ -44,7 +46,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 `compose.yaml` binds the port to `127.0.0.1`. To accept Forgejo webhooks from another host, use a secured reverse proxy and an explicit network policy. To run without Docker: `npm start`. To build a local image: `docker build -t forgehands:local .` and `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`. Keep registry and webhook secrets out of committed files.
 
-Endpoints: `POST /webhooks/forgejo` (the webhook; `/webhooks/gitea` with `FORGE=gitea`), `GET /healthz`, and in direct mode `GET /status` (page), `GET /status.json` and `GET /metrics` (Prometheus).
+Endpoints: `POST /webhooks/forgejo` (the webhook; `/webhooks/gitea` with `FORGE=gitea`, `/webhooks/gitlab` with `FORGE=gitlab`), `GET /healthz`, and in direct mode `GET /status` (page), `GET /status.json` and `GET /metrics` (Prometheus).
 
 ## Forgejo setup
 
@@ -70,6 +72,28 @@ What does not work on Gitea:
 - A CI event of a pull request carries no title or body; the agent reads the issue itself. Whether the pull request is still open is read from the API before a round starts.
 - Only runs of a pull request or a push count, and a head branch in a fork never counts as an agent branch.
 - Metrics count Gitea API errors under the `forgehands_forgejo_api_errors_total` series (one family).
+
+## GitLab setup
+
+Set `FORGE=gitlab` with `FORGE_URL` (the instance, for example `https://gitlab.example.com`), `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET` (the agent still gets its secrets as `FORGEJO_URL` and `FORGEJO_TOKEN`, and sends the token as `PRIVATE-TOKEN`). "Pull request" means **merge request** everywhere, and its number is the `iid`. `ALLOWED_REPOS` takes the full project path, subgroups included (`group/sub/project`).
+
+- **Token**: a personal, project or group access token with the `api` scope, for a user of its own with at least the Developer role (it comments, labels, rebases and merges), sent as `PRIVATE-TOKEN`.
+- **Webhook** per allowed project (Settings, Webhooks): URL `https://YOUR-HOST/webhooks/gitlab`, **Secret token** = the exact `FORGE_WEBHOOK_SECRET`. Triggers: **Issues events**, **Merge request events**, **Pipeline events** and **Push events**. ForgeHands reads `X-Gitlab-Event` (`Issue Hook`, `Merge Request Hook`, `Pipeline Hook`, `Push Hook`) and uses the `Idempotency-Key` as the delivery id.
+- **CI**: a finished pipeline (`status` `failed` or `success`) of a merge request becomes the same `ci.failure` / `ci.success` event as Forgejo's run events; cancelled, skipped and running ones are ignored. The combined status of a commit is derived from its pipelines (red wins, a running or manual one holds, a rerun replaces the older pipeline of the same source and ref). Use **merge request pipelines** (`rules: - if: $CI_PIPELINE_SOURCE == "merge_request_event"`): a plain branch pipeline names no merge request in the event.
+- **Labels** are matched by name. GitLab's *scoped* labels are those with a double colon (`a::b`): two of the same scope replace each other. The default labels (`ai:ready`, `ai:approved`, ...) have a single colon and are ordinary labels, so they do not replace each other; do not give your own labels a `::` unless that replacement is what you want.
+- **Draft** replaces `WIP:`: the titles `Draft:`, `[Draft]` and `(Draft)` count, and ForgeHands removes the marker before it merges an approved, green merge request.
+- **Rebase** (`UPDATE_BRANCHES`) is `PUT .../rebase`, which runs in the background: ForgeHands looks at the merge request until it finishes and reads a failed rebase (`merge_error`) as a conflict. **Merge** is `PUT .../merge` bound to the checked head with `sha`; `MERGE_METHOD=squash` asks for a squash, every other value is the project's own setting (merge commit, semi-linear or fast-forward), because GitLab has no such parameter.
+- **Webhook security**: GitLab sends the secret itself in `X-Gitlab-Token`, not an HMAC of the body. ForgeHands compares it in constant time (both sides hashed, then `crypto.timingSafeEqual`), but it is **weaker than the HMAC of Forgejo and Gitea**: a copy of one delivery (from a proxy log, say) lets anybody post any body. Keep the hop between GitLab and ForgeHands short and on TLS, and restrict who can reach the port. GitLab's newer signing token (`webhook-signature`, Standard Webhooks) is not used yet.
+
+What does not work, or differs, on GitLab:
+
+- **Dependencies need Premium.** Issue links of type `blocks` / `is_blocked_by` are a Premium feature. On Free (or when the call is refused) there are no dependencies: issues are not held back, `waiting for #n` and epic review by dependencies do nothing. Links into other projects are ignored.
+- A dependency bot's merge request (`BOT_AUTHORS`) is recognised from the pipeline's user only: the merge request event does not name the author, so its label events (the approval) are ignored.
+- Pipelines on a merged result run on a merge commit, not on the head of the merge request, and are dropped as stale. Use plain merge request pipelines.
+- The event of a pipeline carries no merge request text; the agent reads it from the API. Issue events carry no comment count.
+- **Native reviews** (`VERDICT_SOURCE=review` or `both`): GitLab's REST API has no review object and no "request changes". A review is a **note** that begins with `## Verdict: OK` or `## Verdict: NOT OK` and ends with `Commit: <sha>`, plus, for OK, the reviewer's **approval** (pinned with `sha`). ForgeHands reads the notes and the approvals: an OK counts only with the approval of its author, NOT OK is a request for changes, the newest note per reviewer wins, and the commit in the note must be the head (so an old approval does not survive a push). The agent prompt tells the reviewer to post exactly that. `approval` / `unapproval` events of the merge request trigger the check like Forgejo's review events.
+- The agent reads review comments from the merge request's discussions (`.../discussions`).
+- Metrics count GitLab API errors under the `forgehands_forgejo_api_errors_total` series (one family).
 
 ## OpenHands setup
 
@@ -111,7 +135,7 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 | `OPENHANDS_WEBHOOK_SECRET`, `OPENHANDS_WEBHOOK_URL` | webhook mode | Independent secret (at least 16 characters) and complete URL of the OpenHands custom webhook. |
 | `OPENHANDS_API_URL`, `OPENHANDS_API_KEY` | direct mode | Switch to direct mode and reach the OpenHands backend. |
 | `FORGEJO_URL`, `FORGEJO_TOKEN` | direct mode, for most features | Forgejo API access: merge, round limits, status checks, dependencies, branch updates. Without them ForgeHands only logs what it would tell Forgejo. |
-| `FORGE` | no | Which forge ForgeHands talks to: `forgejo` (default) or `gitea` (see "Gitea setup"; GitLab is planned). The neutral names `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET` mean the same as `FORGEJO_URL`, `FORGEJO_TOKEN` and `FORGEJO_WEBHOOK_SECRET`, which keep working; setting both names of a pair to different values is an error. In `AGENT_SECRETS` the neutral names reach the agent as `FORGEJO_URL` and `FORGEJO_TOKEN`. |
+| `FORGE` | no | Which forge ForgeHands talks to: `forgejo` (default), `gitea` (see "Gitea setup") or `gitlab` (see "GitLab setup"). The neutral names `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET` mean the same as `FORGEJO_URL`, `FORGEJO_TOKEN` and `FORGEJO_WEBHOOK_SECRET`, which keep working; setting both names of a pair to different values is an error. In `AGENT_SECRETS` the neutral names reach the agent as `FORGEJO_URL` and `FORGEJO_TOKEN`. |
 | `DATA_FILE`, `JOBS_FILE` | no | Delivery store (`./data/deliveries.json`) and issue ledger (`jobs.json` next to it). |
 | `PORT`, `HOST` | no | Listening port (`8080`) and address (`0.0.0.0`). |
 | `DRY_RUN`, `DRY_RUN_REPOS` | no | `DRY_RUN=1`: events are received and judged as usual, but every write is only logged: no OpenHands conversation (the job ends as `dry`, its first message kept in the ledger as `dry_prompt`), no Forgejo comment, label, merge, branch update or close, no webhook-mode forward. Reads stay real. `DRY_RUN_REPOS=owner/repo,...` (must be in `ALLOWED_REPOS`) limits it to those repositories. `/status` shows a banner and `/status.json` the latest would-be writes. |
