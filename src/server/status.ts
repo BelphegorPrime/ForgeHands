@@ -5,7 +5,7 @@ import type { JobStore } from '../store/jobs.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
-  started: string | null; finished: string | null; cost: number | null; retry_at: number | undefined; waiting_for: number[] | undefined;
+  started: string | null; finished: string | null; cost: number | null; retry_at: number | undefined; waiting_for: number[] | undefined; waiting_for_files: number[] | undefined;
   waiting_for_run: true | undefined; escalated: string | undefined; fell_back: string | undefined; created: number;
 }
 export interface Summary {
@@ -83,6 +83,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   if (active && active.retry_at && active.status === 'queued') return 'model quota used up, ' + KIND_TEXT[active.kind] + ' tries again after ' + new Date(active.retry_at).toISOString().slice(11, 16) + ' UTC';
   if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running' + (active.escalated ? ' (escalated to ' + active.escalated + ')' : '') + (active.fell_back ? ' (fallback to ' + active.fell_back + ')' : '');
   const waiting = runs.find((run) => run.status === 'waiting');
+  if (waiting?.waiting_for_files?.length && !waiting.waiting_for?.length) return 'waiting for ' + waiting.waiting_for_files.map((n: number) => '#' + n).join(', ') + ' (same files)';
   if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n: number) => '#' + n).join(', ');
   const last = runs[0];
   if (!last) return 'idle';
@@ -103,7 +104,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       started: job.started ? new Date(job.started).toISOString() : null,
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
-      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, created: job.created
+      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, created: job.created
     };
     const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [] };
     entry.runs.push(run);

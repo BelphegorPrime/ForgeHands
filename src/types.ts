@@ -86,6 +86,7 @@ export interface DirectConfig extends BaseConfig {
   forgejo: ForgejoAccess | null;
   blockedLabel: string;
   updateBranches: boolean;
+  waitForSameFiles: boolean;
   branchUpdateDelayMs: number;
   branchUpdateMinIntervalMs: number;
   minReviewChars: number;
@@ -195,6 +196,8 @@ export interface Job {
   created: number;
   attempts: number;
   waiting_for?: number[];
+  /** The older issues whose files this one shares (WAIT_FOR_SAME_FILES); it starts when they are closed or their pull requests are gone. */
+  waiting_for_files?: number[];
   waiting_for_run?: boolean;
   conversation_id?: string;
   started?: number;

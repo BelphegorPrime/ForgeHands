@@ -152,6 +152,8 @@ export interface Forge {
   isWip(title: string): boolean;
   /** The title without the work in progress marker. */
   stripWip(title: string): string;
+  /** Close a pull request without merging; its branch stays. */
+  closePull(repository: string, number: number): Promise<void>;
   setPullTitle(repository: string, number: number, title: string): Promise<void>;
   /** Native reviews of a pull request (ForgeHands reads the verdict comment today; this is for reviews as the verdict). */
   listReviews(repository: string, number: number): Promise<Review[]>;
