@@ -166,6 +166,11 @@ export interface Forge {
   commitStatus(repository: string, sha: string): Promise<CommitStatus>;
   /** The creation time of a commit (ISO text), or null when the forge does not say. */
   commitTime(repository: string, sha: string): Promise<string | null>;
+  /**
+   * Does the repository have workflow files (a CI that can run) at this commit? Throws when the forge cannot say. Absent on a forge where
+   * ForgeHands cannot tell: there a pull request is only ever reviewed after a CI run (REVIEW_WITHOUT_CI has no effect).
+   */
+  hasWorkflows?(repository: string, sha: string): Promise<boolean>;
   /** The sha of the tip of a branch, or null. */
   branchTip(repository: string, branch: string): Promise<string | null>;
 

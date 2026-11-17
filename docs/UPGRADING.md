@@ -59,3 +59,14 @@ A rollback to 0.3.x works: v0.3.10 loads a `jobs.json` written by 0.4.0 (includi
 
 - **Take the reviewer tokens out of `AGENT_SECRETS`.** 0.3.x hands every entry of `AGENT_SECRETS` to every conversation; keeping a reviewer's token private to its route is a 0.4 feature. Left in, the worker would hold the reviewer's token too.
 - Features you switched on, such as reviews by users of their own, bot pull requests, escalation or reminders, are not understood by 0.3.x and simply do nothing; with `VERDICT_SOURCE=review` the reviewer posts a native review, but 0.3.x looks for a verdict comment and a label, finds none and hands the pull request to a human after two reviews, so switch to `comment` (and the old reviewer prompt) before you roll back.
+
+# Upgrading to 0.4.10: repositories without CI
+
+A repository that has no workflow file never produces a CI run, so until now the pull request of an agent (or of a bot) there was never reviewed, never approved and never merged. From 0.4.10 the review starts without waiting for a green run in such a repository. Nothing else changes: **a repository that has any workflow file behaves exactly as before** (red, pending, and "no status yet" all keep waiting for the real run).
+
+- **The switch is `REVIEW_WITHOUT_CI`, default `1`.** Set `REVIEW_WITHOUT_CI=0` to restore the old behaviour everywhere. Any other value stops the start with `REVIEW_WITHOUT_CI must be 0 or 1`.
+- **How "no CI" is decided.** At the head commit of the pull request the commit has no commit status at all, and `.forgejo/workflows`, `.gitea/workflows` and `.github/workflows` (Forgejo's order; the first folder that exists counts) hold no `.yml` or `.yaml` file. ForgeHands reads that through the contents API. A forge that cannot be read starts no review.
+- **Webhook events.** The review starts from the **Push** event you already send, and from **Pull request** events (opened, reopened, synchronized) for a pull request that is opened after its branch was pushed. If your webhook sends only the label event of pull requests, add the pull request events, or a branch pushed before its pull request exists is only reviewed with its next commit.
+- **Merge.** `MERGE_POLICY` merges a pull request of such a repository on the approved review alone; the merge comment says `there is no CI in this repository` instead of `CI green`. Nothing is merged without `MERGE_POLICY` for the repository, as before.
+- **Not covered.** GitLab (the switch has no effect there).
+- **Rollback.** Set `REVIEW_WITHOUT_CI=0` (or go back to 0.4.9: it ignores the variable and never starts such a review).

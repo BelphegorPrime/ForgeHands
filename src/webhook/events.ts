@@ -1,5 +1,5 @@
 import { isBotPull, type BotRules } from '../forge/bot.ts';
-import type { ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
+import type { BranchPushEvent, ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {
   labelEvents?: boolean;
@@ -7,6 +7,8 @@ export interface NormalizeOptions {
   ci?: { failure?: string; success?: string };
   approved?: string;
   pushes?: boolean;
+  /** REVIEW_WITHOUT_CI: a commit on an agent's or a bot's branch (a push, or a pull request opened or updated) is an event, to look for a repository without CI. */
+  branchPushes?: boolean;
   /** VERDICT_SOURCE review or both: a native review (approved / rejected) is an event. */
   reviews?: boolean;
   /** Dependency bots (BOT_AUTHORS): their pull requests count like agent pull requests. `fixRounds` 0: a red commit and a round label start nothing. */
@@ -18,8 +20,9 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, reviews = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
-  if (event === 'push') return pushes ? normalizePush(payload, allowedRepos) : null;
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
+  if (event === 'push') return (pushes ? normalizePush(payload, allowedRepos) : null) ?? (branchPushes ? normalizeBranchPush(payload, allowedRepos, bots) : null);
+  if (event === 'pull_request' && branchPushes && HEAD_ACTIONS.has(String(payload?.action))) return normalizeBranchPull(payload, allowedRepos, bots);
   if (reviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots);
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
@@ -251,6 +254,55 @@ function normalizePush(payload: Json, allowedRepos: Set<string>): PushEvent | nu
     source: 'forgejo',
     repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: branch },
     after: payload.after,
+    sender: { login: payload.sender?.login || null }
+  };
+}
+
+// Could a branch of this name carry a pull request ForgeHands reviews: an agent branch, or one a listed bot may use? The dispatcher checks
+// the pull request itself (author, state, head) against the forge; this only keeps pushes of every other branch from costing an API call.
+function reviewableBranch(branch: unknown, bots?: NormalizeOptions['bots']): branch is string {
+  if (typeof branch !== 'string' || !branch) return false;
+  if (/^ai\/issue-\d+$/.test(branch)) return true;
+  return !!bots && bots.authors.size > 0 && (!bots.prefixes.length || bots.prefixes.some((prefix) => branch.startsWith(prefix)));
+}
+
+// The actions of a pull request event that put a commit on it: it was opened or reopened, or its branch got a new head.
+const HEAD_ACTIONS = new Set(['opened', 'reopened', 'synchronized', 'synchronize']);
+
+const SHA = /^[0-9a-f]{7,64}$/i;
+
+// A push to a branch that is not the default one. Whether a pull request of an agent or bot stands on it is for the dispatcher to read.
+function normalizeBranchPush(payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots']): BranchPushEvent | null {
+  const fullName = payload?.repository?.full_name;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase()) || typeof payload.ref !== 'string' || !payload.ref.startsWith('refs/heads/')) return null;
+  const branch = payload.ref.slice('refs/heads/'.length);
+  if (branch === payload.repository.default_branch || !reviewableBranch(branch, bots)) return null;
+  if (typeof payload.after !== 'string' || !SHA.test(payload.after) || /^0+$/.test(payload.after)) return null;
+  return {
+    type: 'push.branch',
+    source: 'forgejo',
+    repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: payload.repository.default_branch || null },
+    branch,
+    after: payload.after,
+    sender: { login: payload.sender?.login || null }
+  };
+}
+
+// A pull request opened or updated: the same trigger as a push, with the pull request already named. This covers the pull request that is
+// opened after the branch was pushed (the push found none) and a forge that reports a new head only as a pull request event.
+function normalizeBranchPull(payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots']): BranchPushEvent | null {
+  const pr = payload?.pull_request;
+  const fullName = payload?.repository?.full_name;
+  if (!pr || typeof pr !== 'object' || typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged || !reviewableBranch(pr.head?.ref, bots)) return null;
+  if (typeof pr.head?.sha !== 'string' || !SHA.test(pr.head.sha)) return null;
+  return {
+    type: 'push.branch',
+    source: 'forgejo',
+    repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: payload.repository.default_branch || null },
+    branch: pr.head.ref,
+    after: pr.head.sha,
+    pull_request: pr.number,
     sender: { login: payload.sender?.login || null }
   };
 }

@@ -29,6 +29,9 @@ export class Merger {
   note: (ticket: string, fact: 'merged' | 'blocked') => void = () => {};
   // Tells the human by a message of ForgeHands' own (src/notify); the dispatcher sets it. Off by default.
   notifier: Notify = NO_NOTIFY;
+  // Repository@commit pairs known to have no workflow file (REVIEW_WITHOUT_CI), for this process only. "Has CI" is never kept: a workflow
+  // file can arrive with the next commit, and a commit that has them must be looked at again.
+  noCiSeen = new Set<string>();
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -43,6 +46,31 @@ export class Merger {
 
   call(repository: string, method: string, path: string, body?: unknown): Promise<Json> {
     return this.transport(repository, method, path, body);
+  }
+
+  // Is the commit green? 'green': every check reports and succeeds. 'no_ci': nothing reports and the repository has no workflow file at that
+  // commit (REVIEW_WITHOUT_CI), so there is nothing to wait for. A repository with workflows that has not reported yet is not green, and
+  // neither is a failing, pending or unreadable one. A failing status call throws, the caller decides what an unknown answer means.
+  async ciGreen(repository: string, sha: string): Promise<'green' | 'no_ci' | false> {
+    const status = await this.forge.commitStatus(repository, sha);
+    if (status?.state === 'success' && status.total_count > 0) return 'green';
+    return !(status?.total_count > 0) && (await this.noWorkflows(repository, sha)) ? 'no_ci' : false;
+  }
+
+  // Does this commit have no CI that could run: no workflow file in the tree? Only a positive answer is kept, and only in memory. Off
+  // switch, a forge that cannot tell, an unreadable forge: all of them answer false ("unknown"), so nothing is reviewed on a guess.
+  async noWorkflows(repository: string, sha: string): Promise<boolean> {
+    if (!this.config.reviewWithoutCi || !this.config.forgejo || !this.forge.hasWorkflows) return false;
+    const key = repository.toLowerCase() + '@' + sha;
+    if (this.noCiSeen.has(key)) return true;
+    try {
+      if (await this.forge.hasWorkflows(repository, sha)) return false;
+    } catch (error) {
+      this.logger.error('could not tell whether ' + repository + ' has workflows at ' + sha.slice(0, 7) + ', not treating it as without CI:', error.message);
+      return false;
+    }
+    this.noCiSeen.add(key);
+    return true;
   }
 
   async changedFiles(repository: string, number: number): Promise<string[]> {
@@ -102,8 +130,8 @@ export class Merger {
         await this.rejectApproval(repository, number, sha, review.reason, pr);
         return metrics.refused('no_valid_review');
       }
-      const status = await this.forge.commitStatus(repository, sha);
-      if (status?.state !== 'success' || !(status.total_count > 0)) return metrics.refused('ci_not_green');
+      const ci = await this.ciGreen(repository, sha);
+      if (!ci) return metrics.refused('ci_not_green');
       const changed = await this.changedFiles(repository, number);
       const protectedFiles = changed.filter((name) => policy.deny.some((pattern) => pattern.test(name)));
       // Forgejo refuses to merge a pull request titled as work in progress (and reports it as not mergeable). Approved and green is
@@ -134,8 +162,9 @@ export class Merger {
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
-      await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, CI green; the protected paths it touches are configured for two keys.'
-        : 'merged: approved by the reviewer, CI green, no protected path touched.');
+      const checks = ci === 'no_ci' ? 'there is no CI in this repository' : 'CI green';
+      await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, ' + checks + '; the protected paths it touches are configured for two keys.'
+        : 'merged: approved by the reviewer, ' + checks + ', no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
       if (bot) return 'merged';
       const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);

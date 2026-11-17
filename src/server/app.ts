@@ -5,7 +5,7 @@ import { createForge, createTransport } from '../forge/index.ts';
 import { buildStatus, renderStatus } from './status.ts';
 import { hasToken } from './auth.ts';
 import { gaugeSamples, known, metrics, WEBHOOK_EVENTS } from '../metrics.ts';
-import { isPushEvent } from '../types.ts';
+import { isBranchPush, isPushEvent } from '../types.ts';
 import { DryLog, isDry } from '../dry.ts';
 import type { Config, DirectConfig, Fetch, ForgeEvent, Logger } from '../types.ts';
 import type { DeliveryStore } from '../store/deliveries.ts';
@@ -87,13 +87,14 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
       pushes: direct && config.updateBranches,
+      branchPushes: direct && config.reviewWithoutCi && !!config.forgejo && [...config.routes.values()].some((route) => route.kind === 'ci_success'),
       reviews: direct && config.verdictSource !== 'comment',
       bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, repos: config.botRepos, fixRounds: config.botFixRounds } : undefined });
     if (!normalized) { remember(); delivered('ignored'); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     // The CI outcome of a bot's pull request is let in by BOT_AUTHORS (the operator's own list), not by who triggered the run. Labels still need an allowed sender.
     // An approval needs no sender check: it only asks the merger to read the reviews, which decide. A rejection starts a round, so its author must be allowed.
-    if (config.allowedSenders && normalized.type !== 'pull_request.review_approved' && !((normalized as ForgeEvent).bot && normalized.type.startsWith('ci.')) && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
+    if (config.allowedSenders && normalized.type !== 'pull_request.review_approved' && !((normalized as ForgeEvent).bot && normalized.type.startsWith('ci.')) && !isBranchPush(normalized) && !config.allowedSenders.has(String(normalized.sender.login || '').toLowerCase())) {
       remember();
       delivered('ignored');
       return json(res, 202, { status: 'ignored' });
@@ -110,6 +111,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
           ? { status: await dispatcher!.onReview(normalized as ForgeEvent, normalized.type === 'pull_request.review_approved') }
           : normalized.type === 'pull_request.approved' ? { status: await dispatcher!.approve(normalized as ForgeEvent) }
           : normalized.type === 'issues.closed' ? { status: await dispatcher!.onClosed(normalized as ForgeEvent) }
+          : isBranchPush(normalized) ? { status: await dispatcher!.onBranchPush(normalized) }
           : isPushEvent(normalized) ? { status: (dispatcher!.closeMergedTickets(normalized).catch((error) => logger.error('closing merged tickets failed:', error.message)), dispatcher!.onMainMoved(normalized)) }
           : await dispatcher!.enqueue(normalized);
         remember();
