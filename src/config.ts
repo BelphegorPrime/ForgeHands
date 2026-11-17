@@ -2,7 +2,7 @@ import { URL } from 'node:url';
 import { globToRegExp } from './forge/glob.ts';
 import { FORGES } from './forge/index.ts';
 import type { ForgeKind } from './forge/types.ts';
-import type { Config, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
+import type { Config, DirectConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPO = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
@@ -48,7 +48,9 @@ function parseRoutes(text: string): Map<string, Route> {
       // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route.
       escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to),
       // "fallback_to": "<label of another route>": while the tier of this route is out of quota, jobs start with the profile and tier of that route.
-      fallbackTo: route.fallback_to === undefined ? null : String(route.fallback_to)
+      fallbackTo: route.fallback_to === undefined ? null : String(route.fallback_to),
+      // "forgejo_token_secret": the reviewer's own Forgejo user (the author of a pull request cannot approve it), see loadConfig.
+      forgejoTokenSecret: route.forgejo_token_secret === undefined ? null : String(route.forgejo_token_secret)
     });
   }
   for (const [label, route] of routes) {
@@ -209,6 +211,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     agentSecrets[name.replace(/^FORGE_/, 'FORGEJO_')] = value;
   }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
+  // VERDICT_SOURCE: `comment` (default) is a "Verdict: OK" comment plus the approval label; `review` is Forgejo's own pull request review
+  // (Approve / Request changes) on the head commit, which branch protection can enforce; `both` accepts either.
+  const verdictSource = (env.VERDICT_SOURCE || 'comment').trim().toLowerCase();
+  if (!['comment', 'review', 'both'].includes(verdictSource)) throw new Error('VERDICT_SOURCE must be comment, review or both');
+  if (verdictSource !== 'comment' && !(forgeUrl && forgeToken)) throw new Error('VERDICT_SOURCE=' + verdictSource + ' needs FORGEJO_URL and FORGEJO_TOKEN (or FORGE_URL and FORGE_TOKEN) to read the reviews');
+  const requiredApprovals = positiveInt(env.REQUIRED_APPROVALS, 1, 'REQUIRED_APPROVALS', 20) as number;
+  if (requiredApprovals > 1 && verdictSource === 'comment') throw new Error('REQUIRED_APPROVALS above 1 needs VERDICT_SOURCE=review or both (a comment verdict has no approver to count)');
+  // A route's own Forgejo token: it has to be one of AGENT_SECRETS (so that it is read from the environment like the others) and is then
+  // withheld from every other conversation. It must be another user than the one of FORGEJO_TOKEN, who authors the pull requests and cannot approve them.
+  for (const [label, route] of routes) {
+    const name = route.forgejoTokenSecret;
+    if (name === null) {
+      if (verdictSource === 'review' && route.kind === 'ci_success') throw new Error('LABEL_ROUTES entry ' + label + ': VERDICT_SOURCE=review needs "forgejo_token_secret" on every review route (on: ci_success), the reviewer needs a Forgejo user of its own');
+      continue;
+    }
+    if (route.kind !== 'ci_success') throw new Error('LABEL_ROUTES entry ' + label + ': forgejo_token_secret only applies to a review route (on: ci_success)');
+    if (!/^[A-Z][A-Z0-9_]*$/.test(name) || !(name in agentSecrets) || ['FORGEJO_TOKEN', 'FORGEJO_URL'].includes(name)) {
+      throw new Error('LABEL_ROUTES entry ' + label + ': forgejo_token_secret must name an extra entry of AGENT_SECRETS (not FORGE_TOKEN or FORGE_URL)');
+    }
+    if (agentSecrets[name] === forgeToken) throw new Error('LABEL_ROUTES entry ' + label + ': ' + name + ' is the token of FORGE_TOKEN; the reviewer needs its own Forgejo user, the author of a pull request cannot approve it');
+  }
   const maxRounds = positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100) as number;
   if (positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number > maxRounds) throw new Error('ESCALATE_FROM_ROUND must not be larger than MAX_ROUNDS');
   const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
@@ -250,6 +273,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     branchUpdateMinIntervalMs: positiveInt(env.BRANCH_UPDATE_MIN_INTERVAL_MINUTES, 30, 'BRANCH_UPDATE_MIN_INTERVAL_MINUTES', 1440) * 60000,
     // A merge needs a review comment for the current commit: it says "Verdict: OK" within its first 300 characters and has at least this
     // many characters (evidence, not a one-liner). A label alone is not a review.
+    verdictSource: verdictSource as DirectConfig['verdictSource'],
+    requiredApprovals,
     minReviewChars: positiveInt(env.MIN_REVIEW_CHARS, 300, 'MIN_REVIEW_CHARS', 20000),
     // An approval label without a verdict comment is checked again after this many seconds before it is taken off; 0 takes it off at once.
     approvalGraceMs: env.APPROVAL_GRACE_SECONDS === '0' ? 0 : positiveInt(env.APPROVAL_GRACE_SECONDS, 90, 'APPROVAL_GRACE_SECONDS', 3600) * 1000,

@@ -49,7 +49,11 @@ export interface ChangedFile { filename: string; previous_filename?: string }
 
 export interface Compare { total_commits?: number; files?: ChangedFile[] }
 
-export interface Review { id: number | string; state: string; body?: string; commit_id?: string; user?: { login?: string }; submitted_at?: string }
+export interface Review {
+  id: number | string; state: string; body?: string; commit_id?: string; user?: { login?: string }; submitted_at?: string;
+  /** Forgejo: the review was dismissed, is stale (a push came after it), or counts for the branch protection (the reviewer may approve). */
+  dismissed?: boolean; stale?: boolean; official?: boolean;
+}
 
 /** What a submitted review says. */
 export type ReviewVerdict = 'approve' | 'request_changes' | 'comment';

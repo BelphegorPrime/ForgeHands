@@ -71,10 +71,14 @@ export class Merger {
       if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
       const labels = (pr.labels || []).map((label: Json) => label.name);
-      if (!labels.includes(this.config.approvedLabel)) return 'not_approved';
+      // The approval label (comment mode, or a human's) is a claim; native reviews need no label, they are the proof themselves.
+      const labelled = labels.includes(this.config.approvedLabel);
+      if (!labelled && this.config.verdictSource === 'comment') return 'not_approved';
       if (labels.includes(this.config.blockedLabel)) return metrics.refused('blocked');
-      // The approval label is a claim; the review comment is the proof. Without a verdict for this very commit nothing is merged.
+      // The verdict for this very commit is the proof. Without one nothing is merged.
       const review = await this.reviewOf(repository, number, sha);
+      // No label to take off: a review that does not (yet) say yes is simply not a reason to merge.
+      if (!labelled && !review.ok) return review.reason === 'changes_requested' ? 'changes_requested' : review.reason === 'not_enough' ? 'awaiting_approvals' : 'not_approved';
       // The reviewer sometimes sets the label a moment before it posts the verdict comment. A label that arrives first is looked at
       // once more after a short wait, instead of being taken off at once (the wait does not hold the webhook delivery).
       if (!review.ok && review.reason === 'none' && !regraced && this.config.approvalGraceMs > 0) {
@@ -174,9 +178,57 @@ export class Merger {
     }
   }
 
+  // The verdict of the pull request for this commit, from the source the operator chose (VERDICT_SOURCE).
+  async reviewOf(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
+    const source = this.config.verdictSource;
+    if (source === 'comment') return this.commentVerdict(repository, number, sha);
+    let native: { ok: boolean; reason?: string };
+    try { native = await this.nativeVerdict(repository, number, sha); }
+    catch (error) {
+      // Only `both` has another source to fall back on; `review` fails (the merge reports it) rather than guess.
+      if (source === 'review') throw error;
+      this.logger.error('could not read the reviews of #' + number + ', going by the verdict comment:', error.message);
+      return this.commentVerdict(repository, number, sha);
+    }
+    if (native.ok || source === 'review' || native.reason === 'changes_requested') return native;
+    // `both`: a verdict comment counts too, unless a current review asks for changes (that one wins).
+    return this.commentVerdict(repository, number, sha);
+  }
+
+  // The native reviews of the head commit: per reviewer only the latest approval or request for changes counts, and only when it is not
+  // dismissed, not stale and written for exactly this commit (`commit_id`). An approval of somebody who may not approve (Forgejo: `official`
+  // false) and an approval whose body is shorter than MIN_REVIEW_CHARS (no evidence) do not count; a request for changes always does.
+  // `any`: some reviewer has given a verdict on this commit, whatever it is.
+  async nativeReviews(repository: string, number: number, sha: string): Promise<{ approvals: string[]; changes: string[]; any: boolean }> {
+    const reviews = await this.forge.listReviews(repository, number);
+    const latest = new Map<string, Json>();
+    for (const review of Array.isArray(reviews) ? reviews : []) {
+      const login = String(review.user?.login || '').toLowerCase();
+      if (!login || review.dismissed || review.stale || review.commit_id !== sha) continue;
+      if (review.state !== 'APPROVED' && review.state !== 'REQUEST_CHANGES') continue;
+      const previous = latest.get(login);
+      const at = Date.parse(review.submitted_at || '') || 0;
+      if (!previous || at > (Date.parse(previous.submitted_at || '') || 0) || (at === (Date.parse(previous.submitted_at || '') || 0) && Number(review.id) > Number(previous.id))) latest.set(login, review);
+    }
+    const approvals: string[] = [];
+    const changes: string[] = [];
+    for (const [login, review] of latest) {
+      if (review.state === 'REQUEST_CHANGES') changes.push(login);
+      else if (review.official !== false && String(review.body || '').length >= this.config.minReviewChars) approvals.push(login);
+    }
+    return { approvals, changes, any: latest.size > 0 };
+  }
+
+  async nativeVerdict(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
+    const { approvals, changes, any } = await this.nativeReviews(repository, number, sha);
+    if (changes.length) return { ok: false, reason: 'changes_requested' };
+    if (approvals.length >= this.config.requiredApprovals) return { ok: true };
+    return { ok: false, reason: any ? 'not_enough' : 'none' };
+  }
+
   // The latest review comment of the current commit: written after the commit, long enough to hold evidence, and starting with
   // "Verdict: OK" or "Verdict: NOT OK". A comment of anybody counts (a human may review too); the latest one decides.
-  async reviewOf(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
+  async commentVerdict(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
     let since = 0;
     try {
       const time = Date.parse((await this.forge.commitTime(repository, sha)) || '');
@@ -205,8 +257,10 @@ export class Merger {
     metrics.inc('forgehands_blocks_total', { reason: 'approval_not_trusted' });
     const event = { repository: { full_name: repository }, pull_request: { number } };
     await this.clearApproval(event);
-    const what = reason === 'not_ok'
-      ? 'the latest review of commit ' + sha.slice(0, 8) + ' says NOT OK'
+    const what = reason === 'changes_requested' ? 'a review of commit ' + sha.slice(0, 8) + ' asks for changes'
+      : reason === 'not_enough' ? 'commit ' + sha.slice(0, 8) + ' has fewer than the ' + this.config.requiredApprovals + ' approving review(s) (REQUIRED_APPROVALS) of reviewers who may approve, each with at least ' + this.config.minReviewChars + ' characters of evidence'
+      : reason === 'not_ok' ? 'the latest review of commit ' + sha.slice(0, 8) + ' says NOT OK'
+      : this.config.verdictSource === 'review' ? 'there is no approving review for commit ' + sha.slice(0, 8)
       : 'there is no review comment for commit ' + sha.slice(0, 8) + ' that starts with \"Verdict: OK\" and holds evidence (at least ' + this.config.minReviewChars + ' characters)';
     await this.remark(repository, number, 'the label ' + this.config.approvedLabel + ' was set, but ' + what + '. The approval is not trusted and was taken off. A human has to look at this pull request, or push a commit to run the review again.', true);
     try {
