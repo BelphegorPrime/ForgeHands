@@ -1120,6 +1120,27 @@ test('merge: a real conflict after the title is clean is reported, and a blocked
   assert.ok(!red.forgejo.wrote().includes('PATCH /pulls/34'));
 });
 
+test('merge: a repository without any workflow file merges an approved pull request that has no status; one with workflows, or a red status, still refuses', async () => {
+  const quiet = goodRoutes({ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'pending', total_count: 0 } });
+  const none = await mergerFor(quiet);
+  assert.equal(await none.merger.handle(approvedEvent()), 'merged');
+  assert.ok(none.forgejo.calls.some((call) => call.path === API + '/contents/.github/workflows' && call.search === '?ref=cafe0000cafe'));
+  assert.match(none.forgejo.calls.find((call) => call.method === 'POST' && call.path.endsWith('/issues/34/comments')).body.body, /there is no CI in this repository/);
+  // workflows exist but nothing has reported yet: not green
+  const waiting = await mergerFor({ ...quiet, ['GET ' + API + '/contents/.forgejo/workflows']: [{ type: 'file', name: 'ci.yaml' }] });
+  assert.equal(await waiting.merger.handle(approvedEvent()), 'ci_not_green');
+  assert.ok(!waiting.forgejo.wrote().includes('POST /pulls/34/merge'));
+  // a red status refuses whatever the tree holds
+  const red = await mergerFor(goodRoutes({ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'failure', total_count: 1 } }));
+  assert.equal(await red.merger.handle(approvedEvent()), 'ci_not_green');
+  // an unreadable folder listing is unknown, so refused; and the switch restores the old rule
+  const unknown = await mergerFor({ ...quiet, ['GET ' + API + '/contents/.forgejo/workflows']: { __status: 500 } });
+  assert.equal(await unknown.merger.handle(approvedEvent()), 'ci_not_green');
+  const off = await mergerFor(quiet, { REVIEW_WITHOUT_CI: '0' });
+  assert.equal(await off.merger.handle(approvedEvent()), 'ci_not_green');
+  assert.ok(!off.forgejo.calls.some((call) => call.path.includes('/contents/')));
+});
+
 test('merge: a protected path hands the pull request to a human with the WIP marker already removed', async () => {
   const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34/files']: [{ filename: 'compose.yaml' }] }));
   assert.equal(await merger.handle(approvedEvent()), 'protected_paths');
@@ -1152,7 +1173,8 @@ test('merge: nothing happens without policy, approval, green CI, a clean merge, 
     [pr({ head: { ref: 'feature/x', sha: 'cafe0000cafe' } }), 'not_an_agent_branch', []],
     [pr({ mergeable: false }), 'not_mergeable', ['POST /issues/34/comments']],
     [{ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'pending', total_count: 1 } }, 'ci_not_green', []],
-    [{ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'success', total_count: 0 } }, 'ci_not_green', []]
+    // nothing reported yet while the repository has workflows: the CI has not started, so not green
+    [{ ['GET ' + API + '/commits/cafe0000cafe/status']: { state: 'success', total_count: 0 }, ['GET ' + API + '/contents/.forgejo/workflows']: [{ type: 'file', name: 'ci.yaml' }] }, 'ci_not_green', []]
   ];
   for (const [over, outcome, wrote] of cases) {
     const { merger, forgejo } = await mergerFor(goodRoutes(over));

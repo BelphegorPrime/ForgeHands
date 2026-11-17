@@ -106,6 +106,8 @@ export interface DirectConfig extends BaseConfig {
   forgejo: ForgejoAccess | null;
   blockedLabel: string;
   updateBranches: boolean;
+  /** REVIEW_WITHOUT_CI: a pull request in a repository without any workflow file is reviewed without waiting for a green CI run. */
+  reviewWithoutCi: boolean;
   waitForSameFiles: boolean;
   branchUpdateDelayMs: number;
   branchUpdateMinIntervalMs: number;
@@ -202,9 +204,18 @@ export interface PushEvent extends BaseEvent {
   after: string;
 }
 
-export type NormalizedEvent = ForgeEvent | PushEvent;
+/** A commit on a branch that may be an agent's or a bot's pull request (REVIEW_WITHOUT_CI). `pull_request` is set when the event named the pull request itself. */
+export interface BranchPushEvent extends BaseEvent {
+  type: 'push.branch';
+  branch: string;
+  after: string;
+  pull_request?: number;
+}
+
+export type NormalizedEvent = ForgeEvent | PushEvent | BranchPushEvent;
 
 export const isPushEvent = (event: NormalizedEvent): event is PushEvent => event.type === 'push.default';
+export const isBranchPush = (event: NormalizedEvent): event is BranchPushEvent => event.type === 'push.branch';
 
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
 export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry';

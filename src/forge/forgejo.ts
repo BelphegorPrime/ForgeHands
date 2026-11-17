@@ -22,13 +22,18 @@ export async function forgejoCall(config: ForgejoConfig, send: Fetch, repository
     signal: AbortSignal.timeout(config.timeoutMs),
     redirect: 'error'
   }).catch((error) => { metrics.apiError('forgejo', null); throw error; });
-  if (!response.ok) { metrics.apiError('forgejo', response.status); throw new Error(method + ' ' + path + ' -> HTTP ' + response.status); }
+  // A missing workflow folder is an ordinary answer of the contents API, not an error worth counting.
+  if (!response.ok) { if (!(response.status === 404 && path.startsWith('/contents/'))) metrics.apiError('forgejo', response.status); throw new Error(method + ' ' + path + ' -> HTTP ' + response.status); }
   return response.json().catch(() => null);
 }
 
 export function forgejoTransport(config: ForgejoConfig, send: Fetch, dry: DryLog = new DryLog()): Transport {
   return (repository, method, path, body) => forgejoCall(config, send, repository, method, path, body, dry);
 }
+
+// Where Forgejo looks for workflows (modules/actions/workflows.go ListWorkflows): the first of these folders that exists in the tree is the
+// one it uses, whether or not it holds workflows. Gitea looks in the last two.
+const WORKFLOW_DIRS = ['.forgejo/workflows', '.gitea/workflows', '.github/workflows'];
 
 export const FORGEJO_WIP = /^\s*(?:\[WIP\]|WIP:)\s*/i;
 
@@ -116,6 +121,20 @@ export class ForgejoForge implements Forge {
   async commitTime(repository: string, sha: string): Promise<string | null> {
     const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
     return commit?.created || commit?.commit?.committer?.date || null;
+  }
+  // A 404 means the folder is absent. Any other failure, or an answer that is no folder listing, throws: "unknown" must never read as "no CI".
+  async hasWorkflows(repository: string, sha: string): Promise<boolean> {
+    for (const dir of WORKFLOW_DIRS) {
+      let listing: Json;
+      try { listing = await this.call(repository, 'GET', '/contents/' + dir + '?ref=' + encodeURIComponent(sha)); }
+      catch (error) {
+        if (/HTTP 404\b/.test(error.message)) continue;
+        throw error;
+      }
+      if (!Array.isArray(listing)) throw new Error('GET /contents/' + dir + ' did not answer with a folder listing');
+      return listing.some((entry: Json) => entry?.type === 'file' && /\.ya?ml$/i.test(String(entry.name || '')));
+    }
+    return false;
   }
   async branchTip(repository: string, branch: string): Promise<string | null> {
     const head = await this.call(repository, 'GET', '/branches/' + encodeURIComponent(branch));

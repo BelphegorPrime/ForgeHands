@@ -9,7 +9,8 @@ import { collectDigest, digestDue } from '../notify/digest.ts';
 import { digestMessage, immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
-import type { DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
+import { isBotPull } from '../forge/bot.ts';
+import type { BranchPushEvent, DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 
@@ -172,6 +173,55 @@ export class Dispatcher {
     const results: { status: string }[] = [];
     for (const label of labels) results.push(await this.enqueueOne({ ...event, label }));
     return results.find((result) => result.status === 'queued') ?? results.find((result) => result.status === 'deferred') ?? results[0] ?? { status: 'duplicate_job' };
+  }
+
+  // REVIEW_WITHOUT_CI: a commit arrived on a branch (a push, or a pull request opened or updated). When it is the head of an open pull request of
+  // an agent or a listed bot, in a repository that has no CI at that commit, no CI run will ever report, so the review starts as a green run
+  // would have: the same event, the same key per commit, the same security review. Anything unclear (the forge cannot be read, the pull request
+  // is gone or has moved on) starts nothing; the next event tries again.
+  async onBranchPush(event: BranchPushEvent): Promise<string> {
+    if (!this.config.reviewWithoutCi || !this.config.forgejo) return 'review_without_ci_off';
+    const label = [...this.config.routes].find(([, route]) => route.kind === 'ci_success')?.[0];
+    if (!label) return 'no_review_route';
+    const repository = event.repository.full_name;
+    let pr: Json;
+    try {
+      if (event.pull_request) pr = await this.forge.getPull(repository, event.pull_request);
+      else pr = (await this.forge.listPulls(repository, { state: 'open', limit: 50 })).find((entry: Json) => entry?.head?.ref === event.branch && entry.state === 'open');
+    } catch (error) {
+      this.logger.error('could not look for the pull request of ' + repository + ' ' + event.branch + ':', error.message);
+      return 'pull_unreadable';
+    }
+    if (!pr || pr.state !== 'open' || pr.merged || pr.head?.ref !== event.branch) return 'no_open_pull';
+    if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return 'not_an_agent_branch';
+    const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
+    const match = /^ai\/issue-(\d+)$/.exec(pr.head.ref);
+    if (!bot && !match) return 'not_an_agent_branch';
+    // As for a CI outcome: an agent's commit counts only from a sender who may trigger runs; a bot is let in by BOT_AUTHORS.
+    if (!bot && this.config.allowedSenders && !this.config.allowedSenders.has(String(event.sender.login || '').toLowerCase())) return 'sender_not_allowed';
+    const sha: string = pr.head.sha;
+    // The head of the pull request is read from the forge; an event for another commit is older or newer news and says nothing about it.
+    if (typeof sha !== 'string' || sha.toLowerCase() !== event.after.toLowerCase()) return 'stale_push';
+    try {
+      const status = await this.forge.commitStatus(repository, sha);
+      if (status?.total_count > 0) return 'ci_expected';
+    } catch (error) {
+      this.logger.error('commit status failed:', error.message);
+      return 'ci_unknown';
+    }
+    if (!(await this.merger.noWorkflows(repository, sha))) return 'ci_expected';
+    const number = pr.number;
+    const issue = { number: bot ? number : Number(match![1]), title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000),
+      html_url: pr.html_url || null, comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0, labels: [] as string[] };
+    const ci: ForgeEvent = {
+      type: 'ci.success', source: this.forge.kind, action: 'no_ci', ...(bot ? { bot: true } : {}), label,
+      repository: event.repository, issue, pull_request: { number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+      ci: { run_id: null, workflow: '', commit_sha: sha, status: 'no_ci', html_url: null }, sender: event.sender
+    };
+    const result = await this.enqueue(ci);
+    // One line per commit that started something; a duplicate (the push and the pull request event of one commit) says nothing more.
+    if (result.status === 'queued' || result.status === 'deferred') this.logger.error(repository + '#' + number + ': no CI in ' + repository + ', reviewing ' + sha.slice(0, 7) + ' without it');
+    return result.status;
   }
 
   // A native review (VERDICT_SOURCE review or both) arrived. An approval asks the merger to look at the reviews of the head commit; the merger
@@ -457,15 +507,14 @@ export class Dispatcher {
   }
 
   // Forgejo sends one event per finished workflow run. All workflows of the commit have to be green: the combined commit
-  // status says so. Without Forgejo access ForgeHands cannot tell and starts no review.
+  // status says so (a repository without any workflow file needs no green run, see REVIEW_WITHOUT_CI). Without Forgejo access ForgeHands cannot tell and starts no review.
   async commitGreen(event: ForgeEvent): Promise<boolean> {
     if (!this.config.forgejo) {
       this.logger.error('ci success of ' + this.issueKey(event) + ' ignored: FORGEJO_URL and FORGEJO_TOKEN are needed to check the commit status');
       return false;
     }
     try {
-      const status = await this.forge.commitStatus(event.repository.full_name, event.ci!.commit_sha);
-      return status?.state === 'success' && status.total_count > 0;
+      return Boolean(await this.merger.ciGreen(event.repository.full_name, event.ci!.commit_sha));
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
       return false;
