@@ -94,6 +94,8 @@ export interface AgentApi {
   pull(number: number | string): string;
   pullDiff(number: number | string): string;
   pullReviews(number: number | string): string;
+  /** How an agent submits a native review of a commit, as a phrase for the review prompt; absent: POST to `pullReviews` with an event, commit_id and body. */
+  reviewPost?(number: number | string, sha: string): string;
   /** All pull requests of the repository, any state. */
   pulls(): string;
   labels(): string;

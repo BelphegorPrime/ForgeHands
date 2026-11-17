@@ -68,7 +68,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
   // The verdict as a native review (VERDICT_SOURCE review; with both, a route that has its own Forgejo user): POSTed to the reviews API
   // pinned to the commit, no label. The body carries the evidence under the same rules as the comment.
   const native = mode === 'review' && (config.verdictSource === 'review' || (config.verdictSource === 'both' && Boolean(config.routes.get(event.label ?? '')?.forgejoTokenSecret)));
-  const reviewPost = !ci ? '' : 'POST ' + agent.pullReviews(pr.number) + ' with a JSON body {"event": "APPROVED" or "REQUEST_CHANGES", "commit_id": "' + ci.commit_sha + '", "body": "<the evidence>"}';
+  const reviewPost = !ci ? '' : agent.reviewPost ? agent.reviewPost(pr.number, ci.commit_sha) : 'POST ' + agent.pullReviews(pr.number) + ' with a JSON body {"event": "APPROVED" or "REQUEST_CHANGES", "commit_id": "' + ci.commit_sha + '", "body": "<the evidence>"}';
   if (native && bot) {
     const rounds = config.botFixRounds > 0;
     return [

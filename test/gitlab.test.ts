@@ -325,18 +325,78 @@ test('labels are handled by name: found or created, added and removed with add_l
   assert.deepEqual(calls.slice(-2), [['PUT', '/merge_requests/4', { add_labels: 'ai:blocked' }], ['PUT', '/issues/12', { remove_labels: 'ai:ready' }]]);
 });
 
-test('reviews are approvals and notes: approve pins the sha, request changes and comments are notes', async () => {
-  const { calls, call } = recorder({ 'GET /merge_requests/4/approvals': { approved_by: [{ user: { id: 5, username: 'rev' } }] },
-    'GET /merge_requests/4/discussions?per_page=100': [{ notes: [{ type: 'DiffNote', author: { id: 5, username: 'rev' }, body: 'nit', created_at: 'x' }, { type: null, author: { id: 5 }, body: 'general' }] }] });
+const SHA = 'a'.repeat(40);
+const reviewEnv = () => env({
+  VERDICT_SOURCE: 'review', AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,REVIEWER_TOKEN', REVIEWER_TOKEN: 'glpat-reviewer',
+  LABEL_ROUTES: JSON.stringify({ 'ai:review': { profile: WORKER, tier: 'strong', on: 'ci_success', forgejo_token_secret: 'REVIEWER_TOKEN' } })
+});
+const NEW_SHA = 'b'.repeat(40);
+const review = (id, user, text, sha, at) => ({ id, type: null, system: false, author: { id: id * 10, username: user }, body: text + '\n\nCommit: ' + sha, created_at: at });
+
+test('reviews are read as native reviews: the verdict note names the commit, an OK counts only with the approval of its author, the newest per reviewer wins', async () => {
+  const notes = [
+    review(1, 'rev', '## Verdict: OK\nevidence', SHA, '2026-01-01T00:00:00Z'),
+    review(2, 'other', '## Verdict: OK\nevidence', SHA, '2026-01-01T00:01:00Z'),
+    review(3, 'rev', '## Verdict: NOT OK\nbroken', SHA, '2026-01-01T00:02:00Z'),
+    { id: 4, system: true, author: { username: 'rev' }, body: '## Verdict: OK\n\nCommit: ' + SHA, created_at: 'x' },
+    { id: 5, author: { username: 'rev' }, body: 'just chatting', created_at: 'y' },
+    { id: 6, author: { username: 'rev' }, body: '## Verdict: OK without a commit', created_at: 'z' }
+  ];
+  const { call } = recorder({ 'GET /merge_requests/4/approvals': { approved_by: [{ user: { id: 5, username: 'rev' } }] }, 'GET /merge_requests/4/notes?sort=asc&order_by=created_at&per_page=100': notes });
+  const reviews = await new GitlabForge(call).listReviews(repo, 4);
+  // `other` said OK without approving: no review. `rev` approved and said OK, then said NOT OK: both are reviews, the Merger takes the newest.
+  assert.deepEqual(reviews.map((r) => [r.id, r.user.login, r.state, r.commit_id]), [[1, 'rev', 'APPROVED', SHA], [3, 'rev', 'REQUEST_CHANGES', SHA]]);
+  assert.ok(reviews[0].body.length > 10);
+  assert.equal(reviews[0].submitted_at, '2026-01-01T00:00:00Z');
+});
+
+test('the Merger in review mode accepts a GitLab approval of the head commit and refuses one of an older commit', async () => {
+  const { Merger } = await import('../src/forge/merge.ts');
+  const make = (head) => {
+    const notes = [review(1, 'rev', '## Verdict: OK\n' + 'evidence '.repeat(100), SHA, '2026-01-01T00:00:00Z')];
+    const send = async (url) => ({ ok: true, status: 200, json: async () => url.includes('/approvals') ? { approved_by: [{ user: { username: 'rev' } }] } : notes });
+    return new Merger(loadConfig(reviewEnv()), send, { error() {} }).reviewOf(repo, 4, head);
+  };
+  assert.deepEqual(await make(SHA), { ok: true });
+  assert.equal((await make(NEW_SHA)).ok, false);
+});
+
+test('a GitLab review is submitted as a note that names the commit and, for approve, an approval pinned to it; request changes is the note alone', async () => {
+  const { calls, call } = recorder();
   const gitlab = new GitlabForge(call);
-  assert.deepEqual(await gitlab.listReviews(repo, 4), [{ id: 5, state: 'APPROVED', user: { login: 'rev' } }]);
-  assert.deepEqual(await gitlab.listReviewComments(repo, 4, 5), [{ created_at: 'x', body: 'nit', user: { login: 'rev' } }]);
-  await gitlab.submitReview(repo, 4, 'approve', 'looks good', 'abc');
-  await gitlab.submitReview(repo, 4, 'request_changes', 'fix it');
-  await gitlab.submitReview(repo, 4, 'approve', '');
-  assert.deepEqual(calls.slice(2).map(([method, path, body]) => method + ' ' + path + ' ' + JSON.stringify(body)), [
-    'POST /merge_requests/4/approve {"sha":"abc"}', 'POST /merge_requests/4/notes {"body":"looks good"}',
-    'POST /merge_requests/4/notes {"body":"fix it"}', 'POST /merge_requests/4/approve {}']);
+  await gitlab.submitReview(repo, 4, 'approve', '## Verdict: OK\nlooks good', SHA);
+  await gitlab.submitReview(repo, 4, 'request_changes', '## Verdict: NOT OK\nfix it', SHA);
+  await gitlab.submitReview(repo, 4, 'approve', '', SHA);
+  assert.deepEqual(calls.map(([method, path, body]) => method + ' ' + path + ' ' + JSON.stringify(body)), [
+    'POST /merge_requests/4/notes ' + JSON.stringify({ body: '## Verdict: OK\nlooks good\n\nCommit: ' + SHA }), 'POST /merge_requests/4/approve {"sha":"' + SHA + '"}',
+    'POST /merge_requests/4/notes ' + JSON.stringify({ body: '## Verdict: NOT OK\nfix it\n\nCommit: ' + SHA }),
+    'POST /merge_requests/4/notes ' + JSON.stringify({ body: '\n\nCommit: ' + SHA }), 'POST /merge_requests/4/approve {"sha":"' + SHA + '"}'].slice(0, 5));
+  const inline = recorder({ 'GET /merge_requests/4/notes?sort=asc&order_by=created_at&per_page=100': [{ id: 1, author: { id: 5 }, body: 'x' }, { id: 2, type: 'DiffNote', author: { id: 5, username: 'rev' }, body: 'nit', created_at: 'x' }, { id: 3, type: 'DiffNote', author: { id: 6 }, body: 'no' }] });
+  assert.deepEqual(await new GitlabForge(inline.call).listReviewComments(repo, 4, 1), [{ created_at: 'x', body: 'nit', user: { login: 'rev' } }]);
+});
+
+test('a GitLab approval or withdrawn approval of an agent merge request triggers a look at the reviews; the payload is not believed', () => {
+  const hook = (action, attrs = {}) => mrHook({ changes: {}, labels: [] }, { action, ...attrs });
+  const approved = norm('Merge Request Hook', hook('approval'));
+  assert.equal(approved.type, 'pull_request.review_approved');
+  assert.equal(approved.pull_request.number, 4);
+  assert.equal(approved.issue.number, 12);
+  assert.equal(approved.sender.login, 'marcel');
+  assert.equal(norm('Merge Request Hook', hook('unapproval')).type, 'pull_request.review_rejected');
+  assert.equal(norm('Merge Request Hook', hook('approved')), null, 'the all-rules-met event comes with the last approval');
+  assert.equal(norm('Merge Request Hook', hook('approval', { source_branch: 'feature/x' })), null);
+  assert.equal(norm('Merge Request Hook', hook('approval', { state: 'merged' })), null);
+});
+
+test('the review prompt of a GitLab agent posts a note naming the commit and approves with the sha', () => {
+  const config = loadConfig(reviewEnv());
+  const event = { type: 'ci.success', label: 'ai:review', repository: { full_name: repo, clone_url: 'https://gitlab.example/group/sub/hello.git', default_branch: 'main' },
+    issue: { number: 12, title: 'T', body: 'B', html_url: 'x', labels: [] }, pull_request: { number: 4, head_ref: 'ai/issue-12', html_url: 'y' }, ci: { commit_sha: SHA, workflow: 'Build', status: 'success' }, sender: { login: 'marcel' } };
+  const prompt = buildPrompt(event, config);
+  assert.ok(prompt.includes('/merge_requests/4/notes'));
+  assert.ok(prompt.includes('/merge_requests/4/approve'));
+  assert.ok(prompt.includes('Commit: ' + SHA));
+  assert.ok(!prompt.includes('"commit_id"'));
 });
 
 test('the transport sends the PRIVATE-TOKEN to the encoded project path, counts nothing on success and throws with the status', async () => {

@@ -48,6 +48,9 @@ export function gitlabAgentApi(repository: string): AgentApi {
     pullDiff: (number) => api + '/merge_requests/' + number + '/diffs',
     // GitLab has no list of reviews: what a reviewer leaves are discussions (inline ones are the review comments), approvals are a state.
     pullReviews: (number) => api + '/merge_requests/' + number + '/discussions',
+    // GitLab's REST API has no review object: the verdict is a note that begins with the verdict line and names the commit, and an
+    // approval (pinned to the commit) when it says yes. ForgeHands reads both (see `listReviews`).
+    reviewPost: (number, sha) => 'two steps. First POST ' + api + '/merge_requests/' + number + '/notes with a JSON body {"body": "<the review>"}; the review text ends with the line `Commit: ' + sha + '`. Then, only when you approve, POST ' + api + '/merge_requests/' + number + '/approve with {"sha": "' + sha + '"}. "REQUEST_CHANGES" below means the note alone, with `## Verdict: NOT OK`, and no approve call',
     pulls: () => api + '/merge_requests?state=all&per_page=100',
     labels: () => api + '/labels',
     issueLabels: (number) => api + '/issues/' + number,
@@ -196,22 +199,42 @@ export class GitlabForge implements Forge {
   stripWip(title: string): string { return title.replace(GITLAB_DRAFT, ''); }
   async setPullTitle(repository: string, number: number, title: string): Promise<void> { await this.call(repository, 'PUT', '/merge_requests/' + number, { title }); }
 
-  // What GitLab has instead of reviews: approvals (a state per user) and discussions, whose inline notes are the review comments.
+  // What GitLab has instead of reviews. A review of ForgeHands is a note that begins with `## Verdict: OK` or `## Verdict: NOT OK` and
+  // ends with `Commit: <sha>` (what `submitReview` and the agent prompt write), plus, for OK, an approval by the same user (listed
+  // by the approvals API). The note gives the review its text and its commit, because an approval alone names neither and might survive
+  // a push. An OK without that user's approval is no review at all; NOT OK is a request for changes. The newest such note per user wins.
   async listReviews(repository: string, number: number): Promise<Review[]> {
-    const approvals = await this.call(repository, 'GET', '/merge_requests/' + number + '/approvals');
-    return (Array.isArray(approvals?.approved_by) ? approvals.approved_by : []).map((entry: Json) => ({ id: entry.user?.id, state: 'APPROVED', user: { login: entry.user?.username } }));
+    const [approvals, notes] = await Promise.all([
+      this.call(repository, 'GET', '/merge_requests/' + number + '/approvals'),
+      this.call(repository, 'GET', '/merge_requests/' + number + '/notes?sort=asc&order_by=created_at&per_page=100')
+    ]);
+    const approvers = new Set((Array.isArray(approvals?.approved_by) ? approvals.approved_by : []).map((entry: Json) => String(entry.user?.username || '').toLowerCase()));
+    const reviews: Review[] = [];
+    for (const note of (Array.isArray(notes) ? notes : []) as Json[]) {
+      const login = String(note.author?.username || '');
+      const verdict = /^\s*#+\s*Verdict\s*:\s*(not\s+ok|ok)\b/i.exec(String(note.body || ''));
+      const commit = /\bCommit\s*:\s*`?([0-9a-f]{40,64})\b/i.exec(String(note.body || ''));
+      if (note.system || !login || !verdict || !commit) continue;
+      const ok = !/^not/i.test(verdict[1]);
+      if (ok && !approvers.has(login.toLowerCase())) continue;
+      reviews.push({ id: note.id, state: ok ? 'APPROVED' : 'REQUEST_CHANGES', body: String(note.body), commit_id: commit[1], user: { login }, submitted_at: note.created_at });
+    }
+    return reviews;
   }
-  // `reviewId` is the id of the reviewer (as `listReviews` gives it): the inline notes that user wrote.
+  // The inline comments (diff notes) of one reviewer. `reviewId` is the id of a review from `listReviews`; GitLab does not group inline
+  // notes by review, so these are all the inline notes of the author of that review note.
   async listReviewComments(repository: string, number: number, reviewId: Review['id']): Promise<Comment[]> {
-    const discussions = await this.call(repository, 'GET', '/merge_requests/' + number + '/discussions?per_page=100');
-    return (Array.isArray(discussions) ? discussions : []).flatMap((discussion: Json) => discussion.notes || [])
-      .filter((note: Json) => note.type === 'DiffNote' && !note.system && note.author?.id === reviewId).map(commentOf);
+    const notes = await this.call(repository, 'GET', '/merge_requests/' + number + '/notes?sort=asc&order_by=created_at&per_page=100');
+    const author = (Array.isArray(notes) ? notes : []).find((note: Json) => note.id === reviewId)?.author?.id;
+    return (Array.isArray(notes) ? notes : []).filter((note: Json) => note.type === 'DiffNote' && !note.system && author !== undefined && note.author?.id === author).map(commentOf);
   }
-  // Approve (pinned to the commit when given) and say why in a note. GitLab's REST API has no "request changes": that verdict, like a
-  // plain comment, is a note.
+  // Submit a review the way `listReviews` reads it: the note (with the commit named on its last line) and, for approve, the approval
+  // pinned to the commit. GitLab's REST API has no "request changes": that verdict is the note alone, which should begin with
+  // `## Verdict: NOT OK`. The note comes first, so that the approval event finds it.
   async submitReview(repository: string, number: number, verdict: ReviewVerdict, body: string, commitSha?: string): Promise<void> {
+    const text = commitSha && !body.includes(commitSha) ? body + '\n\nCommit: ' + commitSha : body;
+    if (text) await this.call(repository, 'POST', '/merge_requests/' + number + '/notes', { body: text });
     if (verdict === 'approve') await this.call(repository, 'POST', '/merge_requests/' + number + '/approve', commitSha ? { sha: commitSha } : {});
-    if (body) await this.call(repository, 'POST', '/merge_requests/' + number + '/notes', { body });
   }
 
   // The pipelines of a commit, folded into one answer. Of the pipelines that ran for the same ref and source (a rerun on the same commit)

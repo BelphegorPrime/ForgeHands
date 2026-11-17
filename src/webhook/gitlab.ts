@@ -64,6 +64,7 @@ function normalizeIssue(payload: Json, allowedRepos: Set<string>, triggers: stri
 function normalizeMergeRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string, _bots?: NormalizeOptions['bots']): ForgeEvent | null {
   const mr = payload.object_attributes;
   const repository = repositoryOf(payload, allowedRepos);
+  if (repository && mr && (mr.action === 'approval' || mr.action === 'unapproval')) return normalizeReview(payload, mr, repository);
   if (!repository || !mr || (!labels.length && !approved) || mr.action !== 'update' || mr.state !== 'opened' || !positive(mr.iid)) return null;
   const change = labelChange(payload);
   const match = /^ai\/issue-(\d+)$/.exec(String(mr.source_branch || ''));
@@ -83,6 +84,24 @@ function normalizeMergeRequest(payload: Json, allowedRepos: Set<string>, labels:
     label: matched,
     repository,
     issue: { number: Number(match[1]), title: String(mr.title || '').slice(0, 1000), body: String(mr.description || '').slice(0, 50000), html_url: mr.url || null, comments: 0, labels: present },
+    pull_request: { number: mr.iid, head_ref: mr.source_branch, html_url: mr.url || null },
+    sender: { login: payload.user?.username || null }
+  };
+}
+
+// A user approved (`approval`) or withdrew the approval (`unapproval`) of the merge request of an agent issue. Like Forgejo's review
+// events this only triggers a look at the reviews as GitLab has them (Merger.reviewOf); the payload's word is never taken. `approved`
+// (all rules met) is not used: it comes together with the last `approval`. The author is not in the payload, so a bot's merge request
+// is not recognised here.
+function normalizeReview(payload: Json, mr: Json, repository: ForgeEvent['repository']): ForgeEvent | null {
+  const match = /^ai\/issue-(\d+)$/.exec(String(mr.source_branch || ''));
+  if (mr.state !== 'opened' || !positive(mr.iid) || !match || !positive(Number(match[1]))) return null;
+  return {
+    type: mr.action === 'approval' ? 'pull_request.review_approved' : 'pull_request.review_rejected',
+    source: 'gitlab',
+    action: 'reviewed',
+    repository,
+    issue: { number: Number(match[1]), title: String(mr.title || '').slice(0, 1000), body: String(mr.description || '').slice(0, 50000), html_url: mr.url || null, comments: 0, labels: names(payload.labels ?? mr.labels) },
     pull_request: { number: mr.iid, head_ref: mr.source_branch, html_url: mr.url || null },
     sender: { login: payload.user?.username || null }
   };

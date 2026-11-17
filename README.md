@@ -91,7 +91,7 @@ What does not work, or differs, on GitLab:
 - A dependency bot's merge request (`BOT_AUTHORS`) is recognised from the pipeline's user only: the merge request event does not name the author, so its label events (the approval) are ignored.
 - Pipelines on a merged result run on a merge commit, not on the head of the merge request, and are dropped as stale. Use plain merge request pipelines.
 - The event of a pipeline carries no merge request text; the agent reads it from the API. Issue events carry no comment count.
-- GitLab's REST API has no "request changes" review: `submitReview` approves (with the commit) or leaves a note. Reviews as the verdict (a native review) are therefore approvals plus notes.
+- **Native reviews** (`VERDICT_SOURCE=review` or `both`): GitLab's REST API has no review object and no "request changes". A review is a **note** that begins with `## Verdict: OK` or `## Verdict: NOT OK` and ends with `Commit: <sha>`, plus, for OK, the reviewer's **approval** (pinned with `sha`). ForgeHands reads the notes and the approvals: an OK counts only with the approval of its author, NOT OK is a request for changes, the newest note per reviewer wins, and the commit in the note must be the head (so an old approval does not survive a push). The agent prompt tells the reviewer to post exactly that. `approval` / `unapproval` events of the merge request trigger the check like Forgejo's review events.
 - The agent reads review comments from the merge request's discussions (`.../discussions`).
 - Metrics count GitLab API errors under the `forgehands_forgejo_api_errors_total` series (one family).
 
