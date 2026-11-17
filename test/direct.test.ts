@@ -499,6 +499,59 @@ async function buildWatched(extra) {
   return { forgejo, jobs, dispatcher, finish, comments: () => forgejo.filter((c) => c.method === 'POST' && c.path.endsWith('/comments')).map((c) => c.body.body) };
 }
 
+// A worker run that "finishes" without delivering anything is not a delivery.
+let deliveryRuns = 0;
+async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready' } = {}) {
+  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel' }));
+  const jobs = new JobStore(join(dir, 'delivery-' + (deliveryRuns++) + '.json'));
+  await jobs.load();
+  const forgejo = fakeForgejo({
+    ['GET ' + API + '/issues/26']: { number: 26, state: issueState, labels },
+    ['GET ' + API + '/pulls']: () => pulls,
+    ['GET ' + API + '/issues/26/comments']: () => comments,
+    ['POST ' + API + '/issues/26/comments']: {}
+  });
+  const api = fakeApi();
+  const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  await dispatcher.enqueue(event(label, 26));
+  await dispatcher.tick();
+  const job = jobs.list()[0];
+  const end = async () => { clock += 5 * 60000; states[job.conversation_id] = 'finished'; await dispatcher.tick(); };
+  return { jobs, job, forgejo, dispatcher, end, comments: () => forgejo.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/comments')).map((c) => c.body.body) };
+}
+
+test('a worker run that finishes without a pull request or a comment is run once more, then a human is called', async () => {
+  const t = await buildDelivery();
+  await t.end();
+  assert.equal(t.job.delivery_retry, 1);
+  assert.equal(t.job.status, 'running', 'queued again and started in the same pass');
+  await t.end();
+  assert.equal(t.job.status, 'failed');
+  assert.equal(t.job.result, 'no_delivery');
+  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, so nothing was delivered\./);
+});
+
+test('a pull request or a comment since the run began, a closed issue or an epic is a delivery or needs none', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString(); // (the clock moves on with every case)
+  const cases = () => ({
+    'a pull request updated since': { pulls: [{ number: 5, head: { ref: 'ai/issue-26' }, updated_at: at(60000), state: 'open', merged: false }] },
+    'a comment since': { comments: [{ created_at: at(60000), body: 'done', user: { login: 'openhands' } }] },
+    'the issue was closed': { issueState: 'closed' },
+    'a planner run (epic label)': { label: 'ai:plan' }
+  });
+  for (const name of Object.keys(cases())) {
+    const t = await buildDelivery(cases()[name]);
+    await t.end();
+    assert.equal(t.job.status, 'done', name);
+    assert.equal(t.job.delivery_retry, undefined, name);
+  }
+  const earlier = at(-3600000);
+  const stale = await buildDelivery({ pulls: [{ number: 5, head: { ref: 'ai/issue-26' }, updated_at: earlier, state: 'open', merged: false }], comments: [{ created_at: earlier, body: 'old', user: { login: 'openhands' } }] });
+  await stale.end();
+  assert.equal(stale.job.delivery_retry, 1, 'an old pull request and an old comment are not a delivery');
+});
+
 test('a run that ends with an error is started once more after a pause; a second error is reported to the human on the issue', async () => {
   const { jobs, dispatcher, finish, comments } = await buildWatched({ ERROR_RETRIES: '1' });
   await dispatcher.enqueue(event('ai:ready', 26));

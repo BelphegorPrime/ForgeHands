@@ -558,6 +558,36 @@ export class Dispatcher {
     }
   }
 
+  // A worker run on a ticket that ends as `finished` is not a delivery. A model that answers in words without a tool call can "finish" in a minute
+  // with nothing done, and the ticket then waits for ever (several tickets did). A run on an issue (not a plan or an epic) must leave a pull request
+  // from the branch ai/issue-<n> that was created or changed since the run started, or a comment on the issue written since then, or close the issue.
+  // Otherwise the run is made once more; after the second empty run a human is called. Best effort: when the forge cannot be read nothing happens.
+  async checkDelivery(job: Job): Promise<void> {
+    const event = job.event;
+    if (!this.config.forgejo || !event || event.pull_request || event.type === 'epic.done' || !job.started) return;
+    if (this.config.epicLabels.has(job.label) || (event.issue.labels || []).some((name) => this.config.epicLabels.has(name))) return;
+    try {
+      const since = job.started - 60000;
+      const repository = event.repository.full_name;
+      const issue = await this.forge.getIssue(repository, event.issue.number);
+      if (!issue || issue.state !== 'open') return;
+      const branch = 'ai/issue-' + event.issue.number;
+      const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
+      if (pulls.some((pr) => pr.head?.ref === branch && Date.parse(pr.updated_at) >= since)) return;
+      const comments = await this.forge.listComments(repository, event.issue.number, 50);
+      if (comments.some((comment) => Date.parse(comment.created_at) >= since)) return;
+      if (!job.delivery_retry) {
+        Object.assign(job, { status: 'queued', delivery_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
+        this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
+        return;
+      }
+      Object.assign(job, { status: 'failed', result: 'no_delivery' });
+      await this.reportFailure(job, 'no_delivery');
+    } catch (error) {
+      this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
+    }
+  }
+
   // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
   // for ever, green and unseen. Unless it moved on meanwhile, run it once more; after the second miss hand it to a human.
   async checkVerdict(job: Job): Promise<void> {
@@ -1017,6 +1047,7 @@ export class Dispatcher {
       if (done === 'ci_success') await this.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
       else if (state !== 'finished') await this.reportFailure(job, state);
+      else if (done === 'issue') await this.checkDelivery(job);
       return true;
     }
     if (costChanged) return true;
@@ -1037,7 +1068,9 @@ export class Dispatcher {
     const event = job.event;
     if (!this.config.forgejo || !event || state === 'deleted' || state === 'finished') return;
     const kind = this.config.routes.get(job.label)?.kind;
-    const what = 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
+    const what = state === 'no_delivery'
+      ? 'the run for ' + job.label + ' finished twice without a pull request and without a comment, so nothing was delivered'
+      : 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
     try {
       const exhausted = state === 'max_iterations' || state === 'paused' || state === 'stuck' || state === 'timeout';
       if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
