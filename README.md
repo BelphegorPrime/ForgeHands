@@ -16,7 +16,7 @@ In this document "pull request" also means a GitLab **merge request**, and "Forg
 - [Reviewer accounts](#reviewer-accounts-native-reviews)
 - [OpenHands setup](#openhands-setup)
 - [Configuration](#configuration)
-- [Behaviour in detail](#behaviour-in-detail)
+- [Behaviour in detail](#behaviour-in-detail), including [Notifications](#notifications)
 - [Status page and metrics](#status-page-and-metrics)
 - [Dry run](#dry-run)
 - [Security and limitations](#security-and-limitations)
@@ -307,6 +307,15 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `HUMAN_LOGIN` | none | Login mentioned in comments that hand something to a human (and only there). The agents need a forge user of their own: forges do not mail the actor of an action. |
 | `REMIND_AFTER_DAYS` | `0` (off) | `1` to `365`: remind `HUMAN_LOGIN` of pull requests that wait for him, see [Reminders](#reminders). Needs `FORGE_URL`, `FORGE_TOKEN` and `HUMAN_LOGIN`. |
 | `REMIND_MAX` | 3 | Reminders per pull request. |
+| `HUMAN_MENTION` | `1` | `0` writes the hand-over and reminder comments without the `@HUMAN_LOGIN` mention (the text is otherwise the same), so that the forge sends no mail. See [Notifications](#notifications). |
+| `NOTIFY_IMMEDIATE` | none | Comma list of kinds sent at once as a message of ForgeHands' own: `handover`, `blocked`, `conflict`, `failed`, `reminder`. Empty: none. Needs a channel. |
+| `NOTIFY_DIGEST` | off | `HH:MM` in `NOTIFY_TIMEZONE`: one digest per day at that time, only when something is for the human. Needs a channel. |
+| `NOTIFY_TIMEZONE`, `NOTIFY_LANGUAGE` | `UTC`, `en` | An IANA time zone (`Europe/Berlin`) for the digest time, and the language of the messages (`en` or `de`). |
+| `SMTP_HOST`, `SMTP_FROM`, `SMTP_TO` | none | The mail channel; all three together or none (a half-configured SMTP is an error that names what is missing). `SMTP_FROM` and each address of `SMTP_TO` (comma list) are plain addresses. |
+| `SMTP_PORT`, `SMTP_SECURITY` | 587, `starttls` | `starttls`, `tls` (implicit TLS, port 465 style) or `none` (a local relay). |
+| `SMTP_USER`, `SMTP_PASSWORD` | none | Login (AUTH PLAIN, else AUTH LOGIN); both or neither. With `SMTP_SECURITY=none` a login is accepted only to localhost. The password is read from the environment like the other secrets and never logged. |
+| `SMTP_TLS_VERIFY`, `SMTP_CA_FILE` | `1`, none | `0` accepts a certificate that does not verify (self-signed, the Proton Mail Bridge case); `SMTP_CA_FILE` is a PEM file to trust instead of the system store, which is the better fix. |
+| `NOTIFY_WEBHOOK_URL`, `NOTIFY_WEBHOOK_AUTH` | none | A second channel: POST `{subject, text, link, kind}` as JSON; the optional `NOTIFY_WEBHOOK_AUTH` is sent as the `Authorization` header. ntfy, Telegram bridges and the like sit behind it. |
 | `STALE_LABEL` | none | Label added with the last reminder. |
 | `ERROR_RETRIES` | 1 | Restarts of a run that ended in `error`; `0` switches it off. |
 | `QUOTA_HOLD_MAX_HOURS`, `QUOTA_GIVE_UP_HOURS` | 8, 24 | Out of quota: hold a tier back at most this long at a time, and give a job up once its quota has been out this long. |
@@ -422,6 +431,62 @@ For each, if the last ForgeHands comment is at least `n` days old, it writes one
 
 Design notes: the state lives in the forge's comments (reminders are recognised by their text), so nothing new is stored and a restart only empties the `/status` list until the next pass. A pass reads one pull request list per repository, examines at most 20 agent pull requests per repository and writes at most 10 reminders. The text is built from fixed strings, label names and dates, never from issue or pull request text, and only `HUMAN_LOGIN` is ever mentioned. The recognition of its own comments is by text prefix, so someone who can comment can fake one and only delay or use up the reminders of that pull request. Reminders under `DRY_RUN` are only logged.
 
+### Notifications
+
+By default the human hears of a hand-over only through the forge: a comment that mentions `HUMAN_LOGIN` makes the forge send its own mail, with its own subject and layout, for every hand-over, reminder and mention. Notifications are a second path of ForgeHands' own: a short, plain message when a human is needed and cannot be avoided, plus an optional daily digest. Both are off until configured, and `HUMAN_MENTION=0` lets the forge keep quiet.
+
+**What is sent.** *Immediate* messages (`NOTIFY_IMMEDIATE`, one kind each):
+
+| Kind | When |
+| --- | --- |
+| `handover` | A pull request is approved and green but touches a protected path: it waits for the human to merge. The message says what is done (reviewed, CI green, the security review OK, with CONCERNS or none), why a human is needed (the `reasons` text of `MERGE_POLICY` for the matching patterns, else "it touches protected paths"), how many files, and the link. |
+| `blocked` | A pull request or ticket got `BLOCKED_LABEL`: rounds used up, no verdict, an approval without a valid review, a dependency update a worker cannot fix. |
+| `conflict` | A conflict ForgeHands cannot resolve (no conflict route, or the pull request does not merge cleanly although approved). |
+| `failed` | A run failed for good and was reported, or the merge itself failed. |
+| `reminder` | A reminder (`REMIND_AFTER_DAYS`) was written: the pull request has waited for days. |
+
+A message is three to six short lines: the subject names the repository and number (`[homegraf] #140 waits for you to merge`), the body a cut title, the few facts above and the link in the `link` field (SMTP adds it as the last line). It never holds code, file names, file contents or ticket text beyond the title, cut at 80 characters and cleaned of control characters. `NOTIFY_LANGUAGE=de` writes the same in German (`[homegraf] #140 wartet auf deinen Merge`). Each message is sent from the same place as the comment that mentions the human; the comment itself is unchanged apart from the mention. With `NOTIFY_IMMEDIATE` empty (the default) nothing is sent.
+
+**The digest** (`NOTIFY_DIGEST=08:00`, time of `NOTIFY_TIMEZONE`): once a day, in the first housekeeping pass after that time, one message lists what is for the human now: pull requests waiting for him with their age in days (the list `/status` shows as `waiting_for_human`, which the daily reminder pass fills, so it needs `REMIND_AFTER_DAYS`), blocked tickets (blocked, with no run since), tiers held back by a quota and when they are expected back, and runs that failed for good in the last 24 hours; one closing line says how many tickets merged in the last 24 hours. A line looks like `#140 ingressctl: resolve presets … (waiting 2 days)`; at most 15 items are listed, then "and N more". **If there is nothing for the human, no message is sent** (no "all fine" mail). The date of the last digest is kept in the ledger, so a restart neither sends the day's digest twice nor skips it (a process that was down at the time sends it when it is up again the same day).
+
+**Set up SMTP.** For a mail server with a certificate that verifies:
+
+```
+SMTP_HOST=smtp.example.org
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_USER=forgehands@example.org
+SMTP_PASSWORD=...
+SMTP_FROM=forgehands@example.org
+SMTP_TO=maintainer@example.org
+NOTIFY_IMMEDIATE=handover,blocked,failed
+NOTIFY_DIGEST=08:00
+NOTIFY_TIMEZONE=Europe/Berlin
+HUMAN_MENTION=0
+```
+
+A **Proton Mail Bridge** on a LAN host listens on port 2025 (STARTTLS) with a self-signed certificate and a bridge-specific password. Either accept the certificate or, better, trust it by file:
+
+```
+SMTP_HOST=192.168.1.20
+SMTP_PORT=2025
+SMTP_SECURITY=starttls
+SMTP_USER=you@proton.me
+SMTP_PASSWORD=<the bridge password, not the account password>
+SMTP_FROM=you@proton.me
+SMTP_TO=you@proton.me
+SMTP_TLS_VERIFY=0            # the Bridge's certificate is self-signed
+# SMTP_CA_FILE=/run/secrets/bridge-cert.pem   # instead: keep verification on and trust this certificate
+```
+
+The client is built in (`node:net`, `node:tls`): `EHLO`, STARTTLS or implicit TLS or none, `AUTH PLAIN` with `AUTH LOGIN` as fallback, multi-line replies, timeouts (10 s to connect, 30 s per command). The message is `text/plain; charset=utf-8`, quoted-printable; a non-ASCII subject is an RFC 2047 encoded word. At start ForgeHands logs one line naming the channels, the immediate kinds and the digest time (never the password); `/status.json` has the same under `notify`. A send that fails is tried again after 1, 5 and 30 minutes, then logged and counted in `forgehands_notifications_total{channel,kind,result}` (`sent`, `failed`, `dry`); the retry queue lives in memory only, so a restart drops what was waiting. `notify` never blocks the loop or throws. Under `DRY_RUN` a notification is only logged, one line with the subject.
+
+**`HUMAN_MENTION=0`** writes the hand-over, failure and reminder comments without the `@login` so that the forge sends no mail; the rest of each comment is identical, and the comment stays the record on the pull request. Use it together with `NOTIFY_IMMEDIATE`, otherwise the human hears of nothing.
+
+**Other channels.** `NOTIFY_WEBHOOK_URL` posts `{"subject", "text", "link", "kind"}` as JSON (optional `Authorization` from `NOTIFY_WEBHOOK_AUTH`); ntfy, Telegram bridges and chat webhooks can be reached through it. A new channel is a class with `name` and `send(message)` in `src/notify/` (the `Channel` interface).
+
+**Security notes.** Every header value and address is stripped of CR, LF and other control characters before use, so a title or an address cannot start a header or an SMTP command; addresses must match a plain pattern or the send is refused; the subject is cut at 200 characters. STARTTLS is required, never optional: a server that does not offer it is an error, not a reason to send the password in clear text (`SMTP_SECURITY=none` with a login is accepted only to localhost). Errors name neither the password nor the webhook URL and token. Messages are built from fixed strings and a few safe fields; ticket text appears only as a title cut at 80 characters. `SMTP_TLS_VERIFY=0` removes protection against a man in the middle on the way to the mail server: use it only on a trusted LAN, or prefer `SMTP_CA_FILE`. Notifications apply in direct mode only.
+
 ### Housekeeping
 
 Finished runs archive themselves (`ARCHIVE_AFTER_DAYS`): about once an hour ForgeHands adds the tag `archived=true` (other tags stay, so runs can still be found by `source`, `issue`, `pr`, `ci`, `epic`) to conversations that ended long enough ago, at most 20 per round. Archived runs stay in the ledger until it prunes them (30 days).
@@ -432,7 +497,7 @@ Both are direct mode only, read only and served by the same port as the webhook.
 
 **Authentication.** With `STATUS_TOKEN` set (at least 16 characters), `/status`, `/status.json` and `/metrics` answer `401` (with `WWW-Authenticate: Basic`, no ledger data) unless the request carries `Authorization: Bearer <token>` or HTTP basic auth with any user name and the token as password, so a browser can open the page. The comparison is constant time. Basic auth sends the token in base64 on every request: keep it behind TLS. `/healthz` stays open. Without `STATUS_TOKEN` all three are open and ForgeHands logs a warning at start; either way keep them behind the same internal reverse proxy as the webhook.
 
-**`GET /status`, `GET /status.json`.** Per issue (and per dependency bot pull request) what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`, with "escalated to <label>" when the last round ran on the stronger route) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, waiting for a human, failed). No event text but the issue title. The page refreshes itself every 30 seconds (a meta refresh, no script). A dry run shows a banner, and `/status.json` has `dry_run` with the repositories and the latest would-be writes.
+**`GET /status`, `GET /status.json`.** Per issue (and per dependency bot pull request) what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`, with "escalated to <label>" when the last round ran on the stronger route) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, waiting for a human, failed). No event text but the issue title. The page refreshes itself every 30 seconds (a meta refresh, no script). `/status.json` also has `notify` (channels, immediate kinds, digest time; no secrets). A dry run shows a banner, and `/status.json` has `dry_run` with the repositories and the latest would-be writes.
 
 **The summary** above the tickets (in `/status.json` under `summary`, per repository, for the last 7 and 30 days of the ledger):
 
@@ -450,7 +515,7 @@ Both are direct mode only, read only and served by the same port as the webhook.
 
 **Closed tickets.** When ForgeHands learns that an issue is closed (the `issues closed` event, or `closeMergedTickets`), it marks the ledger jobs of the issue (`archived_view`, kept in the ledger; runs that are still queued or running are not marked). Such an issue is listed in a collapsed "Closed" section of the page and has `closed: true` and state `closed` in `/status.json`; it never appears in `waiting_for_human` and never as "rounds used up" or failed. At start and then once a day, in the hourly housekeeping pass, ForgeHands reads the issues of tickets with a failed run, used-up rounds or a waiting job from the forge (at most 20 per pass, the rest in the next pass) and marks those the forge reports closed; a failed read changes nothing. The counts of the summary do not change.
 
-**`GET /metrics`.** Prometheus text format, written by hand, no dependency. Gauges from the ledger, read at scrape time: `forgehands_jobs{status,kind}`, `forgehands_jobs_waiting`, `forgehands_queued_jobs{repository}`, `forgehands_tier_cooldown_active{tier}`. Counters since start (in memory, they reset on restart): `forgehands_webhook_deliveries_total{event,result}` (result `accepted`, `ignored`, `duplicate`, `rejected_signature` or `failed`), `forgehands_runs_started_total{kind}`, `forgehands_runs_finished_total{kind,state}`, `forgehands_merges_total{repository}`, `forgehands_merge_refusals_total{reason}` (`protected_paths`, `no_valid_review`, `ci_not_green`, `not_mergeable`, `blocked`, `merge_failed`), `forgehands_blocks_total{reason}`, `forgehands_error_retries_total`, `forgehands_branch_updates_total`, `forgehands_branch_conflicts_total`, `forgehands_openhands_api_errors_total{class}`, `forgehands_forgejo_api_errors_total{class}` (the forge's API errors, whichever forge; class `network`, `4xx` or `5xx`), `forgehands_escalated_rounds_total`, `forgehands_tier_runs_total{repository,tier,result}` (ended runs by the tier they really ran on; result `finished`, `max_iterations`, `error`, `stuck`, `timeout`, `no_delivery` or `other`; a worker run that finished without delivering counts as `finished` and again as `no_delivery`), `forgehands_reminders_total`, `forgehands_dry_run_writes_total`; and the histogram `forgehands_run_duration_seconds{kind}`. Labels come from known sets only (repositories of `ALLOWED_REPOS`, route kinds, tiers, fixed reasons), never issue numbers. A 404 from OpenHands is not counted as an error (a deleted conversation is a normal answer).
+**`GET /metrics`.** Prometheus text format, written by hand, no dependency. Gauges from the ledger, read at scrape time: `forgehands_jobs{status,kind}`, `forgehands_jobs_waiting`, `forgehands_queued_jobs{repository}`, `forgehands_tier_cooldown_active{tier}`. Counters since start (in memory, they reset on restart): `forgehands_webhook_deliveries_total{event,result}` (result `accepted`, `ignored`, `duplicate`, `rejected_signature` or `failed`), `forgehands_runs_started_total{kind}`, `forgehands_runs_finished_total{kind,state}`, `forgehands_merges_total{repository}`, `forgehands_merge_refusals_total{reason}` (`protected_paths`, `no_valid_review`, `ci_not_green`, `not_mergeable`, `blocked`, `merge_failed`), `forgehands_blocks_total{reason}`, `forgehands_error_retries_total`, `forgehands_branch_updates_total`, `forgehands_branch_conflicts_total`, `forgehands_openhands_api_errors_total{class}`, `forgehands_forgejo_api_errors_total{class}` (the forge's API errors, whichever forge; class `network`, `4xx` or `5xx`), `forgehands_escalated_rounds_total`, `forgehands_tier_runs_total{repository,tier,result}` (ended runs by the tier they really ran on; result `finished`, `max_iterations`, `error`, `stuck`, `timeout`, `no_delivery` or `other`; a worker run that finished without delivering counts as `finished` and again as `no_delivery`), `forgehands_reminders_total`, `forgehands_notifications_total{channel,kind,result}` (`sent`, `failed` or `dry`), `forgehands_dry_run_writes_total`; and the histogram `forgehands_run_duration_seconds{kind}`. Labels come from known sets only (repositories of `ALLOWED_REPOS`, route kinds, tiers, fixed reasons), never issue numbers. A 404 from OpenHands is not counted as an error (a deleted conversation is a normal answer).
 
 Point Prometheus at it with the token as bearer credential:
 

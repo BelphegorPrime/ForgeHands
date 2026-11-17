@@ -2,6 +2,7 @@ import { isDry } from '../dry.ts';
 import type { DryLog, DryWrite } from '../dry.ts';
 import type { DirectConfig, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
+import { notifyChannels } from '../notify/config.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -22,6 +23,8 @@ export interface TierStats {
 export interface Status {
   generated: string;
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
+  // Where the human is told (no secrets): the channels, the immediate kinds and the time of the digest.
+  notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats }> }>;
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
@@ -183,6 +186,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   return {
     generated: new Date(now).toISOString(),
     dry_run: config.dryRun ? { repositories: config.dryRunRepos.size ? [...config.dryRunRepos] : 'all', would_write: dry?.writes.slice(-50) || [] } : null,
+    notify: { channels: notifyChannels(config.notify), immediate: config.notify.immediate, digest: config.notify.digest },
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
     summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier] }])) }])),

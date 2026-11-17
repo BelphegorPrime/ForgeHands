@@ -38,6 +38,23 @@ export interface MergeRule {
   twoKeyPatterns: string[];
 }
 
+export type NotifyLanguage = 'en' | 'de';
+export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder'] as const;
+
+/** Notifications (SMTP_*, NOTIFY_*, HUMAN_MENTION): how the human hears of what needs him without the forge's mail. */
+export interface NotifyConfig {
+  smtp: { host: string; port: number; security: 'starttls' | 'tls' | 'none'; user: string | null; password: string | null; from: string; to: string[]; tlsVerify: boolean; ca: string | null } | null;
+  webhook: { url: string; auth: string | null } | null;
+  /** Kinds that are sent at once (NOTIFY_IMMEDIATE); empty: none. */
+  immediate: string[];
+  /** NOTIFY_DIGEST: HH:MM in `timezone`, or null for no digest. */
+  digest: string | null;
+  timezone: string;
+  language: NotifyLanguage;
+  /** HUMAN_MENTION: false writes the hand-over comments without the @login, so that the forge sends no mail. */
+  humanMention: boolean;
+}
+
 export interface ForgejoAccess {
   url: string;
   token: string;
@@ -107,6 +124,7 @@ export interface DirectConfig extends BaseConfig {
   remindMax: number;
   staleLabel: string | null;
   humanLogin: string | null;
+  notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
   botAuthors: Set<string>;

@@ -2,6 +2,7 @@ import { URL } from 'node:url';
 import { globToRegExp } from './forge/glob.ts';
 import { FORGES } from './forge/index.ts';
 import type { ForgeKind } from './forge/types.ts';
+import { parseNotify } from './notify/config.ts';
 import type { Config, DirectConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -321,6 +322,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
+    // Notifications of ForgeHands' own (SMTP, webhook, digest) and whether the hand-over comments mention HUMAN_LOGIN, see src/notify.
+    notify: parseNotify(env),
     // Whose security review comments count (comma separated logins, case-insensitive). Empty: the comment of anybody counts, which is fine for
     // the advisory display but not for two_keys, so two_keys needs it: the second key must be a user the author of the pull request does not control.
     securityReviewers: parseLogins(env.SECURITY_REVIEWERS),
