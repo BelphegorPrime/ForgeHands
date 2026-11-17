@@ -102,6 +102,7 @@ export class ForgejoForge implements Forge {
   }
   isWip(title: string): boolean { return FORGEJO_WIP.test(title); }
   stripWip(title: string): string { return title.replace(FORGEJO_WIP, ''); }
+  async closePull(repository: string, number: number): Promise<void> { await this.call(repository, 'PATCH', '/pulls/' + number, { state: 'closed' }); }
   async setPullTitle(repository: string, number: number, title: string): Promise<void> { await this.call(repository, 'PATCH', '/pulls/' + number, { title }); }
   listReviews(repository: string, number: number): Promise<Review[]> { return this.call(repository, 'GET', '/pulls/' + number + '/reviews'); }
   listReviewComments(repository: string, number: number, reviewId: Review['id']): Promise<Comment[]> {

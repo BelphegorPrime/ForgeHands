@@ -3288,3 +3288,145 @@ test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as
   // without two_keys the variable is not needed, and without it every security comment still counts for the advisory line
   assert.doesNotThrow(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': { deny: ['compose.yaml'] } }) }))));
 });
+
+// ---- WAIT_FOR_SAME_FILES and a ticket sent to the planner
+import { parseDeclaredFiles, pathsOverlap } from '../src/agent/files.ts';
+const filesBody = (...files) => '## Summary\nSomething.\n\n## Exact files\n' + files.map((file) => '- `' + file + '`').join('\n') + '\n\n## Tests\n- `not/declared.ts`\n';
+const ticket = (label, number, body, extra = {}) => event(label, number, { issue: { number, title: 'T', body, labels: [label] }, ...extra });
+const agentPull = (number, issue) => ({ number, state: 'open', merged: false, title: 'Fix', head: { ref: 'ai/issue-' + issue, sha: 'cafe' + number }, labels: [] });
+async function buildSameFiles(routes, extra = {}) {
+  const config = loadConfig(env({ WAIT_FOR_SAME_FILES: '1', ...extra }));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  const forgejo = fakeForgejo({ ['GET ' + API + '/pulls']: [], ...routes });
+  const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
+  return { config, jobs, forgejo, dispatcher: new Dispatcher(config, jobs, send, quiet, () => clock) };
+}
+
+test('declared files: the Exact files section is read, notes are ignored, no section declares nothing', () => {
+  assert.deepEqual(parseDeclaredFiles(filesBody('a/b.py', 'seed/x/**') + '- `late.ts`\n'), ['a/b.py', 'seed/x/**']);
+  assert.deepEqual(parseDeclaredFiles('## Exact files\n- `a.ts` (new)\n- `dir/**` (new)\n* `c.ts`: note\nplain text\n'), ['a.ts', 'dir/**', 'c.ts']);
+  assert.deepEqual(parseDeclaredFiles('Just text with `a.ts`'), []);
+  assert.deepEqual(parseDeclaredFiles(undefined), []);
+});
+
+test('declared files overlap by equal path or by glob, and not otherwise', () => {
+  assert.ok(pathsOverlap('a/b.py', 'a/b.py'));
+  assert.ok(pathsOverlap('seed/infra/**', 'seed/infra/homelab/x.py'));
+  assert.ok(pathsOverlap('seed/infra/homelab/x.py', 'seed/infra/**'));
+  assert.ok(pathsOverlap('seed/**', 'seed/infra/**'));
+  assert.ok(pathsOverlap('src/*.ts', 'src/a.ts'));
+  assert.ok(!pathsOverlap('a/b.py', 'a/c.py'));
+  assert.ok(!pathsOverlap('seed/infra/**', 'docs/x.md'));
+  assert.ok(!pathsOverlap('src/*.ts', 'src/sub/a.ts'));
+  assert.ok(!pathsOverlap('docs/**', 'src/**'));
+});
+
+test('a ticket waits for an older ticket with an open agent pull request on the same files, and starts when that issue closes', async () => {
+  let pulls = [agentPull(50, 5)];
+  const { jobs, dispatcher, forgejo } = await buildSameFiles({
+    ['GET ' + API + '/pulls']: () => pulls,
+    ['GET ' + API + '/pulls/50/files']: [{ filename: 'src/a.ts' }, { filename: 'src/b.ts' }],
+    ['GET ' + API + '/issues/5/blocks']: []
+  });
+  assert.equal((await dispatcher.enqueue(ticket('ai:ready', 9, filesBody('src/b.ts')))).status, 'queued');
+  await dispatcher.tick();
+  assert.equal(starts().length, 0);
+  const job = jobs.list(true)[0];
+  assert.equal(job.status, 'waiting');
+  assert.deepEqual(job.waiting_for_files, [5]);
+  pulls = [];
+  await dispatcher.onClosed({ type: 'issues.closed', repository: event('x').repository, issue: { number: 5 }, sender: { login: 'marcel' } });
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+  assert.equal(jobs.list(true)[0].waiting_for_files, undefined);
+});
+
+test('a ticket whose files do not overlap, or that declares none, is not held', async () => {
+  const { dispatcher } = await buildSameFiles({
+    ['GET ' + API + '/pulls']: [agentPull(50, 5)],
+    ['GET ' + API + '/pulls/50/files']: [{ filename: 'src/a.ts' }]
+  });
+  await dispatcher.enqueue(ticket('ai:ready', 9, filesBody('src/other.ts')));
+  await dispatcher.enqueue(ticket('ai:ready', 10, 'No section here, src/a.ts'));
+  await dispatcher.tick();
+  assert.equal(starts().length, 2);
+});
+
+test('a ticket never waits for a newer ticket, and two tickets on the same files cannot wait for each other', async () => {
+  const { jobs, dispatcher } = await buildSameFiles({
+    ['GET ' + API + '/pulls']: [agentPull(60, 12)],
+    ['GET ' + API + '/pulls/60/files']: [{ filename: 'src/a.ts' }],
+    ['GET ' + API + '/issues/7']: { number: 7, state: 'open' }
+  });
+  assert.equal((await dispatcher.enqueue(ticket('ai:ready', 7, filesBody('src/a.ts')))).status, 'queued');
+  assert.equal((await dispatcher.enqueue(ticket('ai:ready', 8, filesBody('src/a.ts')))).status, 'queued');
+  await dispatcher.tick();
+  const [seven, eight] = jobs.list(true).sort((a, b) => a.event.issue.number - b.event.issue.number);
+  assert.equal(seven.status, 'running', 'the open pull request of #12 does not hold #7');
+  assert.equal(eight.status, 'waiting');
+  assert.deepEqual(eight.waiting_for_files, [7]);
+  assert.equal(seven.waiting_for_files, undefined);
+});
+
+test('WAIT_FOR_SAME_FILES is off by default', async () => {
+  const { dispatcher } = await buildSameFiles({
+    ['GET ' + API + '/pulls']: [agentPull(50, 5)],
+    ['GET ' + API + '/pulls/50/files']: [{ filename: 'src/a.ts' }]
+  }, { WAIT_FOR_SAME_FILES: undefined });
+  assert.equal(loadConfig(env()).waitForSameFiles, false);
+  await dispatcher.enqueue(ticket('ai:ready', 9, filesBody('src/a.ts')));
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+  assert.throws(() => loadConfig(env({ WAIT_FOR_SAME_FILES: 'yes' })), /WAIT_FOR_SAME_FILES must be 0 or 1/);
+});
+
+test('a forge read error does not hold a ticket that waits for the same files', async () => {
+  const { dispatcher } = await buildSameFiles({
+    ['GET ' + API + '/pulls']: [agentPull(50, 5)] // the files of the pull request answer 404
+  });
+  await dispatcher.enqueue(ticket('ai:ready', 9, filesBody('src/a.ts')));
+  await dispatcher.tick();
+  assert.equal(starts().length, 1);
+});
+
+// A ticket sent to the planner ends the work on its original pull request.
+async function buildSplit(routes, extra = {}) {
+  return buildSameFiles({ ['PATCH ' + API + '/pulls/50']: {}, ['POST ' + API + '/issues/50/comments']: {}, ...routes }, { WAIT_FOR_SAME_FILES: undefined, ...extra });
+}
+
+test('a ticket labelled for the planner closes its open agent pull request with a comment and drops its other queued jobs', async () => {
+  const { jobs, dispatcher, forgejo } = await buildSplit({ ['GET ' + API + '/pulls']: [agentPull(50, 5), agentPull(51, 6)] });
+  const queued = jobs.add({ key: repo + '#5:ai:ready', label: 'ai:ready', event: ticket('ai:ready', 5, 'B'), status: 'queued', created: clock });
+  const running = jobs.add({ key: repo + '#5:ai:changes', label: 'ai:changes', event: ticket('ai:ready', 5, 'B'), status: 'running', created: clock });
+  const other = jobs.add({ key: repo + '#6:ai:ready', label: 'ai:ready', event: ticket('ai:ready', 6, 'B'), status: 'queued', created: clock });
+  await dispatcher.enqueue(ticket('ai:plan', 5, 'B'));
+  assert.deepEqual(forgejo.wrote(), ['POST /issues/50/comments', 'PATCH /pulls/50']);
+  const [comment, close] = forgejo.calls.filter((call) => call.method !== 'GET');
+  assert.match(comment.body.body, /^ForgeHands: the ticket was sent to the planner to be split; this pull request is closed/);
+  assert.deepEqual(close.body, { state: 'closed' });
+  const keys = jobs.list(true).map((job) => job.key);
+  assert.ok(!keys.includes(queued.key));
+  assert.ok(keys.includes(running.key), 'a running worker is left alone');
+  assert.ok(keys.includes(other.key), 'another issue is untouched');
+  assert.ok(keys.includes(repo + '#5:ai:plan'), 'the planner job stays');
+});
+
+test('a planner label on an issue without a pull request, or a non-epic label on one with a pull request, changes nothing', async () => {
+  const { jobs, dispatcher, forgejo } = await buildSplit({ ['GET ' + API + '/pulls']: [agentPull(50, 5)] });
+  const queued = jobs.add({ key: repo + '#7:ai:ready', label: 'ai:ready', event: ticket('ai:ready', 7, 'B'), status: 'queued', created: clock });
+  await dispatcher.enqueue(ticket('ai:plan', 7, 'B'));
+  assert.deepEqual(forgejo.wrote(), []);
+  assert.ok(jobs.list(true).some((job) => job.id === queued.id));
+  await dispatcher.enqueue(ticket('ai:escalate', 5, 'B'));
+  assert.deepEqual(forgejo.wrote(), []);
+});
+
+test('a dry run only logs the closing of the original pull request', async () => {
+  const { jobs, dispatcher, forgejo } = await buildSplit({ ['GET ' + API + '/pulls']: [agentPull(50, 5)] }, { DRY_RUN: '1' });
+  const queued = jobs.add({ key: repo + '#5:ai:ready', label: 'ai:ready', event: ticket('ai:ready', 5, 'B'), status: 'queued', created: clock });
+  await dispatcher.enqueue(ticket('ai:plan', 5, 'B'));
+  assert.deepEqual(forgejo.wrote(), []);
+  assert.ok(jobs.list(true).some((job) => job.id === queued.id));
+});

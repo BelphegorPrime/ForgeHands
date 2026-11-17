@@ -290,6 +290,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // When the default branch moves, open agent pull requests that fell behind and have no review or approval yet are brought up to
     // date (Forgejo's update, rebase style); one that conflicts gets a conflict round (route "on": "conflict"). 0 switches it off.
     updateBranches: env.UPDATE_BRANCHES !== '0',
+    // Off unless 1: a ticket whose declared files ('## Exact files' in its body) overlap those of an older open ticket or agent pull request waits.
+    waitForSameFiles: switchOff(env.WAIT_FOR_SAME_FILES, 'WAIT_FOR_SAME_FILES'),
     // Wait this long after the last push to the default branch before looking at the pull requests (a merge is often followed by another).
     branchUpdateDelayMs: positiveInt(env.BRANCH_UPDATE_DELAY_SECONDS, 60, 'BRANCH_UPDATE_DELAY_SECONDS', 3600) * 1000,
     // At most one update of a pull request branch in this many minutes, however often the default branch moves.
@@ -336,4 +338,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     pollMs: 15000,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };
+}
+
+// A 0/1 switch that is off unless set to 1; any other value is a mistake worth a clear message.
+function switchOff(value: string | undefined, name: string): boolean {
+  if (value === undefined || value === '' || value === '0') return false;
+  if (value === '1') return true;
+  throw new Error(name + ' must be 0 or 1');
 }

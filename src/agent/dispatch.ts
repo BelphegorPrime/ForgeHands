@@ -1,4 +1,5 @@
 import { buildPrompt } from './prompt.ts';
+import { anyOverlap, parseDeclaredFiles } from './files.ts';
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from '../forge/merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
@@ -19,6 +20,9 @@ const ERROR_RETRY_DELAY_MS = 60000;
 const UNAVAILABLE_CODES = new Set(['LLMServiceUnavailableError', 'BadGatewayError', 'LLMTimeoutError']);
 // The last this many started runs decide what a repository has had so far (see pickNext).
 const RECENT_STARTS = 50;
+// WAIT_FOR_SAME_FILES looks at no more open pull requests than this per check.
+const FILE_PULLS_LOOKED_AT = 20;
+const ACTIVE_STATUSES = new Set(['waiting', 'queued', 'running']);
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -193,6 +197,7 @@ export class Dispatcher {
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
     const kind = this.config.routes.get(label)!.kind;
+    if (this.config.epicLabels.has(label) && !event.pull_request && !event.ci && event.type.startsWith('issues.')) await this.endOriginalPull(event, label);
     if (event.ci) {
       // While an agent still works on the issue (it will push again) the outcome is not acted on, but kept: it is looked at again
       // when that run ends (see releaseDeferred), because CI often finishes seconds before the agent's last step.
@@ -314,6 +319,7 @@ export class Dispatcher {
   async onClosed(event: ForgeEvent): Promise<string> {
     await this.markClosed(event.repository.full_name.toLowerCase() + '#' + event.issue.number);
     if (!this.config.forgejo) return 'no_forgejo_access';
+    await this.releaseFileWaitsNow();
     let blocked: Json;
     try { blocked = await this.forge.blocks(event.repository.full_name, event.issue.number); }
     catch (error) { this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message); return 'blocks_unknown'; }
@@ -345,6 +351,7 @@ export class Dispatcher {
   // event, which starts what waits. Best effort.
   async closeMergedTickets(event: PushEvent): Promise<number> {
     if (!this.config.forgejo) return 0;
+    await this.releaseFileWaitsNow();
     const repository = event.repository.full_name;
     let closed = 0;
     try {
@@ -866,6 +873,96 @@ export class Dispatcher {
     return true;
   }
 
+  // WAIT_FOR_SAME_FILES: the older issues (lower numbers) whose files this worker job's issue also declares, because they have an open agent
+  // pull request that changes them, or a job in the ledger and the same declared files. The oldest goes first, so no ticket ever waits
+  // for a newer one and two tickets cannot wait for each other. Any failing read means "not held": a ticket is never stuck on a guess.
+  async filesBlockers(job: Job): Promise<number[]> {
+    const event = job.event;
+    const mine = parseDeclaredFiles(event.issue.body);
+    if (!this.config.waitForSameFiles || !this.config.forgejo || !mine.length) return [];
+    const repository = event.repository.full_name;
+    const number = event.issue.number;
+    const blockers = new Set<number>();
+    try {
+      const pulls = await this.forge.listPulls(repository, { state: 'open', limit: FILE_PULLS_LOOKED_AT });
+      for (const pr of (Array.isArray(pulls) ? pulls : []).slice(0, FILE_PULLS_LOOKED_AT)) {
+        const other = Number(/^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''))?.[1]);
+        if (!other || other >= number || blockers.has(other)) continue;
+        const files = await this.forge.pullFiles(repository, pr.number, 100);
+        const names = (Array.isArray(files) ? files : []).flatMap((file) => [file.filename, file.previous_filename].filter((name): name is string => !!name));
+        if (anyOverlap(mine, names)) blockers.add(other);
+      }
+      for (const other of this.jobs.list(true)) {
+        const issue = other.event?.issue;
+        if (!issue || other.event.bot || other.event.repository.full_name.toLowerCase() !== repository.toLowerCase()) continue;
+        if (issue.number >= number || blockers.has(issue.number) || !ACTIVE_STATUSES.has(other.status)) continue;
+        if (this.config.epicLabels.has(other.label) || !anyOverlap(mine, parseDeclaredFiles(issue.body))) continue;
+        if ((await this.forge.getIssue(repository, issue.number))?.state === 'open') blockers.add(issue.number);
+      }
+    } catch (error) {
+      this.logger.error('could not compare the files of #' + number + ' with the open work, it is not held back:', error.message);
+      return [];
+    }
+    return [...blockers].sort((a, b) => a - b);
+  }
+
+  // Look again at the jobs that wait for the same files and queue those whose older tickets are gone. Called when something may have
+  // been freed (a push to the default branch, a closed issue, a run that ended); startJob checks once more before a worker starts.
+  async releaseFileWaits(): Promise<boolean> {
+    if (!this.config.waitForSameFiles) return false;
+    let changed = false;
+    for (const job of this.jobs.list('waiting')) {
+      if (!job.waiting_for_files?.length || job.waiting_for?.length) continue;
+      const blockers = await this.filesBlockers(job);
+      if (blockers.length) { job.waiting_for_files = blockers; continue; }
+      job.status = 'queued';
+      delete job.waiting_for_files;
+      this.logger.error(job.key + ' no longer waits for the files of older tickets');
+      changed = true;
+    }
+    return changed;
+  }
+
+  // The same, from outside a pass (a webhook): save and start what was released.
+  async releaseFileWaitsNow(): Promise<void> {
+    try {
+      if (!(await this.releaseFileWaits())) return;
+      await this.jobs.persist(this.now());
+      this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
+    } catch (error) {
+      this.logger.error('could not release the tickets that wait for the same files:', error.message);
+    }
+  }
+
+  // A ticket was sent to the planner (an epic label): its original agent pull request is closed (the branch stays), because the slices
+  // would build the same thing again, and its queued or waiting jobs other than the planner's go. A worker running on it is left alone.
+  // Best effort; without forge access, or without an open pull request, nothing changes.
+  async endOriginalPull(event: ForgeEvent, label: string): Promise<void> {
+    if (!this.config.forgejo) return;
+    const repository = event.repository.full_name;
+    const number = event.issue.number;
+    try {
+      const pulls = await this.forge.listPulls(repository, { state: 'open', limit: 50 });
+      const pr = (Array.isArray(pulls) ? pulls : []).find((entry) => entry?.head?.ref === 'ai/issue-' + number && entry.state === 'open');
+      if (!pr) return;
+      if (isDry(this.config, repository)) {
+        this.logger.error('DRY RUN: pull request #' + pr.number + ' of #' + number + ' would be closed, the ticket went to ' + label);
+        return;
+      }
+      await this.forge.addComment(repository, pr.number, 'ForgeHands: the ticket was sent to the planner to be split; this pull request is closed so that the slices do not build the same thing twice. Its work stays in the branch.', 'pull');
+      await this.forge.closePull(repository, pr.number);
+      const base = this.issueKey(event) + ':';
+      let removed = 0;
+      for (const job of this.jobs.list(true).filter((entry) => entry.key.startsWith(base) && !this.config.epicLabels.has(entry.label))) {
+        if (job.status === 'running') { this.logger.error(job.key + ' is running and is left alone, its ticket went to ' + label); continue; }
+        if (job.status === 'queued' || job.status === 'waiting') { this.jobs.remove(job.id); removed += 1; }
+      }
+      if (removed) await this.jobs.persist(this.now());
+    } catch (error) {
+      this.logger.error('could not end the pull request of #' + number + ' after it went to ' + label + ':', error.message);
+    }
+  }
+
   // The issue ("repo#number") is closed in the forge: its jobs leave the waiting and failed lists of the status page (see JobStore.markClosed).
   async markClosed(ticket: string): Promise<boolean> {
     if (isDry(this.config, ticket.split('#')[0]) || !this.jobs.markClosed(ticket)) return false;
@@ -999,6 +1096,16 @@ export class Dispatcher {
         return true;
       }
     }
+    // WAIT_FOR_SAME_FILES: an older ticket or pull request that changes the same files goes first.
+    if (this.config.waitForSameFiles && this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && !this.config.epicLabels.has(job.label)) {
+      const blockers = await this.filesBlockers(job);
+      if (blockers.length) {
+        Object.assign(job, { status: 'waiting', waiting_for_files: blockers });
+        this.logger.error(job.key + ' waits for ' + blockers.map((number) => '#' + number).join(', ') + ' (same files)');
+        return true;
+      }
+      delete job.waiting_for_files;
+    }
     if (job.event.ci && this.config.routes.get(job.label)?.kind === 'ci_failure' && (await this.commitRecovered(job.event))) {
       this.jobs.remove(job.id);
       return true;
@@ -1107,6 +1214,7 @@ export class Dispatcher {
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       this.runEnded(job, state, now);
       await this.checkBranchAfterRun(job);
+      await this.releaseFileWaits();
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }

@@ -197,6 +197,7 @@ export class GitlabForge implements Forge {
   }
   isWip(title: string): boolean { return GITLAB_DRAFT.test(title); }
   stripWip(title: string): string { return title.replace(GITLAB_DRAFT, ''); }
+  async closePull(repository: string, number: number): Promise<void> { await this.call(repository, 'PUT', '/merge_requests/' + number, { state_event: 'close' }); }
   async setPullTitle(repository: string, number: number, title: string): Promise<void> { await this.call(repository, 'PUT', '/merge_requests/' + number, { title }); }
 
   // What GitLab has instead of reviews. A review of ForgeHands is a note that begins with `## Verdict: OK` or `## Verdict: NOT OK` and
