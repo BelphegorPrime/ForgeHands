@@ -213,6 +213,7 @@ export interface Job {
   fell_back?: string;
   archived?: boolean;
   error_retry?: number;
+  delivery_retry?: number;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
   /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */
