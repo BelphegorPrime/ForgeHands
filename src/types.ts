@@ -126,6 +126,8 @@ export interface DirectConfig extends BaseConfig {
   remindMax: number;
   staleLabel: string | null;
   humanLogin: string | null;
+  /** COMMENT_RESTARTS: how often a comment of HUMAN_LOGIN may start a failed or handed-over run again, per issue and label; 0 switches it off. */
+  commentRestarts: number;
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
@@ -196,6 +198,8 @@ export interface ForgeEvent extends BaseEvent {
   review?: { reviewer: string | null };
   /** The changed files that match the deny list of the merge policy (security review runs only). */
   protected_files?: string[];
+  /** A comment of HUMAN_LOGIN that started this run again (COMMENT_RESTARTS): the comment's id and its author. */
+  comment?: { id: string; login: string | null };
 }
 
 /** A push to the default branch. */

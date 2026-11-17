@@ -16,6 +16,8 @@ export class JobStore {
   labels = new Map<string, SeenLabels>(); // repo#issue -> { labels, seen }: the labels seen on the last event of an issue
   /** Small facts that must outlive a restart and belong to no job: the date of the last digest (`digest_sent`, YYYY-MM-DD in NOTIFY_TIMEZONE). */
   meta: { digest_sent?: string } = {};
+  /** Keys of things already done, kept 30 days: a human comment that restarted a run (`comment:<repo>#<n>#<id>`), a notice sent once (`limit:<repo>#<n>:<label>`). */
+  dedupe = new Map<string, number>();
   writes: Promise<void> = Promise.resolve();
 
   constructor(file: string) {
@@ -28,6 +30,9 @@ export class JobStore {
       if (!Array.isArray(jobs)) throw Error('Invalid job store');
       for (const job of jobs) if (job && job.id) this.jobs.set(job.id, job);
       if (typeof content?.meta?.digest_sent === 'string') this.meta.digest_sent = content.meta.digest_sent;
+      for (const [key, value] of Object.entries((content?.dedupe || {}) as Record<string, number>)) {
+        if (typeof value === 'number') this.dedupe.set(key, value);
+      }
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
       }
@@ -47,6 +52,12 @@ export class JobStore {
     const changed = !previous || previous.length !== labels.length || previous.some((name: string, i: number) => name !== labels[i]);
     this.labels.set(issueKey, { labels, seen: now });
     return changed;
+  }
+  noted(key: string): boolean {
+    return this.dedupe.has(key);
+  }
+  note(key: string, now = Date.now()): void {
+    this.dedupe.set(key, now);
   }
   activeByKey(key: string): Job | undefined {
     return this.list(true).find((job) => job.key === key);
@@ -87,9 +98,10 @@ export class JobStore {
         if (!ACTIVE.has(job.status) && (job.finished || job.created) < now - KEEP_MS) this.jobs.delete(id);
       }
       for (const [key, value] of this.labels) if (value.seen < now - KEEP_MS) this.labels.delete(key);
+      for (const [key, seen] of this.dedupe) if (seen < now - KEEP_MS) this.dedupe.delete(key);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe) }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;

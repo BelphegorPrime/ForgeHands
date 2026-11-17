@@ -331,6 +331,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
+    // A comment of HUMAN_LOGIN on an issue whose last run failed (or waits for him) starts that run again; this many times per issue and label.
+    commentRestarts: commentRestartsOf(env.COMMENT_RESTARTS),
     // Notifications of ForgeHands' own (SMTP, webhook, digest) and whether the hand-over comments mention HUMAN_LOGIN, see src/notify.
     notify: parseNotify(env),
     // Whose security review comments count (comma separated logins, case-insensitive). Empty: the comment of anybody counts, which is fine for
@@ -364,6 +366,13 @@ function reviewSwitch(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('REVIEW_WITHOUT_CI must be 0 or 1');
+}
+
+// COMMENT_RESTARTS: 0 to 100, default 2; 0 switches the comment restarts off.
+function commentRestartsOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 2;
+  if (!/^\d{1,3}$/.test(value) || Number(value) > 100) throw new Error('COMMENT_RESTARTS must be an integer between 0 and 100');
+  return Number(value);
 }
 
 // A 0/1 switch that is off unless set to 1; any other value is a mistake worth a clear message.

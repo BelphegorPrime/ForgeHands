@@ -220,6 +220,7 @@ export function buildPrompt(event: ForgeEvent, config: DirectConfig): string {
   return [
     agent.name + ' issue #' + issue.number + ' in ' + repository.full_name + (issue.html_url ? ' (' + issue.html_url + ')' : '') + '.',
     'Trigger label: ' + label + (sender.login ? '. Set by: ' + sender.login : '') + '.',
+    ...(event.comment ? ['This run starts again because ' + (event.comment.login || 'a comment') + ' commented on the issue (comment ' + event.comment.id + '): that comment is the reason, read it first.'] : []),
     repository.clone_url
       ? 'Work in a fresh clone of ' + repository.clone_url + ' at ' + dir + ' (use ' + agent.secrets + '; never print them). If that directory exists from an earlier run, delete it and clone again.'
       : 'Work in a fresh clone of the repository at ' + dir + '.',

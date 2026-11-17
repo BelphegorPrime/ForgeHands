@@ -80,8 +80,10 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
     catch { return json(res, 400, { error: 'invalid_json' }); }
     const event = forge.eventName(req.headers);
     const direct = config.mode === 'direct';
-    const previousLabels = direct ? dispatcher!.labelsBefore(body, config.allowedRepos) : null;
-    const remember = () => { if (direct) dispatcher!.recordLabels(body, config.allowedRepos); };
+    // A comment is no label event: the label memory of the issue is left alone (a comment on a pull request carries the pull request's labels).
+    const isComment = event === 'issue_comment';
+    const previousLabels = direct && !isComment ? dispatcher!.labelsBefore(body, config.allowedRepos) : null;
+    const remember = () => { if (direct && !isComment) dispatcher!.recordLabels(body, config.allowedRepos); };
     const routeLabels = (kind: string) => [...config.routes].filter(([, route]) => (route.kind || 'issue') === kind).map(([label]) => label);
     const normalized = forge.normalizeEvent(event, body, config.allowedRepos, routeLabels('issue'), { labelEvents: config.mode === 'direct', prLabels: direct ? routeLabels('pull_request') : [],
       ci: direct ? { failure: routeLabels('ci_failure')[0], success: routeLabels('ci_success')[0] } : {},
@@ -89,7 +91,8 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       pushes: direct && config.updateBranches,
       branchPushes: direct && config.reviewWithoutCi && !!config.forgejo && [...config.routes.values()].some((route) => route.kind === 'ci_success'),
       reviews: direct && config.verdictSource !== 'comment',
-      bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, repos: config.botRepos, fixRounds: config.botFixRounds } : undefined });
+      bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, repos: config.botRepos, fixRounds: config.botFixRounds } : undefined,
+      comments: direct && config.humanLogin && config.commentRestarts ? { human: config.humanLogin } : undefined });
     if (!normalized) { remember(); delivered('ignored'); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     // The CI outcome of a bot's pull request is let in by BOT_AUTHORS (the operator's own list), not by who triggered the run. Labels still need an allowed sender.
@@ -111,6 +114,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
           ? { status: await dispatcher!.onReview(normalized as ForgeEvent, normalized.type === 'pull_request.review_approved') }
           : normalized.type === 'pull_request.approved' ? { status: await dispatcher!.approve(normalized as ForgeEvent) }
           : normalized.type === 'issues.closed' ? { status: await dispatcher!.onClosed(normalized as ForgeEvent) }
+          : normalized.type === 'issues.commented' ? { status: await dispatcher!.onComment(normalized as ForgeEvent) }
           : isBranchPush(normalized) ? { status: await dispatcher!.onBranchPush(normalized) }
           : isPushEvent(normalized) ? { status: (dispatcher!.closeMergedTickets(normalized).catch((error) => logger.error('closing merged tickets failed:', error.message)), dispatcher!.onMainMoved(normalized)) }
           : await dispatcher!.enqueue(normalized);

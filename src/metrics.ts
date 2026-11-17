@@ -24,7 +24,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_tier_runs_total: 'Agent runs that ended, by repository, the tier they really ran on (after fallback and escalation) and result (finished, max_iterations, error, stuck, timeout, no_delivery, other).',
   forgehands_reminders_total: 'Reminders to the human about a pull request that waits for him.',
   forgehands_notifications_total: 'Notifications to the human by channel, kind (handover, blocked, conflict, failed, reminder, digest) and result (sent, failed, dry).',
-  forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).'
+  forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
+  forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -34,7 +35,7 @@ const GAUGES: Record<string, string> = {
 };
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
-export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
+export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
   'pull_request_approved', 'pull_request_rejected', 'pull_request_review_approved', 'pull_request_review_rejected',
   'Issue Hook', 'Merge Request Hook', 'Pipeline Hook', 'Push Hook'];
 const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed'];

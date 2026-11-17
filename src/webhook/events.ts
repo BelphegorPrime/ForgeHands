@@ -13,6 +13,8 @@ export interface NormalizeOptions {
   reviews?: boolean;
   /** Dependency bots (BOT_AUTHORS): their pull requests count like agent pull requests. `fixRounds` 0: a red commit and a round label start nothing. */
   bots?: BotRules & { fixRounds: number };
+  /** COMMENT_RESTARTS and HUMAN_LOGIN: a comment of this login on an issue is an event (see normalizeComment). Absent: comments are ignored. */
+  comments?: { human: string };
 }
 
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
@@ -20,8 +22,9 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots, comments }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return (pushes ? normalizePush(payload, allowedRepos) : null) ?? (branchPushes ? normalizeBranchPush(payload, allowedRepos, bots) : null);
+  if (event === 'issue_comment') return comments ? normalizeComment(payload, allowedRepos, comments.human) : null;
   if (event === 'pull_request' && branchPushes && HEAD_ACTIONS.has(String(payload?.action))) return normalizeBranchPull(payload, allowedRepos, bots);
   if (reviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots);
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
@@ -223,6 +226,47 @@ function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>,
     pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
     ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
     sender: { login: run.trigger_user?.login || null }
+  };
+}
+
+// A comment written on an issue (Forgejo's `issue_comment`, action `created`). Only the comments of HUMAN_LOGIN count: one of them may start the
+// last run of its issue again (Dispatcher.onComment). Comments on pull requests, edited or deleted comments and those of anybody else are ignored.
+// The payload is read for the author (`comment.user.login`, else the sender), the comment id and the issue; the dispatcher reads the issue from the forge.
+function normalizeComment(payload: Json, allowedRepos: Set<string>, human: string): ForgeEvent | null {
+  if (payload?.action !== 'created') return null;
+  const fullName = payload.repository?.full_name;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  const issue = payload.issue;
+  if (!issue || !Number.isSafeInteger(issue.number) || issue.number <= 0) return null;
+  // A pull request is an issue too: Forgejo marks it with a `pull_request` object (Gitea adds `is_pull`). Those comments are not handled here.
+  if (issue.pull_request || payload.is_pull === true) return null;
+  const comment = payload.comment;
+  const author = String(comment?.user?.login || payload.sender?.login || '');
+  if (!author || author.toLowerCase() !== human.toLowerCase()) return null;
+  if (!/^\d{1,18}$/.test(String(comment?.id ?? ''))) return null;
+  const present = Array.isArray(issue.labels)
+    ? issue.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
+    : [];
+  return {
+    type: 'issues.commented',
+    source: 'forgejo',
+    action: 'created',
+    repository: {
+      full_name: fullName,
+      clone_url: payload.repository.clone_url || null,
+      html_url: payload.repository.html_url || null,
+      default_branch: payload.repository.default_branch || null
+    },
+    issue: {
+      number: issue.number,
+      title: String(issue.title || '').slice(0, 1000),
+      body: String(issue.body || '').slice(0, 50000),
+      html_url: issue.html_url || null,
+      comments: Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0,
+      labels: present
+    },
+    comment: { id: String(comment.id), login: author },
+    sender: { login: author }
   };
 }
 
