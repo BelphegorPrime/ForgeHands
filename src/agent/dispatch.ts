@@ -144,7 +144,42 @@ export class Dispatcher {
     }
   }
 
+  // A green commit starts every review route (on: ci_success), once per commit each: a second reviewer is a second route. The event names
+  // the first one; the others are the same event under their own label.
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
+    if (event.type !== 'ci.success') return this.enqueueOne(event);
+    const labels = [...this.config.routes].filter(([, entry]) => entry.kind === 'ci_success').map(([label]) => label);
+    const results: { status: string }[] = [];
+    for (const label of labels) results.push(await this.enqueueOne({ ...event, label }));
+    return results.find((result) => result.status === 'queued') ?? results.find((result) => result.status === 'deferred') ?? results[0] ?? { status: 'duplicate_job' };
+  }
+
+  // A native review (VERDICT_SOURCE review or both) arrived. An approval asks the merger to look at the reviews of the head commit; the merger
+  // decides, so the event itself is only a trigger. A rejection starts the next round, once the reviews of the head commit say so too: a
+  // review of somebody who may not request changes (a stranger, an outdated commit) starts nothing.
+  async onReview(event: ForgeEvent, approved: boolean): Promise<string> {
+    if (approved) return this.merger.handle(event);
+    if (!this.config.forgejo || !event.pull_request) return 'no_forgejo_access';
+    const repository = event.repository.full_name;
+    try {
+      const pr = await this.forge.getPull(repository, event.pull_request.number);
+      if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
+      const review = await this.merger.reviewOf(repository, event.pull_request.number, pr.head.sha);
+      if (review.reason !== 'changes_requested') return 'ignored_review';
+    } catch (error) {
+      this.logger.error('could not check the review of #' + event.pull_request.number + ':', error.message);
+      return 'review_unreadable';
+    }
+    // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a human has to look at it.
+    if (event.bot && !this.config.botFixRounds) {
+      await this.markForHuman(event, 'ForgeHands: a review asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
+      return 'handed_to_human';
+    }
+    if (!this.config.routes.get(this.config.changesLabel) || this.config.routes.get(this.config.changesLabel)!.kind !== 'pull_request') return 'no_round_route';
+    return (await this.enqueueOne({ ...event, label: this.config.changesLabel })).status;
+  }
+
+  async enqueueOne(event: ForgeEvent): Promise<{ status: string }> {
     const label = this.pickLabel(event);
     if (!label) return { status: 'duplicate_job' };
     if (!this.config.routes.get(label)) throw new Error('no route for label ' + label);
@@ -157,7 +192,7 @@ export class Dispatcher {
       // While an agent still works on the issue (it will push again) the outcome is not acted on, but kept: it is looked at again
       // when that run ends (see releaseDeferred), because CI often finishes seconds before the agent's last step.
       const base = this.issueKey(event) + ':';
-      if (this.jobs.list(true).some((job) => job.key.startsWith(base) && !job.waiting_for_run)) {
+      if (this.jobs.list(true).some((job) => job.key.startsWith(base) && !job.waiting_for_run && !this.parallelReview(job, event))) {
         const deferred = this.jobs.add({ key, label, event: { ...event, label }, status: 'waiting', waiting_for_run: true, created: this.now() });
         try {
           await this.jobs.persist(this.now());
@@ -192,6 +227,12 @@ export class Dispatcher {
     if (kind === 'ci_success') await this.startSecurityReview(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
+  }
+
+  // A review of the same commit by another reviewer route: it pushes nothing, so the reviewers of one commit run side by side.
+  parallelReview(job: Job, event: ForgeEvent): boolean {
+    return this.config.routes.get(job.label)?.kind === 'ci_success' && this.config.routes.get(event.label ?? '')?.kind === 'ci_success'
+      && !!event.ci && job.event.ci?.commit_sha === event.ci.commit_sha;
   }
 
   // Follow-up runs (pull request routes) already made for the issue of this event.
@@ -344,7 +385,7 @@ export class Dispatcher {
   // arrived: gone when its commit is no longer the head or the status is not green (a later event can come again), otherwise started.
   async releaseDeferred(job: Job, now: number): Promise<boolean> {
     const base = job.key.split(':')[0] + ':';
-    if (this.jobs.list(true).some((other) => other.id !== job.id && !other.waiting_for_run && other.key.startsWith(base))) {
+    if (this.jobs.list(true).some((other) => other.id !== job.id && !other.waiting_for_run && other.key.startsWith(base) && !this.parallelReview(other, job.event))) {
       if (job.created + this.config.maxRunMs < now) { this.jobs.remove(job.id); return true; }
       return false;
     }
@@ -455,7 +496,8 @@ export class Dispatcher {
     try {
       const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
       if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== event.ci.commit_sha) return;
-      if (!(pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel)) return;
+      const labelled = (pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel);
+      if (!labelled && !(this.config.verdictSource !== 'comment' && (await this.merger.reviewOf(event.repository.full_name, event.pull_request.number, pr.head.sha)).ok)) return;
       await this.merger.handle(event);
     } catch (error) {
       this.logger.error('could not hand #' + event.pull_request.number + ' over after its security review:', error.message);
@@ -530,14 +572,17 @@ export class Dispatcher {
         await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
         return;
       }
-      if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
+      if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name)) && this.config.verdictSource !== 'review') return;
+      // Native reviews: any approval or request for changes on the head commit is a verdict (the webhook of the review does the rest).
+      if (this.config.verdictSource !== 'comment' && (await this.merger.nativeReviews(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)).any) return;
+      if (this.config.verdictSource === 'review' && names.includes(this.config.blockedLabel)) return;
       // The first time, review once more: such a run mostly ends early (a blind command, a spent iteration budget), not for good.
       if (!job.verdict_retry) {
         Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
         this.logger.error('review ' + job.key + ' ended without a verdict, running it once more');
         return;
       }
-      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel + '). A human has to look at this pull request, or push a commit to start the review again.', 'no_verdict');
+      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (' + (this.config.verdictSource === 'review' ? 'no approving or rejecting review' : 'no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel) + '). A human has to look at this pull request, or push a commit to start the review again.', 'no_verdict');
     } catch (error) {
       this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
     }
@@ -887,7 +932,11 @@ export class Dispatcher {
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
     // Built per start from the environment; never stored in the ledger.
-    const secrets = Object.entries(this.config.agentSecrets || {});
+    // A route's own Forgejo token (the reviewer user) goes to its conversations only, as FORGEJO_TOKEN; no other conversation gets it.
+    const claimed = new Set([...this.config.routes.values()].map((entry) => entry.forgejoTokenSecret).filter(Boolean));
+    const own = route.forgejoTokenSecret ? this.config.agentSecrets[route.forgejoTokenSecret] : undefined;
+    const secrets = [...Object.entries(this.config.agentSecrets || {}).filter(([name]) => !claimed.has(name) && !(own && name === 'FORGEJO_TOKEN')),
+      ...(own ? [['FORGEJO_TOKEN', own] as [string, string]] : [])];
     if (secrets.length) {
       body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
     }

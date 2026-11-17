@@ -10,6 +10,9 @@ export interface Logger {
   log?: (...args: unknown[]) => void;
 }
 
+/** VERDICT_SOURCE: where the verdict of a review comes from. */
+export type VerdictSource = 'comment' | 'review' | 'both';
+
 export type RouteKind = 'issue' | 'pull_request' | 'ci_failure' | 'ci_success' | 'epic_done' | 'conflict' | 'sensitive_review';
 
 export interface Route {
@@ -21,6 +24,8 @@ export interface Route {
   kind: RouteKind;
   escalateTo: string | null;
   fallbackTo: string | null;
+  /** "forgejo_token_secret": the AGENT_SECRETS entry that holds this route's own Forgejo token (the reviewer user); handed to this route's conversations as FORGEJO_TOKEN, to no other. */
+  forgejoTokenSecret: string | null;
 }
 
 /** The deny list of a repository: a pattern (as written), its regular expression and why it needs a human (optional). */
@@ -84,6 +89,10 @@ export interface DirectConfig extends BaseConfig {
   branchUpdateDelayMs: number;
   branchUpdateMinIntervalMs: number;
   minReviewChars: number;
+  /** VERDICT_SOURCE: a `Verdict:` comment with the approval label (comment), native Forgejo reviews (review) or either (both). */
+  verdictSource: VerdictSource;
+  /** REQUIRED_APPROVALS: how many distinct reviewers must approve the head commit (review and both). */
+  requiredApprovals: number;
   approvalGraceMs: number;
   errorRetries: number;
   quotaHoldMaxMs: number;
@@ -157,6 +166,8 @@ export interface ForgeEvent extends BaseEvent {
   bot?: boolean;
   epic?: { children: { number: number; title: string }[] };
   base_sha?: string;
+  /** A native review (VERDICT_SOURCE review or both) that triggered this event: who wrote it. */
+  review?: { reviewer: string | null };
   /** The changed files that match the deny list of the merge policy (security review runs only). */
   protected_files?: string[];
 }

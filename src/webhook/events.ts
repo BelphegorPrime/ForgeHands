@@ -7,6 +7,8 @@ export interface NormalizeOptions {
   ci?: { failure?: string; success?: string };
   approved?: string;
   pushes?: boolean;
+  /** VERDICT_SOURCE review or both: a native review (approved / rejected) is an event. */
+  reviews?: boolean;
   /** Dependency bots (BOT_AUTHORS): their pull requests count like agent pull requests. `fixRounds` 0: a red commit and a round label start nothing. */
   bots?: BotRules & { fixRounds: number };
 }
@@ -16,8 +18,9 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, reviews = false, bots }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return pushes ? normalizePush(payload, allowedRepos) : null;
+  if (reviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots);
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci, bots);
@@ -64,6 +67,55 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
       comments: Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0,
       labels: present
     },
+    sender: { login: payload.sender?.login || null }
+  };
+}
+
+// Forgejo sends a review as an event of its own. Its code (modules/webhook/type.go) names the types pull_request_review_approved and
+// pull_request_review_rejected (what the payload's `review.type` carries); the delivery header may carry the mapped names
+// pull_request_approved / pull_request_rejected instead (HookEventType.Event()), so both spellings are accepted.
+const REVIEW_EVENTS: Record<string, 'approved' | 'rejected'> = {
+  pull_request_review_approved: 'approved', pull_request_approved: 'approved',
+  pull_request_review_rejected: 'rejected', pull_request_rejected: 'rejected'
+};
+
+// A native review of the pull request of an agent issue (or of a bot). The event is only a trigger: what it says is checked against the
+// reviews as Forgejo has them (Merger.reviewOf), never taken from the payload.
+function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots']): ForgeEvent | null {
+  const pr = payload?.pull_request;
+  if (!pr || typeof pr !== 'object') return null;
+  const fullName = payload.repository?.full_name;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
+  if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
+  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const bot = !match && !!bots && isBotPull(bots, pr, fullName);
+  const issueNumber = bot ? pr.number : match ? Number(match[1]) : 0;
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+  const present = Array.isArray(pr.labels)
+    ? pr.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
+    : [];
+  const verdict = REVIEW_EVENTS[event];
+  return {
+    type: 'pull_request.review_' + verdict,
+    source: 'forgejo',
+    action: 'reviewed',
+    ...(bot ? { bot: true } : {}),
+    repository: {
+      full_name: fullName,
+      clone_url: payload.repository.clone_url || null,
+      html_url: payload.repository.html_url || null,
+      default_branch: payload.repository.default_branch || null
+    },
+    issue: {
+      number: issueNumber,
+      title: String(pr.title || '').slice(0, 1000),
+      body: String(pr.body || '').slice(0, 50000),
+      html_url: pr.html_url || null,
+      comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
+      labels: present
+    },
+    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    review: { reviewer: payload.sender?.login || null },
     sender: { login: payload.sender?.login || null }
   };
 }
