@@ -88,18 +88,21 @@ export function quotedPrintable(text: string): string {
 export function buildMessage(options: Pick<SmtpOptions, 'from' | 'to'>, message: Notification, now = new Date(), hostPart?: string): string {
   const domain = hostPart || options.from.split('@')[1] || 'localhost';
   const body = message.text + (message.link ? '\n\n' + headerless(message.link) : '');
-  return [
+  const head = [
     'Date: ' + now.toUTCString().replace('GMT', '+0000'),
     'From: ' + options.from,
     'To: ' + options.to.join(', '),
     'Subject: ' + encodeSubject(message.subject),
     'Message-ID: <' + randomBytes(12).toString('hex') + '@' + domain + '>',
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=utf-8',
-    'Content-Transfer-Encoding: quoted-printable',
-    '',
-    quotedPrintable(body)
-  ].join('\r\n');
+    'MIME-Version: 1.0'
+  ];
+  if (!message.html) return [...head, 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: quoted-printable', '', quotedPrintable(body)].join('\r\n');
+  // Plain text and HTML in one mail (multipart/alternative): a client shows the HTML, the plain text is for the rest.
+  const boundary = '=_fh_' + randomBytes(12).toString('hex');
+  return [...head, 'Content-Type: multipart/alternative; boundary="' + boundary + '"', '',
+    '--' + boundary, 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: quoted-printable', '', quotedPrintable(body),
+    '--' + boundary, 'Content-Type: text/html; charset=utf-8', 'Content-Transfer-Encoding: quoted-printable', '', quotedPrintable(message.html),
+    '--' + boundary + '--', ''].join('\r\n');
 }
 
 // The link is on a line of its own in the body; one line, no control characters.

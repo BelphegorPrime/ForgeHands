@@ -10,6 +10,7 @@ import { Merger } from '../src/forge/merge.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { Notifier, RETRY_DELAYS_MS, mentionOf } from '../src/notify/index.ts';
 import { immediateMessage, digestMessage, cleanTitle } from '../src/notify/texts.ts';
+import { buildMessage } from '../src/notify/smtp.ts';
 import { buildStatus } from '../src/server/status.ts';
 import { metrics } from '../src/metrics.ts';
 
@@ -416,7 +417,7 @@ test('the digest lists waiting, blocked, quota and failed items with the merged 
   assert.match(digest.text, /Waiting for you \(1\):\nhello#140 ingressctl: resolve presets and some more text that goes on and on and on until… \(waiting 2 days\)/);
   assert.match(digest.text, /Blocked \(1\):\nhello#141 Blocked ticket/);
   assert.match(digest.text, /Held back by a quota \(1\):\nstrong \(back about 09:30 Europe\/Berlin\)/);
-  assert.match(digest.text, /Failed in the last 24 hours \(1\):\nhello#142 Failed ticket \(stuck\)/);
+  assert.match(digest.text, /Failed in the last 24 hours \(1\):\nhello#142 Failed ticket \(got stuck\)/);
   assert.doesNotMatch(digest.text, /Old failure/);
   assert.match(digest.text, /Merged in the last 24 hours: 2\./);
   assert.equal(config.notify.language, 'en');
@@ -443,4 +444,62 @@ test('NOTIFY_DIGEST in the German setting writes German; the dispatcher uses NOT
   await dispatcher.tick(); await wait();
   assert.match(channel.sent[0].subject, /Sache braucht dich/);
   assert.match(channel.sent[0].text, /Blockiert \(1\)/);
+});
+
+// ---- the mail as HTML: tables, links, escaping
+test('the digest is also an HTML table per section with a link on every number, escaped, and no WIP prefix', () => {
+  const data = {
+    waiting: [{ repository: repo, number: 219, title: 'WIP: Factory mail <b>&</b> "quotes"', days: 2, url: 'https://forge.example/owner/hello/pulls/219' }],
+    blocked: [{ repository: repo, number: 5, title: 'Blocked', url: 'javascript:alert(1)' }],
+    failed: [{ repository: repo, number: 73, title: 'A ticket', result: 'max_iterations', url: 'https://forge.example/owner/hello/issues/73' }],
+    quota: [{ tier: 'smart', back: '09:30 Europe/Berlin' }], merged: 3
+  };
+  const digest = digestMessage('de', data, false);
+  assert.ok(digest.html.startsWith('<!doctype html>'));
+  assert.match(digest.html, /<th [^>]*>Ticket<\/th><th [^>]*>Titel<\/th><th [^>]*>Stand<\/th>/);
+  assert.match(digest.html, /<a href="https:\/\/forge\.example\/owner\/hello\/pulls\/219"[^>]*>#219<\/a>/);
+  assert.match(digest.html, /<a href="https:\/\/forge\.example\/owner\/hello\/issues\/73"[^>]*>#73<\/a>/);
+  assert.match(digest.html, /Factory mail &lt;b&gt;&amp;&lt;\/b&gt; &quot;quotes&quot;/, 'the title is escaped');
+  assert.doesNotMatch(digest.html, /WIP/, 'the WIP prefix is dropped');
+  assert.doesNotMatch(digest.html, /javascript:/, 'only an http(s) link becomes a link');
+  assert.match(digest.html, /Iterationslimit erreicht/);
+  assert.match(digest.html, /Gemergt in den letzten 24 Stunden: 3/);
+  assert.doesNotMatch(digest.html, /<script|<img|<link|src=|onclick/i);
+  // the plain text carries the same items, with the link below
+  assert.match(digest.text, /#219 Factory mail <b>&<\/b> "quotes" \(wartet seit 2 Tagen\)\n  https:\/\/forge\.example\/owner\/hello\/pulls\/219/);
+});
+
+test('an immediate message is also HTML with a button to the pull request; the mail has both parts', () => {
+  const message = immediateMessage('de', 'handover', { repository: repo, number: 140, title: 'WIP: ingress <x>', link: 'https://forge.example/owner/hello/pulls/140', files: 5, reason: 'it decides what is reachable', security: 'ok' });
+  assert.match(message.html, /\[hello\] #140 wartet auf deinen Merge/);
+  assert.match(message.html, /ingress &lt;x&gt;/);
+  assert.match(message.html, /<a href="https:\/\/forge\.example\/owner\/hello\/pulls\/140"[^>]*>Öffnen<\/a>/);
+  assert.doesNotMatch(message.html, /WIP/);
+  const bad = immediateMessage('en', 'conflict', { repository: repo, number: 1, title: 't', link: 'file:///etc/passwd' });
+  assert.doesNotMatch(bad.html, /file:|href=/, 'no link when it is not http(s)');
+  const mail = buildMessage({ from: 'a@example.org', to: ['b@example.org'] }, message, new Date('2026-11-17T08:00:00Z'), 'example.org');
+  assert.match(mail, /Content-Type: multipart\/alternative; boundary="=_fh_[0-9a-f]+"/);
+  assert.match(mail, /Content-Type: text\/plain; charset=utf-8/);
+  assert.match(mail, /Content-Type: text\/html; charset=utf-8/);
+  const boundary = /boundary="([^"]+)"/.exec(mail)[1];
+  assert.equal(mail.split('--' + boundary).length, 4, 'two parts and the closing line');
+  assert.ok(mail.trimEnd().endsWith('--' + boundary + '--'));
+  // a message without HTML stays a plain mail
+  assert.match(buildMessage({ from: 'a@example.org', to: ['b@example.org'] }, { kind: 'x', subject: 's', text: 't' }), /Content-Type: text\/plain/);
+});
+
+test('the digest does not list a ticket whose newest run is not a failure (split, retried, running)', async () => {
+  const { dispatcher, jobs, channel } = await digestSetup();
+  clock = Date.parse('2026-11-17T07:30:00Z');
+  addJob(jobs, 60, { status: 'failed', result: 'max_iterations', finished: clock - 3600000 }, 'Split ticket');
+  addJob(jobs, 61, { status: 'failed', result: 'error', finished: clock - 7200000 }, 'Retried ticket');
+  addJob(jobs, 62, { status: 'failed', result: 'error', finished: clock - 3600000 }, 'Really failed');
+  const retried = jobs.list().filter((job) => job.key.includes('#61'));
+  jobs.add({ key: repo + '#61:ai:ready:retry', label: 'ai:ready', status: 'done', created: retried[0].created + 10, event: retried[0].event, result: 'finished', finished: clock - 1800000 });
+  const split = jobs.list().find((job) => job.key.includes('#60'));
+  split.split_at = clock - 3000000;
+  await dispatcher.tick(); await wait();
+  const [digest] = channel.sent;
+  assert.match(digest.text, /Really failed/);
+  assert.doesNotMatch(digest.text, /Split ticket|Retried ticket/);
 });
