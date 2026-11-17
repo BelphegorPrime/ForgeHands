@@ -5,7 +5,8 @@ COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci
 COPY src ./src
 COPY test ./test
-RUN npm run typecheck
+COPY ui ./ui
+RUN npm run typecheck && npm run ui:build
 
 # Runtime: Node runs the TypeScript sources directly (type stripping), so there is no compile output and no node_modules.
 FROM node:26-alpine
@@ -13,6 +14,7 @@ WORKDIR /app
 RUN mkdir -p /app/data && chown -R node:node /app/data
 COPY --chown=node:node package.json ./
 COPY --from=builder --chown=node:node /app/src ./src
+COPY --from=builder --chown=node:node /app/dist/dashboard ./dist/dashboard
 USER node
 ENV NODE_ENV=production
 EXPOSE 8080

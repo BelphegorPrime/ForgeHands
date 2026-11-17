@@ -63,7 +63,10 @@ curl -fsS http://127.0.0.1:8080/healthz
 | --- | --- | --- | --- |
 | `POST /webhooks/forgejo` | both | HMAC signature | The webhook of Forgejo. `POST /webhooks/gitea` with `FORGE=gitea`, `POST /webhooks/gitlab` with `FORGE=gitlab`; only the path of the configured forge exists. |
 | `GET /healthz` | both | none | `{"status":"ok"}`. |
-| `GET /status` | direct | `STATUS_TOKEN` if set | HTML page: summary and tickets, refreshes itself every 30 seconds. |
+| `GET /` | direct | `STATUS_TOKEN` if set | React operations dashboard with live updates. |
+| `GET /api/dashboard` | direct | `STATUS_TOKEN` if set | Current read-only dashboard snapshot as JSON. |
+| `GET /dashboard/ws` | direct | `STATUS_TOKEN` if set | WebSocket stream of dashboard snapshots. |
+| `GET /status` | direct | `STATUS_TOKEN` if set | Legacy HTML status page, refreshes itself every 30 seconds. |
 | `GET /status.json` | direct | `STATUS_TOKEN` if set | The same as JSON. |
 | `GET /metrics` | direct | `STATUS_TOKEN` if set | Prometheus text. |
 
@@ -502,9 +505,11 @@ Finished runs archive themselves (`ARCHIVE_AFTER_DAYS`): about once an hour Forg
 
 Both are direct mode only, read only and served by the same port as the webhook.
 
-**Authentication.** With `STATUS_TOKEN` set (at least 16 characters), `/status`, `/status.json` and `/metrics` answer `401` (with `WWW-Authenticate: Basic`, no ledger data) unless the request carries `Authorization: Bearer <token>` or HTTP basic auth with any user name and the token as password, so a browser can open the page. The comparison is constant time. Basic auth sends the token in base64 on every request: keep it behind TLS. `/healthz` stays open. Without `STATUS_TOKEN` all three are open and ForgeHands logs a warning at start; either way keep them behind the same internal reverse proxy as the webhook.
+**Authentication.** With `STATUS_TOKEN` set (at least 16 characters), `/`, `/api/dashboard`, `/dashboard/ws`, `/status`, `/status.json` and `/metrics` answer `401` (with `WWW-Authenticate: Basic`, no ledger data) unless the request carries `Authorization: Bearer <token>` or HTTP basic auth with any user name and the token as password. An authorized browser response receives a signed, `HttpOnly`, `SameSite=Strict` session cookie (8 hours) so its WebSocket can authenticate without putting the token in a URL or client bundle. The comparison is constant time. Basic auth sends the token in base64: keep it behind TLS. `/healthz` stays open. Without `STATUS_TOKEN` the status endpoints are open and ForgeHands logs a warning at start; either way keep them behind the same internal reverse proxy as the webhook.
 
-**`GET /status`, `GET /status.json`.** Per issue (and per dependency bot pull request) what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`, with "escalated to <label>" when the last round ran on the stronger route) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, waiting for a human, failed). No event text but the issue title. The page refreshes itself every 30 seconds (a meta refresh, no script). `/status.json` also has `notify` (channels, immediate kinds, digest time; no secrets). A dry run shows a banner, and `/status.json` has `dry_run` with the repositories and the latest would-be writes.
+**`GET /`, `GET /api/dashboard`, `GET /dashboard/ws`.** The root serves a responsive React/Vite dashboard in direct mode. It summarizes live run capacity, repository outcomes, tiers and ticket activity; search, ticket filters and 7/30-day windows are client-side. `/api/dashboard` and the WebSocket carry the same read-only status model as `/status.json`; the socket sends an initial snapshot and a fresh snapshot every three seconds. The client reconnects with bounded backoff. The frontend is built to static files and adds no runtime dependencies. For local UI development, run the service in direct mode with `npm start`, then run `npm run ui:dev`; Vite serves port 5173 and proxies the dashboard API and WebSocket to port 8080.
+
+**`GET /status`, `GET /status.json`.** The legacy status view and JSON remain available. Per issue (and per dependency bot pull request) they show what the ledger knows: runs with kind, state, result, conversation id, cost, the pull request number, the rounds used (`n/MAX_ROUNDS`, with "escalated to <label>" when the last round ran on the stronger route) and one line for the state (worker running, waiting for #n, follow-up round, fix after red CI, review, security review, epic review, rounds used up, waiting for a human, failed). No event text but the issue title. The HTML refreshes itself every 30 seconds. `/status.json` also has `notify` (channels, immediate kinds, digest time; no secrets). A dry run shows a banner, and `/status.json` has `dry_run` with the repositories and the latest would-be writes.
 
 **The summary** above the tickets (in `/status.json` under `summary`, per repository, for the last 7 and 30 days of the ledger):
 

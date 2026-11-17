@@ -9,13 +9,31 @@
   },
   "scripts": {
     "start": "node src/index.ts",
-    "typecheck": "tsc",
+    "ui:dev": "vite --config ui/vite.config.ts",
+    "ui:build": "vite build --config ui/vite.config.ts",
+    "typecheck": "tsc --project tsconfig.json && tsc --project ui/tsconfig.json",
+    "pretest": "npm run ui:build",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "pretest:coverage": "npm run ui:build",
     "test:coverage": "node --test --experimental-test-coverage \"test/**/*.test.ts\""
   },
   "license": "MIT",
   "devDependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "@radix-ui/react-tabs": "^1.2.1",
+    "@tailwindcss/vite": "^4.3.5",
     "@types/node": "^26.6.6",
-    "typescript": "^7.0.2"
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.74.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^6.4.4"
   }
 }

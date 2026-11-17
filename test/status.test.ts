@@ -4,9 +4,10 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connect } from 'node:net';
 import { createApp } from '../src/server/app.ts';
 import { buildStatus, renderStatus } from '../src/server/status.ts';
-import { hasToken } from '../src/server/auth.ts';
+import { hasStatusSession, hasToken, statusSessionCookie } from '../src/server/auth.ts';
 import { DeliveryStore } from '../src/store/deliveries.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { Dispatcher } from '../src/agent/dispatch.ts';
@@ -130,6 +131,26 @@ async function serve(extra) {
   return { base, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
+function upgradeStatus(base, cookie = '', origin = base) {
+  const target = new URL(base);
+  const socket = connect(Number(target.port), target.hostname);
+  return new Promise((resolve, reject) => {
+    let response = Buffer.alloc(0);
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error('WebSocket handshake timed out')); }, 2000);
+    socket.once('error', (error) => { clearTimeout(timer); reject(error); });
+    socket.once('connect', () => socket.write('GET /dashboard/ws HTTP/1.1\r\nHost: ' + target.host + '\r\nOrigin: ' + origin + '\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n' + (cookie ? 'Cookie: ' + cookie + '\r\n' : '') + '\r\n'));
+    socket.on('data', (chunk) => {
+      response = Buffer.concat([response, chunk]);
+      const end = response.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      clearTimeout(timer);
+      const status = response.subarray(0, end).toString('utf8').split('\r\n')[0];
+      socket.destroy();
+      resolve(status);
+    });
+  });
+}
+
 test('without STATUS_TOKEN the status stays open', async () => {
   const { base, close } = await serve();
   try {
@@ -155,6 +176,65 @@ test('with STATUS_TOKEN the status needs the token, healthz does not', async () 
     assert.doesNotMatch(refused, /Ticket|owner\/hello/);
     assert.equal((await fetch(base + '/healthz')).status, 200);
   } finally { await close(); }
+});
+
+test('dashboard API returns status and websocket sends a live snapshot', async () => {
+  const { base, close } = await serve();
+  try {
+    const response = await fetch(base + '/api/dashboard');
+    assert.equal(response.status, 200);
+    assert.ok((await response.json()).summary[repo]);
+    const socket = new WebSocket(base.replace(/^http/, 'ws') + '/dashboard/ws');
+    const snapshot = await new Promise((resolve, reject) => {
+      socket.addEventListener('message', (event) => resolve(JSON.parse(String(event.data))), { once: true });
+      socket.addEventListener('error', reject, { once: true });
+    });
+    assert.ok(snapshot.summary[repo]);
+    await new Promise((resolve) => { socket.addEventListener('close', resolve, { once: true }); socket.close(); });
+  } finally { await close(); }
+});
+
+test('root serves the built dashboard and its Vite assets', async () => {
+  const { base, close } = await serve();
+  try {
+    const response = await fetch(base + '/');
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/html/);
+    const html = await response.text();
+    assert.match(html, /ForgeHands Operations/);
+    const script = /src="([^"]+\.js)"/.exec(html)?.[1];
+    assert.ok(script);
+    const asset = await fetch(base + script);
+    assert.equal(asset.status, 200);
+    assert.match(asset.headers.get('content-type'), /javascript/);
+    assert.match(await asset.text(), /Agent activity/);
+  } finally { await close(); }
+});
+
+test('dashboard session cookies protect its API and WebSocket without exposing the status token', async () => {
+  const { base, close } = await serve({ STATUS_TOKEN: TOKEN });
+  try {
+    assert.equal((await fetch(base + '/')).status, 401);
+    assert.equal(await upgradeStatus(base), 'HTTP/1.1 401 Unauthorized');
+    assert.equal(await upgradeStatus(base, '', 'http://attacker.example'), 'HTTP/1.1 403 Forbidden');
+    const page = await fetch(base + '/', { headers: { authorization: basic('browser', TOKEN) } });
+    assert.equal(page.status, 200);
+    const setCookie = page.headers.get('set-cookie');
+    assert.match(setCookie, /HttpOnly/);
+    assert.match(setCookie, /SameSite=Strict/);
+    assert.doesNotMatch(setCookie, new RegExp(TOKEN));
+    const cookie = setCookie.split(';')[0];
+    assert.equal((await fetch(base + '/api/dashboard', { headers: { cookie } })).status, 200);
+    assert.equal(await upgradeStatus(base, cookie), 'HTTP/1.1 101 Switching Protocols');
+  } finally { await close(); }
+});
+
+test('dashboard session cookies expire and reject tampering', () => {
+  const cookie = statusSessionCookie(TOKEN, NOW);
+  assert.equal(hasStatusSession(cookie, TOKEN, NOW + 1000), true);
+  assert.equal(hasStatusSession(cookie, TOKEN, NOW + 9 * HOUR), false);
+  assert.equal(hasStatusSession(cookie.replace(/[A-Za-z0-9_-](?=;)/, 'x'), TOKEN, NOW), false);
+  assert.equal(hasStatusSession(cookie, 'another-long-status-token', NOW), false);
 });
 
 test('dry-run jobs stay out of the summary, a bot pull request counts as a ticket', () => {
