@@ -3204,10 +3204,12 @@ test('the sweep runs with the pass at start and does nothing without forge acces
 // ---- two keys: protected paths that merge with an independent security review instead of a human
 const TWO_POLICY = JSON.stringify({ 'owner/hello': { deny: ['seed/infra/**', 'compose.yaml'], two_keys: ['seed/infra/tests/**', 'seed/infra/README.md'] } });
 const securityComment = (word, sha = 'cafe0000', login = 'security-bot') => ({ created_at: '2026-11-15T11:01:00Z', user: { login }, body: '## Security review: ' + word + '\nCommit ' + sha + ': ' + 'evidence '.repeat(40) });
+// The security route of a two-key setup has a Forgejo user of its own (its token is handed to that route only).
+const twoKeyRoutes = () => JSON.stringify({ ...JSON.parse(sensitiveRoutes()), 'sensitive:review': { ...JSON.parse(sensitiveRoutes())['sensitive:review'], forgejo_token_secret: 'SECURITY_TOKEN' } });
 async function twoKeys(files, comments, extra = {}) {
   const all = [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...comments];
   const routes = goodRoutes({ ['GET ' + API + '/pulls/34/files']: files.map((filename) => ({ filename })), ['GET ' + API + '/issues/34/comments']: all, ['GET ' + API + '/issues/34/comments?limit=100']: all });
-  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), HUMAN_LOGIN: 'marcel', SECURITY_REVIEWERS: 'Security-Bot', ...extra });
+  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value', HUMAN_LOGIN: 'marcel', SECURITY_REVIEWERS: 'Security-Bot', ...extra });
   return { ...made, all };
 }
 
@@ -3284,7 +3286,9 @@ test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as
   // the latest comment of the reviewer decides, a later forged OK after the reviewer's CONCERNS does not turn it
   const mixed = await twoKeys(files, [securityComment('CONCERNS'), { ...securityComment('OK', 'cafe0000', 'openhands'), created_at: '2026-11-15T11:05:00Z' }]);
   assert.equal(await mixed.merger.handle(approvedEvent()), 'protected_paths');
-  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes() }))), /two_keys needs SECURITY_REVIEWERS/);
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /two_keys needs SECURITY_REVIEWERS/);
+  // two_keys also needs the security route to have a Forgejo user of its own, or the worker could sign as the security reviewer
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), SECURITY_REVIEWERS: 'security-bot' }))), /two_keys needs "forgejo_token_secret" on every sensitive_review route/);
   // without two_keys the variable is not needed, and without it every security comment still counts for the advisory line
   assert.doesNotThrow(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': { deny: ['compose.yaml'] } }) }))));
 });
@@ -3429,4 +3433,24 @@ test('a dry run only logs the closing of the original pull request', async () =>
   await dispatcher.enqueue(ticket('ai:plan', 5, 'B'));
   assert.deepEqual(forgejo.wrote(), []);
   assert.ok(jobs.list(true).some((job) => job.id === queued.id));
+});
+
+test('a security review route may have a Forgejo user of its own: its token goes to that route only, as FORGEJO_TOKEN', async () => {
+  const config = loadConfig(env(withMerge({ LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' })));
+  assert.equal(config.routes.get('sensitive:review').forgejoTokenSecret, 'SECURITY_TOKEN');
+  // a route that is neither a review nor a security review still may not have one
+  assert.throws(() => loadConfig(env(withMerge({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free', forgejo_token_secret: 'SECURITY_TOKEN' } }), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /only applies to a review route/);
+  const jobs = new JobStore(join(dir, 'sec-token.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => clock);
+  jobs.add({ key: repo + '#26:sensitive:review:abcdef01', label: 'sensitive:review', status: 'queued', created: clock, event: { ...ciEvent('success'), type: 'ci.sensitive', label: 'sensitive:review', protected_files: ['compose.yaml'] } });
+  jobs.add({ key: repo + '#27:ai:ready', label: 'ai:ready', status: 'queued', created: clock + 1, event: event('ai:ready', 27) });
+  await dispatcher.tick();
+  const secretsOf = (profile) => starts().find((call) => call.body.agent_profile_id === profile).body.secrets;
+  const security = secretsOf(config.routes.get('sensitive:review').profile);
+  assert.equal(security.FORGEJO_TOKEN.value, 'security-token-value', 'the security reviewer acts as its own user');
+  assert.ok(!('SECURITY_TOKEN' in security));
+  const worker = secretsOf(WORKER);
+  assert.notEqual(worker.FORGEJO_TOKEN.value, 'security-token-value', 'the worker never gets it');
+  assert.ok(!('SECURITY_TOKEN' in worker));
 });
