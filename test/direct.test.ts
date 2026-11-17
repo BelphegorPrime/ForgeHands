@@ -2948,3 +2948,10 @@ test('dry run: review mode reads the reviews but merges nothing', async () => {
   assert.deepEqual(forgejo.wrote(), []);
   assert.ok(forgejo.calls.some((call) => call.path.endsWith('/pulls/34/reviews')));
 });
+
+import { normalizeGiteaEvent } from "../src/webhook/gitea.ts";
+test("Gitea review events go through the same normalizer and carry the forge as source", () => {
+  const e = normalizeGiteaEvent("pull_request_approved", reviewPayload("pull_request_review_approved"), new Set([repo]), [], { reviews: true });
+  assert.equal(e.type, "pull_request.review_approved");
+  assert.equal(e.source, "gitea");
+});
