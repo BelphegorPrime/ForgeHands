@@ -21,6 +21,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_openhands_api_errors_total: 'Failed OpenHands API calls, by class (network, 4xx, 5xx).',
   forgehands_forgejo_api_errors_total: 'Failed Forgejo API calls, by class (network, 4xx, 5xx).',
   forgehands_escalated_rounds_total: 'Follow-up rounds sent to the stronger profile of an escalate_to route.',
+  forgehands_tier_runs_total: 'Agent runs that ended, by repository, the tier they really ran on (after fallback and escalation) and result (finished, max_iterations, error, stuck, timeout, no_delivery, other).',
   forgehands_reminders_total: 'Reminders to the human about a pull request that waits for him.',
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).'
 };
@@ -107,7 +108,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 

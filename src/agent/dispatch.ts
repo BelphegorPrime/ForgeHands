@@ -47,6 +47,9 @@ export class Dispatcher {
   dry: DryLog;
   reminder: Reminder;
   lastArchive = 0;
+  /** Earliest time of the next look for closed issues (sweepClosed) and when each ticket was last found open. */
+  nextClosedSweep = 0;
+  closedChecked = new Map<string, number>();
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
@@ -314,6 +317,7 @@ export class Dispatcher {
 
   // An issue closed: what depended on it may start now (a waiting job), and an epic whose last dependency this was is reviewed.
   async onClosed(event: ForgeEvent): Promise<string> {
+    await this.markClosed(event.repository.full_name.toLowerCase() + '#' + event.issue.number);
     if (!this.config.forgejo) return 'no_forgejo_access';
     await this.releaseFileWaitsNow();
     let blocked: Json;
@@ -357,9 +361,11 @@ export class Dispatcher {
         if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
         const number = Number(match[1]);
         const issue = await this.forge.getIssue(repository, number);
+        if (issue && issue.state === 'closed' && !issue.pull_request) await this.markClosed(repository.toLowerCase() + '#' + number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
         await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.', 'issue');
         await this.forge.closeIssue(repository, number);
+        await this.markClosed(repository.toLowerCase() + '#' + number);
         this.noteTicket(event.repository.full_name.toLowerCase() + '#' + number, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
       }
@@ -595,6 +601,7 @@ export class Dispatcher {
         return;
       }
       Object.assign(job, { status: 'failed', result: 'no_delivery' });
+      this.tierRunEnded(job, 'no_delivery');
       await this.reportFailure(job, 'no_delivery');
     } catch (error) {
       this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
@@ -673,6 +680,16 @@ export class Dispatcher {
     const kind = this.config.routes.get(job.label)?.kind || 'issue';
     metrics.inc('forgehands_runs_finished_total', { kind, state: known(state, ['finished', 'error', 'stuck', 'deleted', 'paused', 'timeout']) });
     if (job.started) metrics.observe({ kind }, Math.max(0, now - job.started) / 1000);
+    this.tierRunEnded(job, state);
+  }
+
+  // The same end, counted per repository and the tier the run really ran on (fallback and escalation included).
+  tierRunEnded(job: Job, state: string): void {
+    const tiers = new Set([...this.config.routes.values()].map((route) => route.tier));
+    metrics.inc('forgehands_tier_runs_total', {
+      repository: known(String(job.event?.repository?.full_name).toLowerCase(), this.config.allowedRepos), tier: known(this.tierOf(job), tiers),
+      result: known(state, ['finished', 'max_iterations', 'error', 'stuck', 'timeout', 'no_delivery'])
+    });
   }
 
   // Ticks never overlap: a caller waits for the running one and then runs a fresh pass.
@@ -701,6 +718,7 @@ export class Dispatcher {
     }
     if (await this.refreshMoved(now)) changed = true;
     if (await this.archiveOld(now)) changed = true;
+    if (await this.sweepClosed(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
   }
@@ -943,6 +961,43 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not end the pull request of #' + number + ' after it went to ' + label + ':', error.message);
     }
+  }
+
+  // The issue ("repo#number") is closed in the forge: its jobs leave the waiting and failed lists of the status page (see JobStore.markClosed).
+  async markClosed(ticket: string): Promise<boolean> {
+    if (isDry(this.config, ticket.split('#')[0]) || !this.jobs.markClosed(ticket)) return false;
+    await this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
+    return true;
+  }
+
+  // The events of a closed issue can be missed (closed by hand while ForgeHands was down, or before this was kept). Once a day and at start,
+  // look at the tickets that are in a state the status page shows as a problem (failed run, rounds used up, waiting) and mark those that the
+  // forge says are closed. At most 20 reads per pass; the rest follows in the next hourly pass. A read that fails changes nothing.
+  async sweepClosed(now: number): Promise<boolean> {
+    if (!this.config.forgejo || now < this.nextClosedSweep) return false;
+    const tickets = new Map<string, Job[]>();
+    for (const job of this.jobs.list()) if (!job.key.split(':')[0].includes('!')) tickets.set(job.key.split(':')[0], [...(tickets.get(job.key.split(':')[0]) || []), job]);
+    const candidates = [...tickets].filter(([ticket, list]) => {
+      if (isDry(this.config, ticket.split('#')[0]) || list.every((job) => job.archived_view) || list.some((job) => job.status === 'running' || job.status === 'queued')) return false;
+      const checked = this.closedChecked.get(ticket);
+      if (checked !== undefined && now - checked < 86400000) return false;
+      const rounds = list.filter((job) => ROUND_KINDS.has(this.config.routes.get(job.label)?.kind) && (job.started || job.status !== 'failed')).length;
+      return list.some((job) => job.status === 'failed' || job.status === 'waiting') || rounds >= this.config.maxRounds;
+    });
+    this.nextClosedSweep = now + (candidates.length > 20 ? 3600000 : 86400000);
+    let changed = false;
+    for (const [ticket, list] of candidates.slice(0, 20)) {
+      const [repository, number] = [list[0].event.repository.full_name, Number(ticket.split('#')[1])];
+      try {
+        const issue = await this.forge.getIssue(repository, number);
+        if (!issue) continue;
+        if (issue.state === 'closed') { if (await this.markClosed(ticket)) changed = true; }
+        else this.closedChecked.set(ticket, now);
+      } catch (error) {
+        this.logger.error('could not read #' + number + ' of ' + repository + ':', error.message);
+      }
+    }
+    return changed;
   }
 
   // Archive the conversations of runs that ended a while ago: the tag archived=true is added, every other tag stays, so the runs can still

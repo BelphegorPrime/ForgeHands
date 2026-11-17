@@ -60,6 +60,16 @@ export class JobStore {
     Object.assign(newest, patch);
     return true;
   }
+  // The issue (ledger key without the label) is closed in the forge: mark its jobs for the status page. Jobs that run or are queued keep
+  // their state, so work that is still going on is never hidden. Returns whether something changed.
+  markClosed(ticket: string): boolean {
+    let changed = false;
+    for (const job of this.list().filter((entry) => entry.key.startsWith(ticket + ':') && entry.status !== 'running' && entry.status !== 'queued' && !entry.archived_view)) {
+      job.archived_view = true;
+      changed = true;
+    }
+    return changed;
+  }
   add(job: NewJob): Job {
     const record: Job = { id: randomUUID(), attempts: 0, ...job };
     this.jobs.set(record.id, record);

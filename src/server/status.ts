@@ -13,12 +13,18 @@ export interface Summary {
   merge_seconds: { median: number | null; p90: number | null };
   rounds_per_merged: number | null; review_retries: number; error_retries: number; cost: number;
 }
+// Runs of one tier in a window, counted from the ledger. `failed` has one entry per reason; `merged_share` is the share of the finished
+// worker runs (kind issue) whose ticket has a merged pull request so far, null without such a run.
+export interface TierStats {
+  started: number; finished: number; failed: Record<string, number>; split: number; fell_back: number; escalated: number;
+  worker_runs_finished: number; worker_runs_merged: number; merged_share: number | null;
+}
 export interface Status {
   generated: string;
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
-  summary: Record<string, { last_7_days: Summary; last_30_days: Summary }>;
-  issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; runs: Omit<Run, 'created'>[] }[];
+  summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats }> }>;
+  issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
   waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
 }
@@ -71,6 +77,49 @@ function summarize(config: DirectConfig, jobs: Job[], days: number, now: number)
   return result;
 }
 
+export const FAIL_REASONS = ['max_iterations', 'error', 'stuck', 'timeout', 'no_delivery', 'other'];
+
+// The tier a run really ran on, from the ledger alone: the fallback route it started with, the escalation target of an escalated round, or its own route.
+function tierOfJob(config: DirectConfig, job: Job): string | undefined {
+  if (job.fell_back) return config.routes.get(job.fell_back)?.tier;
+  const own = config.routes.get(job.label);
+  return (job.escalated && own?.escalateTo ? config.routes.get(own.escalateTo) : own)?.tier;
+}
+
+// Runs per repository, tier and window (by the time the run started). A ticket sent to the planner counts for the tier of the run that held the
+// split note. A worker run counts as merged when any job of its ticket carries `merged_at` (so a pull request merged later still counts).
+function tierStats(config: DirectConfig, jobs: Job[], days: number, now: number): Record<string, Record<string, TierStats>> {
+  const since = now - days * DAY_MS;
+  const result: Record<string, Record<string, TierStats>> = {};
+  const merged = new Set(jobs.filter((job) => job.merged_at).map((job) => job.key.split(':')[0]));
+  const stats = (job: Job): TierStats | undefined => {
+    const tier = tierOfJob(config, job);
+    if (!tier) return undefined;
+    const repo = String(job.event?.repository?.full_name || job.key.split('#')[0]).toLowerCase();
+    return ((result[repo] ||= {})[tier] ||= { started: 0, finished: 0, failed: Object.fromEntries(FAIL_REASONS.map((reason) => [reason, 0])), split: 0, fell_back: 0, escalated: 0, worker_runs_finished: 0, worker_runs_merged: 0, merged_share: null });
+  };
+  for (const job of jobs) {
+    if (job.split_at && job.split_at >= since) { const entry = stats(job); if (entry) entry.split += 1; }
+    if (!job.started || job.started < since) continue;
+    const entry = stats(job);
+    if (!entry) continue;
+    entry.started += 1;
+    if (job.fell_back) entry.fell_back += 1;
+    if (job.escalated) entry.escalated += 1;
+    if (job.status === 'done') {
+      entry.finished += 1;
+      if ((config.routes.get(job.label)?.kind || 'issue') === 'issue') {
+        entry.worker_runs_finished += 1;
+        if (merged.has(job.key.split(':')[0])) entry.worker_runs_merged += 1;
+      }
+    } else if (job.status === 'failed') entry.failed[FAIL_REASONS.includes(String(job.result)) ? String(job.result) : 'other'] += 1;
+  }
+  for (const tiers of Object.values(result)) for (const entry of Object.values(tiers)) {
+    entry.merged_share = entry.worker_runs_finished ? Math.round(entry.worker_runs_merged / entry.worker_runs_finished * 100) / 100 : null;
+  }
+  return result;
+}
+
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
 // Read only, no event text beyond the issue title; it says nothing about Forgejo's side (the pull request itself).
 const KIND_TEXT: Record<string, string> = {
@@ -110,12 +159,15 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     entry.runs.push(run);
     byIssue.set(base, entry);
   }
+  // An issue is closed when every job of it is marked (see JobStore.markClosed): a new run on a reopened issue shows it as open again.
+  const closed = new Set([...byIssue.keys()].filter((key) => jobs.list().filter((job) => job.key.startsWith(key + ':')).every((job) => job.archived_view)));
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
-      issue: entry.key, title: entry.title, pr, rounds, state: stateOf(entry.runs, config.maxRounds, rounds),
+      issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds),
+      ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run)
     };
   });
@@ -125,13 +177,17 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const all = jobs.list().filter((job) => job.status !== 'dry');
   const week = summarize(config, all, 7, now);
   const month = summarize(config, all, 30, now);
+  const tierWeek = tierStats(config, all, 7, now);
+  const tierMonth = tierStats(config, all, 30, now);
+  const emptyTier = (): TierStats => ({ started: 0, finished: 0, failed: Object.fromEntries(FAIL_REASONS.map((reason) => [reason, 0])), split: 0, fell_back: 0, escalated: 0, worker_runs_finished: 0, worker_runs_merged: 0, merged_share: null });
   return {
     generated: new Date(now).toISOString(),
     dry_run: config.dryRun ? { repositories: config.dryRunRepos.size ? [...config.dryRunRepos] : 'all', would_write: dry?.writes.slice(-50) || [] } : null,
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
-    summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo] }])),
+    summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
+      tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier] }])) }])),
     issues,
-    waiting_for_human: waiting.map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason }))
+    waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason }))
   };
 }
 
@@ -150,15 +206,33 @@ function renderSummary(status: Status): string {
   return '<table><tr><th>Repository</th><th>Window</th><th>Merged (no human)</th><th>Blocked</th><th>Split</th><th>Median / p90 to merge</th><th>Rounds per merged</th><th>Review / error retries</th><th>Cost</th></tr>\n' + rows.join('\n') + '</table>';
 }
 
+// Per repository, tier and window: runs started and finished, the failed ones by reason, split tickets, fallback and escalated runs, and the share
+// of finished worker runs that led to a merged pull request.
+function renderTiers(status: Status): string {
+  const rows = Object.entries(status.summary).flatMap(([repo, entry]) => Object.entries(entry.tiers || {}).flatMap(([tier, windows]) => [['last 7 days', windows.last_7_days], ['last 30 days', windows.last_30_days]].map(([name, s]) => {
+    const t = s as TierStats;
+    return '<tr><td>' + escape(repo) + '</td><td>' + escape(tier) + '</td><td>' + name + '</td><td>' + t.started + '</td><td>' + t.finished + '</td>'
+      + FAIL_REASONS.map((reason) => '<td>' + t.failed[reason] + '</td>').join('') + '<td>' + t.split + '</td><td>' + t.fell_back + '</td><td>' + t.escalated + '</td><td>'
+      + (t.merged_share === null ? '-' : Math.round(t.merged_share * 100) + '% (' + t.worker_runs_merged + '/' + t.worker_runs_finished + ')') + '</td></tr>';
+  })));
+  if (!rows.length) return '';
+  return '<h2>Runs per tier</h2><table><tr><th>Repository</th><th>Tier</th><th>Window</th><th>Started</th><th>Finished</th>' + FAIL_REASONS.map((reason) => '<th>' + reason + '</th>').join('')
+    + '<th>Split</th><th>Fallback</th><th>Escalated</th><th>Workers merged</th></tr>\n' + rows.join('\n') + '</table>';
+}
+
 export function renderStatus(status: Status): string {
-  const rows = status.issues.map((issue) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
-    + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>').join('\n');
+  const line = (issue: Status['issues'][number]) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
+    + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
+  const head = '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n';
+  const closedIssues = status.issues.filter((issue) => issue.closed);
+  const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';
+  const rows = status.issues.filter((issue) => !issue.closed).map(line).join('\n');
   const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + ' #' + entry.pr
     + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
     + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + waiting
-    + renderSummary(status) + '<h2>Tickets</h2>'
-    + '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n' + rows + '</table>';
+    + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
+    + head + rows + '</table>' + closedSection;
 }
