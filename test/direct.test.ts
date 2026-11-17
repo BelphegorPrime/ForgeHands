@@ -3482,3 +3482,15 @@ test('a ticket the forge refuses to close does not stop the others, and is not t
   await dispatcher.closeMergedTickets(movedEvent());
   assert.ok(forgejo.wrote().slice(before).includes('PATCH /issues/53'), 'tried again after six hours');
 });
+
+test('BOT_REPOS limits the bot pull requests to some repositories; it must name allowed ones', () => {
+  const all = loadConfig(env(withCi({ ...BOT })));
+  assert.equal(all.botRepos.size, 0, 'empty: every allowed repository');
+  const some = loadConfig(env(withCi({ ...BOT, ALLOWED_REPOS: repo + ',owner/other', BOT_REPOS: 'Owner/Other' })));
+  assert.deepEqual([...some.botRepos], ['owner/other']);
+  assert.throws(() => loadConfig(env(withCi({ ...BOT, BOT_REPOS: 'owner/elsewhere' }))), /BOT_REPOS: owner\/elsewhere is not in ALLOWED_REPOS/);
+  // the pull request of an allowed repository that is not in BOT_REPOS is not a bot pull request (the operator merges it himself)
+  assert.equal(botEvent('success', {}, { ...BOT_RULES, repos: new Set(['owner/other']) }), null);
+  assert.equal(botEvent('success', {}, { ...BOT_RULES, repos: new Set([repo]) }).bot, true);
+  assert.equal(botEvent('success', {}, { ...BOT_RULES, repos: new Set() }).bot, true, 'an empty set limits nothing');
+});

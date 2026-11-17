@@ -88,7 +88,7 @@ export function createApp(config: Config, store: DeliveryStore, send: Fetch = fe
       approved: direct && config.mergePolicy.size ? config.approvedLabel : '',
       pushes: direct && config.updateBranches,
       reviews: direct && config.verdictSource !== 'comment',
-      bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, fixRounds: config.botFixRounds } : undefined });
+      bots: direct ? { authors: config.botAuthors, prefixes: config.botBranchPrefixes, repos: config.botRepos, fixRounds: config.botFixRounds } : undefined });
     if (!normalized) { remember(); delivered('ignored'); return json(res, 202, { status: 'ignored' }); }
     if (direct) normalized.previous_labels = previousLabels;
     // The CI outcome of a bot's pull request is let in by BOT_AUTHORS (the operator's own list), not by who triggered the run. Labels still need an allowed sender.

@@ -297,6 +297,7 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BOT_AUTHORS` | none | Logins of dependency bots (for example `renovate`, case-insensitive, a leading `@` is dropped). Their pull requests are reviewed and merged like agent pull requests. |
+| `BOT_REPOS` | all allowed | Optional comma separated repositories (each one of `ALLOWED_REPOS`) that have bot pull requests; the others do not: the pull requests of a bot there are ignored, so a repository whose Renovate pull requests the operator merges himself keeps the forge's own mail and handling. |
 | `BOT_BRANCH_PREFIXES` | none | Optional comma separated head branch prefixes (for example `renovate/`); a bot's pull request must match one when set. |
 | `BOT_FIX_ROUNDS` | 0 | Fix rounds per bot pull request after a red commit (1 to 100); `0` starts nothing on red. |
 

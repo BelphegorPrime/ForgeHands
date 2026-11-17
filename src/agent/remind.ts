@@ -118,7 +118,7 @@ export class Reminder {
     for (const pr of Array.isArray(pulls) ? pulls : []) {
       const match = /^ai\/issue-(\d+)$/.exec(pr?.head?.ref || '');
       // A dependency bot's pull request (BOT_AUTHORS) has no ticket: it is reminded only when it is marked blocked.
-      const bot = !match && isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes }, pr, repository);
+      const bot = !match && isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if ((!match && !bot) || pr.state !== 'open' || pr.merged) continue;
       if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) continue;
       if (looked++ >= MAX_PULLS) break;
