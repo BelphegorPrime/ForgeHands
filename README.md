@@ -435,6 +435,8 @@ Design notes: the state lives in the forge's comments (reminders are recognised 
 
 By default the human hears of a hand-over only through the forge: a comment that mentions `HUMAN_LOGIN` makes the forge send its own mail, with its own subject and layout, for every hand-over, reminder and mention. Notifications are a second path of ForgeHands' own: a short, plain message when a human is needed and cannot be avoided, plus an optional daily digest. Both are off until configured, and `HUMAN_MENTION=0` lets the forge keep quiet.
 
+**How it looks.** Every message is a mail with a plain-text and an HTML part. The HTML has a short heading and, for the digest, one table per section (ticket, title, state) in which each ticket number is a link to its pull request, or to the issue when there is no pull request; an immediate message has a button to the pull request. Titles are escaped and cut, a leading `WIP:` is dropped, a link is only used when it is a plain `http(s)` address, and there is no script, image or external style. The plain text carries the same items with the link on the line below.
+
 **What is sent.** *Immediate* messages (`NOTIFY_IMMEDIATE`, one kind each):
 
 | Kind | When |
