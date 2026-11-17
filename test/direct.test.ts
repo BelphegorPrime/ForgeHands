@@ -1739,6 +1739,38 @@ test('a reset time given only in words is understood; a few seconds next to no c
   }
 });
 
+test('no model available (503, bad gateway, timeout) is treated like a used-up quota: the tier waits and the job tries again', async () => {
+  for (const code of ['LLMServiceUnavailableError', 'BadGatewayError', 'LLMTimeoutError']) {
+    const { dispatcher, jobs, forgejo } = await buildQuota([{ kind: 'ConversationErrorEvent', code, detail: 'dva/claude-fable-5-1-high: provider — [503]: not configured; openai/gpt-6-astra: no credits remaining' }], 'unavail-' + code + '.json');
+    const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, verdict_retry: 1 });
+    await dispatcher.tick();
+    states[job.conversation_id] = 'error';
+    await dispatcher.tick();
+    assert.equal(job.status, 'queued', code);
+    assert.equal(job.next_try - clock, 900 * 1000, code + ': the default wait of 15 minutes');
+    assert.equal(job.rate_limited, 1, code);
+    assert.equal(job.error_retry, undefined, code + ': not an ordinary error retry');
+    assert.deepEqual(forgejo.wrote(), [], code + ': nobody is called');
+    assert.ok(dispatcher.cooldowns.get('strong') > clock, code + ': the tier waits');
+  }
+  // gives up like a quota that stays out: after QUOTA_GIVE_UP_HOURS
+  const { dispatcher, jobs } = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMServiceUnavailableError', detail: '503' }], 'unavail-giveup.json');
+  const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 90, rate_limited_since: clock - 25 * 3600000, verdict_retry: 1 });
+  await dispatcher.tick();
+  states[job.conversation_id] = 'error';
+  await dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  // an error that is not about availability (a bad request) is still an ordinary error
+  const other = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMBadRequestError', detail: '400' }], 'unavail-other.json');
+  other.dispatcher.config = { ...other.config, errorRetries: 1 };
+  const retried = other.jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, verdict_retry: 1 });
+  await other.dispatcher.tick();
+  states[retried.conversation_id] = 'error';
+  await other.dispatcher.tick();
+  assert.equal(retried.error_retry, 1);
+  assert.equal(retried.rate_limited, undefined);
+});
+
 test('a run that reached its iteration limit is not run again: it ends as max_iterations', async () => {
   const limit = { kind: 'ConversationErrorEvent', code: 'MaxIterationsReached', detail: 'Agent reached maximum iterations limit (150).' };
   const { dispatcher, jobs, config } = await buildQuota([limit]);
@@ -1750,7 +1782,7 @@ test('a run that reached its iteration limit is not run again: it ends as max_it
   assert.equal(job.status, 'failed');
   assert.equal(job.result, 'max_iterations');
   assert.equal(job.error_retry, undefined, 'no error retry');
-  const other = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMServiceUnavailableError', detail: '503' }], 'other.json');
+  const other = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMBadRequestError', detail: '400' }], 'other.json');
   other.dispatcher.config = { ...other.config, errorRetries: 1 };
   const retried = other.jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, verdict_retry: 1 });
   await other.dispatcher.tick();

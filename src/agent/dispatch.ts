@@ -15,6 +15,8 @@ const MAX_ATTEMPTS = 3;
 // Routes that count as a follow-up round of an issue (a review run does not).
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
 const ERROR_RETRY_DELAY_MS = 60000;
+// Errors of a gateway that has no model left to ask: treated like a quota that is used up.
+const UNAVAILABLE_CODES = new Set(['LLMServiceUnavailableError', 'BadGatewayError', 'LLMTimeoutError']);
 // The last this many started runs decide what a repository has had so far (see pickNext).
 const RECENT_STARTS = 50;
 
@@ -551,6 +553,10 @@ export class Dispatcher {
         return { code: String(limit.code || 'LLMRateLimitError'), rateLimited: true, waitMs: seconds > 0 ? seconds * 1000 : null };
       }
       if (!errors.length) return null;
+      // No model could answer (OmniRoute tried every model of the combination and reports the last failure: 503, bad gateway, timeout): the
+      // same as an exhausted quota for the tier. Wait and try again, and give up only when it has gone on for QUOTA_GIVE_UP_HOURS.
+      const unavailable = errors.find((item: Json) => UNAVAILABLE_CODES.has(String(item.code || '')));
+      if (unavailable) return { code: String(unavailable.code), rateLimited: true, waitMs: null };
       return { code: String(errors[0].code || ''), rateLimited: false, waitMs: null };
     } catch (error) {
       this.logger.error('could not read the error of ' + job.key + ':', error.message);
