@@ -532,7 +532,7 @@ export class Dispatcher {
   // How long (ms) until the quota is back, when the run ended with a rate limit error; null for any other failure.
   // The error a run ended with, from its last events: whether the model was out of quota (and, when the gateway says, for how long), or
   // whether the agent reached its iteration limit. Null when there is no error event or it cannot be read.
-  async lastError(job: Job): Promise<{ code: string; rateLimited: boolean; waitMs: number | null } | null> {
+  async lastError(job: Job): Promise<{ code: string; rateLimited: boolean; unavailable?: boolean; waitMs: number | null } | null> {
     try {
       const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/search?limit=10&sort_order=TIMESTAMP_DESC');
       if (!response.ok) return null;
@@ -556,7 +556,7 @@ export class Dispatcher {
       // No model could answer (OmniRoute tried every model of the combination and reports the last failure: 503, bad gateway, timeout): the
       // same as an exhausted quota for the tier. Wait and try again, and give up only when it has gone on for QUOTA_GIVE_UP_HOURS.
       const unavailable = errors.find((item: Json) => UNAVAILABLE_CODES.has(String(item.code || '')));
-      if (unavailable) return { code: String(unavailable.code), rateLimited: true, waitMs: null };
+      if (unavailable) return { code: String(unavailable.code), rateLimited: true, unavailable: true, waitMs: null };
       return { code: String(errors[0].code || ''), rateLimited: false, waitMs: null };
     } catch (error) {
       this.logger.error('could not read the error of ' + job.key + ':', error.message);
@@ -1023,7 +1023,10 @@ export class Dispatcher {
       if (error?.rateLimited) {
         const since = job.rate_limited_since || now;
         if (now - since < this.config.quotaGiveUpMs) {
-          const wait = Math.min(Math.max(error.waitMs ?? 15 * 60000, 60000), this.config.quotaHoldMaxMs);
+          // No time from the gateway: a quota without a reset time waits 15 minutes; "no model available" starts short and doubles (1, 2, 4, 8,
+          // 16, then 30 minutes), because such a window may be over in a minute or last hours.
+          const fallback = error.unavailable ? Math.min(60000 * 2 ** Math.min(job.rate_limited || 0, 5), 30 * 60000) : 15 * 60000;
+          const wait = Math.min(Math.max(error.waitMs ?? fallback, 60000), this.config.quotaHoldMaxMs);
           const until = now + wait;
           this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());

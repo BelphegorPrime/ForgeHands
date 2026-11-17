@@ -1747,12 +1747,28 @@ test('no model available (503, bad gateway, timeout) is treated like a used-up q
     states[job.conversation_id] = 'error';
     await dispatcher.tick();
     assert.equal(job.status, 'queued', code);
-    assert.equal(job.next_try - clock, 900 * 1000, code + ': the default wait of 15 minutes');
+    assert.equal(job.next_try - clock, 60 * 1000, code + ': the first wait is a minute');
     assert.equal(job.rate_limited, 1, code);
     assert.equal(job.error_retry, undefined, code + ': not an ordinary error retry');
     assert.deepEqual(forgejo.wrote(), [], code + ': nobody is called');
     assert.ok(dispatcher.cooldowns.get('strong') > clock, code + ': the tier waits');
   }
+  // the pause grows: 1, 2, 4, 8, 16 and then 30 minutes
+  for (const [waited, minutes] of [[1, 2], [3, 8], [5, 30], [20, 30]]) {
+    const t = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMServiceUnavailableError', detail: '503' }], 'unavail-grow-' + waited + '.json');
+    const grown = t.jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: waited, rate_limited_since: clock, verdict_retry: 1 });
+    await t.dispatcher.tick();
+    states[grown.conversation_id] = 'error';
+    await t.dispatcher.tick();
+    assert.equal(grown.next_try - clock, minutes * 60000, waited + ' waits so far');
+  }
+  // a rate limit without a time keeps its 15 minutes
+  const limited = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMRateLimitError', classification: { kind: 'rate_limit' }, detail: 'no number' }], 'unavail-limit.json');
+  const quota = limited.jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 3, rate_limited_since: clock, verdict_retry: 1 });
+  await limited.dispatcher.tick();
+  states[quota.conversation_id] = 'error';
+  await limited.dispatcher.tick();
+  assert.equal(quota.next_try - clock, 900 * 1000);
   // gives up like a quota that stays out: after QUOTA_GIVE_UP_HOURS
   const { dispatcher, jobs } = await buildQuota([{ kind: 'ConversationErrorEvent', code: 'LLMServiceUnavailableError', detail: '503' }], 'unavail-giveup.json');
   const job = jobs.add({ ...reviewJob(), status: 'queued', conversation_id: undefined, started: undefined, rate_limited: 90, rate_limited_since: clock - 25 * 3600000, verdict_retry: 1 });
