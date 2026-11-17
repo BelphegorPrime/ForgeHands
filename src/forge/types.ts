@@ -3,7 +3,7 @@ import type { Json, NormalizedEvent } from '../types.ts';
 import type { NormalizeOptions } from '../webhook/events.ts';
 
 /** The forges ForgeHands can talk to. Gitea and GitLab are added by their own implementations of `Forge`. */
-export type ForgeKind = 'forgejo';
+export type ForgeKind = 'forgejo' | 'gitea';
 
 // The shapes below are what the core reads. A forge whose API looks different maps its answers into them (a GitLab merge request into a
 // PullRequest, a pipeline into a CommitStatus), so that the dispatcher and the merger never branch on the forge.
@@ -75,6 +75,8 @@ export interface AgentApi {
   name: string;
   /** The secrets the agent gets (AGENT_SECRETS), as a phrase: "the FORGEJO_TOKEN and FORGEJO_URL secrets". */
   secrets: string;
+  /** Where the repository keeps its CI workflow files, as a phrase for the fix prompt. */
+  workflows: string;
   issue(number: number | string): string;
   issueComments(number: number | string): string;
   pull(number: number | string): string;

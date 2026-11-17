@@ -37,8 +37,8 @@ afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDela
 test('FORGE defaults to forgejo, and an unsupported forge is refused with a clear message', () => {
   assert.equal(loadConfig(env()).forge, 'forgejo');
   assert.equal(loadConfig(env({ FORGE: 'Forgejo' })).forge, 'forgejo');
-  assert.throws(() => loadConfig(env({ FORGE: 'gitea' })), /FORGE must be forgejo, not gitea/);
-  assert.throws(() => loadConfig(env({ FORGE: 'github' })), /FORGE must be forgejo/);
+  assert.equal(loadConfig(env({ FORGE: 'gitea' })).forge, 'gitea');
+  assert.throws(() => loadConfig(env({ FORGE: 'github' })), /FORGE must be forgejo or gitea, not github/);
 });
 
 test('FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names of the FORGEJO_* settings', () => {
