@@ -370,6 +370,8 @@ export class Dispatcher {
     if (!this.config.forgejo) return false;
     try {
       const pr = await this.forge.getPull(event.repository.full_name, event.pull_request!.number);
+      // A pull request that closed meanwhile has nothing left to fix or review (Gitea's run event does not say whether it is open).
+      if (pr?.state === 'closed' || pr?.merged === true) return true;
       return Boolean(pr?.head?.sha) && pr.head.sha !== event.ci!.commit_sha;
     } catch (error) {
       this.logger.error('could not read the head of #' + event.pull_request!.number + ':', error.message);

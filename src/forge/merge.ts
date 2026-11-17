@@ -157,7 +157,7 @@ export class Merger {
     return ['approved and green, but not merged automatically: it touches protected paths. It is ready for a human to merge.',
       'The reviewer approved commit ' + sha.slice(0, 8) + ' and CI is green. A human merges it because the merge policy keeps these paths for a person:\n' + lines.join('\n'),
       ...(security ? [security.trim()] : []),
-      ...(conflict ? ['Forgejo reports a conflict with the default branch; a conflict round resolves it before the merge.'] : [])].join('\n\n');
+      ...(conflict ? [this.forge.agent(repository).name + ' reports a conflict with the default branch; a conflict round resolves it before the merge.'] : [])].join('\n\n');
   }
 
   // One sentence for the comment that hands a protected-path pull request to the human. Empty without a security review route.

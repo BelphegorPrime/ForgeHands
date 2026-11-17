@@ -3,7 +3,7 @@ import { DryLog, isDry, isWrite } from '../dry.ts';
 import { normalizeEvent } from '../webhook/events.ts';
 import { deliveryId, verifyForgejoSignature } from '../webhook/security.ts';
 import type { Config, Fetch, ForgejoAccess, Json } from '../types.ts';
-import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from './types.ts';
+import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, ForgeKind, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from './types.ts';
 
 export interface ForgejoConfig { forgejo?: ForgejoAccess | null; timeoutMs: number; dryRun: Config['dryRun']; dryRunRepos: Config['dryRunRepos'] }
 
@@ -39,6 +39,7 @@ export function forgejoAgentApi(repository: string): AgentApi {
   const api = '$FORGEJO_URL/api/v1/repos/' + repository;
   return {
     name: 'Forgejo',
+    workflows: '.forgejo/workflows or .github/workflows',
     secrets: 'the FORGEJO_TOKEN and FORGEJO_URL secrets',
     issue: (number) => api + '/issues/' + number,
     issueComments: (number) => api + '/issues/' + number + '/comments',
@@ -56,8 +57,8 @@ export function forgejoAgentApi(repository: string): AgentApi {
 
 // Forgejo's API (v1) and its webhooks. Gitea's is nearly the same; a Gitea variant overrides what differs.
 export class ForgejoForge implements Forge {
-  readonly kind = 'forgejo' as const;
-  readonly webhookPath = '/webhooks/forgejo';
+  readonly kind: ForgeKind = 'forgejo';
+  readonly webhookPath: string = '/webhooks/forgejo';
   call: Transport;
 
   constructor(call: Transport) {

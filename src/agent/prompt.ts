@@ -116,7 +116,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
       clone, never,
       'Do this, in order:',
       '1. Check out the branch ' + pr.head_ref + ' of the pull request.',
-      '2. Find out what failed: run the checks the repository documents (AGENTS.md / CONTRIBUTING.md / the workflow files in .forgejo/workflows or .github/workflows) and reproduce the failure. ' + issueRead + ' Also read ' + reading + '.',
+      '2. Find out what failed: run the checks the repository documents (AGENTS.md / CONTRIBUTING.md / the workflow files in ' + agent.workflows + ') and reproduce the failure. ' + issueRead + ' Also read ' + reading + '.',
       trust,
       '3. Fix the failure and nothing beyond it. Run the same checks until they pass.',
       '4. Push to the SAME branch ' + pr.head_ref + '. Never open another pull request or branch for this issue.',

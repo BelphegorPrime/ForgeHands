@@ -44,7 +44,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 `compose.yaml` binds the port to `127.0.0.1`. To accept Forgejo webhooks from another host, use a secured reverse proxy and an explicit network policy. To run without Docker: `npm start`. To build a local image: `docker build -t forgehands:local .` and `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`. Keep registry and webhook secrets out of committed files.
 
-Endpoints: `POST /webhooks/forgejo` (the webhook), `GET /healthz`, and in direct mode `GET /status` (page), `GET /status.json` and `GET /metrics` (Prometheus).
+Endpoints: `POST /webhooks/forgejo` (the webhook; `/webhooks/gitea` with `FORGE=gitea`), `GET /healthz`, and in direct mode `GET /status` (page), `GET /status.json` and `GET /metrics` (Prometheus).
 
 ## Forgejo setup
 
@@ -55,6 +55,21 @@ Create a **Forgejo** webhook per allowed repository (Settings, Webhooks):
 - Forgejo may not deliver to an HTTPS URL whose certificate comes from a private CA; a plain internal `http://` URL works (the payload is HMAC-signed).
 
 Direct mode also needs the labels you route (for example `ai:plan`, `ai:ready`, `ai:escalate`, `ai:review`, `ai:changes`, `ai:approved`; `ai:blocked` is created when missing) and, for a clean division of rights, a Forgejo user of its own for the agents and ForgeHands (a token for it as `FORGEJO_TOKEN`, write access to the allowed repositories, not an administrator).
+
+## Gitea setup
+
+Set `FORGE=gitea` (with `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`; the agent still gets its secrets as `FORGEJO_URL` and `FORGEJO_TOKEN`). Gitea shares Forgejo's API, so everything above applies; only the webhook differs. Create a **Gitea** webhook (type Gitea) per allowed repository:
+
+- URL `https://YOUR-HOST/webhooks/gitea`, content type `application/json`, secret = the exact `FORGE_WEBHOOK_SECRET`. ForgeHands checks `X-Gitea-Signature` (hex HMAC-SHA256 of the body) and reads `X-Gitea-Event` and `X-Gitea-Delivery`; Forgejo's headers and `/webhooks/forgejo` are not accepted on a Gitea setup.
+- Events: **Issues** (Gitea reports label changes as `issues` with action `label_updated`), **Pull request** and **Pull request label** (`pull_request`), **Workflow run** (`workflow_run`, Gitea 1.25 or newer, needs Gitea Actions) and **Push**. A finished `workflow_run` (`conclusion` `failure` or `success`) becomes the same internal event as Forgejo's `action_run_failure` and `action_run_success`; cancelled and skipped runs are ignored.
+- Verified against the Gitea source and webhook docs: merge (`Do`, `head_commit_id`), `POST /pulls/<n>/update?style=rebase` (409 on conflict), combined status, compare, pull files, issue dependencies and blocks, reviews, and the `WIP:` / `[WIP]` title prefixes (case-insensitive, and `mergeable` is false for them, as on Forgejo).
+
+What does not work on Gitea:
+
+- A dependency bot's pull request (`BOT_AUTHORS`) gets no review or fix round from CI: Gitea's `workflow_run` names the pull request only by number and branch, with no author. Label events of such a pull request still work.
+- A CI event of a pull request carries no title or body; the agent reads the issue itself. Whether the pull request is still open is read from the API before a round starts.
+- Only runs of a pull request or a push count, and a head branch in a fork never counts as an agent branch.
+- Metrics count Gitea API errors under the `forgehands_forgejo_api_errors_total` series (one family).
 
 ## OpenHands setup
 
@@ -96,7 +111,7 @@ Webhook mode verifies `X-Forgejo-Signature` (HMAC SHA-256 over the raw body), al
 | `OPENHANDS_WEBHOOK_SECRET`, `OPENHANDS_WEBHOOK_URL` | webhook mode | Independent secret (at least 16 characters) and complete URL of the OpenHands custom webhook. |
 | `OPENHANDS_API_URL`, `OPENHANDS_API_KEY` | direct mode | Switch to direct mode and reach the OpenHands backend. |
 | `FORGEJO_URL`, `FORGEJO_TOKEN` | direct mode, for most features | Forgejo API access: merge, round limits, status checks, dependencies, branch updates. Without them ForgeHands only logs what it would tell Forgejo. |
-| `FORGE` | no | Which forge ForgeHands talks to: `forgejo` (default and the only one so far; Gitea and GitLab are planned). The neutral names `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET` mean the same as `FORGEJO_URL`, `FORGEJO_TOKEN` and `FORGEJO_WEBHOOK_SECRET`, which keep working; setting both names of a pair to different values is an error. In `AGENT_SECRETS` the neutral names reach the agent as `FORGEJO_URL` and `FORGEJO_TOKEN`. |
+| `FORGE` | no | Which forge ForgeHands talks to: `forgejo` (default) or `gitea` (see "Gitea setup"; GitLab is planned). The neutral names `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET` mean the same as `FORGEJO_URL`, `FORGEJO_TOKEN` and `FORGEJO_WEBHOOK_SECRET`, which keep working; setting both names of a pair to different values is an error. In `AGENT_SECRETS` the neutral names reach the agent as `FORGEJO_URL` and `FORGEJO_TOKEN`. |
 | `DATA_FILE`, `JOBS_FILE` | no | Delivery store (`./data/deliveries.json`) and issue ledger (`jobs.json` next to it). |
 | `PORT`, `HOST` | no | Listening port (`8080`) and address (`0.0.0.0`). |
 | `DRY_RUN`, `DRY_RUN_REPOS` | no | `DRY_RUN=1`: events are received and judged as usual, but every write is only logged: no OpenHands conversation (the job ends as `dry`, its first message kept in the ledger as `dry_prompt`), no Forgejo comment, label, merge, branch update or close, no webhook-mode forward. Reads stay real. `DRY_RUN_REPOS=owner/repo,...` (must be in `ALLOWED_REPOS`) limits it to those repositories. `/status` shows a banner and `/status.json` the latest would-be writes. |
