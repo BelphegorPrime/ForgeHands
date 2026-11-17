@@ -140,6 +140,7 @@ export class Merger {
   async securityReview(repository: string, number: number, sha: string): Promise<string | null> {
     const comments = await this.forge.listComments(repository, number, 100);
     const found = (Array.isArray(comments) ? comments : [])
+      .filter((comment: Json) => !this.config.securityReviewers || this.config.securityReviewers.has(String(comment.user?.login || comment.user?.username || '').toLowerCase()))
       .map((comment: Json) => ({ at: Date.parse(comment.created_at), text: String(comment.body || '').slice(0, 600) }))
       .filter((entry) => /security review\s*:\s*(ok|concerns)\b/i.test(entry.text.slice(0, 200)) && entry.text.includes(sha.slice(0, 8)))
       .sort((a, b) => a.at - b.at)

@@ -3059,11 +3059,11 @@ test("Gitea review events go through the same normalizer and carry the forge as 
 
 // ---- two keys: protected paths that merge with an independent security review instead of a human
 const TWO_POLICY = JSON.stringify({ 'owner/hello': { deny: ['seed/infra/**', 'compose.yaml'], two_keys: ['seed/infra/tests/**', 'seed/infra/README.md'] } });
-const securityComment = (word, sha = 'cafe0000') => ({ created_at: '2026-11-15T11:01:00Z', user: { login: 'openhands' }, body: '## Security review: ' + word + '\nCommit ' + sha + ': ' + 'evidence '.repeat(40) });
+const securityComment = (word, sha = 'cafe0000', login = 'security-bot') => ({ created_at: '2026-11-15T11:01:00Z', user: { login }, body: '## Security review: ' + word + '\nCommit ' + sha + ': ' + 'evidence '.repeat(40) });
 async function twoKeys(files, comments, extra = {}) {
   const all = [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...comments];
   const routes = goodRoutes({ ['GET ' + API + '/pulls/34/files']: files.map((filename) => ({ filename })), ['GET ' + API + '/issues/34/comments']: all, ['GET ' + API + '/issues/34/comments?limit=100']: all });
-  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), HUMAN_LOGIN: 'marcel', ...extra });
+  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), HUMAN_LOGIN: 'marcel', SECURITY_REVIEWERS: 'Security-Bot', ...extra });
   return { ...made, all };
 }
 
@@ -3115,16 +3115,32 @@ test('two keys: a security review that arrives after the approval merges when th
 });
 
 test('two keys: the policy is validated, and an entry without two_keys behaves as before', () => {
-  const bad = (entry, pattern) => assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }) }))), pattern);
+  const bad = (entry, pattern) => assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }), SECURITY_REVIEWERS: 'security-bot' }))), pattern);
   bad({ deny: ['a/**'], two_keys: 'a/x' }, /two_keys of owner\/hello must be a list of patterns/);
   bad({ deny: ['a/**'], two_keys: [''] }, /two_keys of owner\/hello must be a list/);
   bad({ deny: ['a/**'], two_keys: [1] }, /two_keys of owner\/hello must be a list/);
   bad({ two_keys: ['a/x'] }, /needs a deny list/);
   bad({ deny: ['a/**'], two_keys: ['b/**'] }, /not covered by a deny pattern/);
-  const rule = (entry) => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }) }))).mergePolicy.get('owner/hello');
+  const rule = (entry) => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': entry }), SECURITY_REVIEWERS: 'security-bot' }))).mergePolicy.get('owner/hello');
   const ok = rule({ deny: ['a/**', 'c.md'], two_keys: ['a/tests/**', 'c.md', 'a/*.md'] });
   assert.deepEqual(ok.twoKeyPatterns, ['a/tests/**', 'c.md', 'a/*.md']);
   assert.ok(ok.twoKeys[0].test('a/tests/x/y.ts'));
   const plain = rule({ deny: ['a/**'] });
   assert.deepEqual([plain.twoKeys, plain.twoKeyPatterns], [[], []]);
+});
+
+test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as the second key; two_keys needs the variable', async () => {
+  const files = ['seed/infra/tests/a.test.ts'];
+  // the same comment written by the author of the pull request (the worker, here "openhands") is no second key
+  const forged = await twoKeys(files, [securityComment('OK', 'cafe0000', 'openhands')]);
+  assert.equal(await forged.merger.handle(approvedEvent()), 'protected_paths');
+  assert.ok(!forged.forgejo.wrote().includes('POST /pulls/34/merge'));
+  const genuine = await twoKeys(files, [securityComment('OK')]);
+  assert.equal(await genuine.merger.handle(approvedEvent()), 'merged');
+  // the latest comment of the reviewer decides, a later forged OK after the reviewer's CONCERNS does not turn it
+  const mixed = await twoKeys(files, [securityComment('CONCERNS'), { ...securityComment('OK', 'cafe0000', 'openhands'), created_at: '2026-11-15T11:05:00Z' }]);
+  assert.equal(await mixed.merger.handle(approvedEvent()), 'protected_paths');
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes() }))), /two_keys needs SECURITY_REVIEWERS/);
+  // without two_keys the variable is not needed, and without it every security comment still counts for the advisory line
+  assert.doesNotThrow(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': { deny: ['compose.yaml'] } }) }))));
 });

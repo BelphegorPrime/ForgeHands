@@ -106,6 +106,7 @@ export interface DirectConfig extends BaseConfig {
   remindMax: number;
   staleLabel: string | null;
   humanLogin: string | null;
+  securityReviewers: Set<string> | null;
   approvedLabel: string;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
