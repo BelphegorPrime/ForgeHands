@@ -1,6 +1,6 @@
 import { isDry } from '../dry.ts';
 import type { DryLog, DryWrite } from '../dry.ts';
-import type { DirectConfig, Job } from '../types.ts';
+import type { DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
@@ -36,6 +36,8 @@ export interface Status {
   waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
+  // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
+  idle?: { since: string; reasons: IdleCounts; quota_tiers: string[] };
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -155,7 +157,8 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null, options: { all?: boolean } = {}): Status {
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
+  options: { all?: boolean; idle?: IdleState | null } = {}): Status {
   const byIssue = new Map<string, { key: string; title: string; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -213,7 +216,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     issues,
     hidden,
     waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
-    workspace
+    workspace,
+    ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers } } : {})
   };
 }
 

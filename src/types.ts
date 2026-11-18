@@ -39,7 +39,12 @@ export interface MergeRule {
 }
 
 export type NotifyLanguage = 'en' | 'de';
-export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder'] as const;
+export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled'] as const;
+
+/** What holds the queued and waiting jobs back, counted per job (see Dispatcher.idleCounts). `could_start`: a job that could start and did not. */
+export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number }
+/** The last pass in which something waited and nothing could start: since when, the counts, and the tiers whose quota holds the queued jobs. */
+export interface IdleState { since: number; reasons: IdleCounts; tiers: string[] }
 
 /** Notifications (SMTP_*, NOTIFY_*, HUMAN_MENTION): how the human hears of what needs him without the forge's mail. */
 export interface NotifyConfig {
@@ -153,6 +158,8 @@ export interface DirectConfig extends BaseConfig {
   commentRestarts: number;
   /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
   humanReviewRounds: boolean;
+  /** STALL_ALERT_MINUTES: a notification when nothing has started for this long while work waits on a hold that is not a dependency (0 = off). */
+  stallAlertMinutes: number;
   /** NUDGE_AT_PERCENT: the share of a worker run's iteration limit after which, without a branch ai/issue-<n>, the run is nudged (0 = off). */
   nudgeAtPercent: number;
   /** NUDGE_MESSAGE: the text of the nudge instead of the default (null: the default). */
