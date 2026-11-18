@@ -122,6 +122,14 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
 - **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
 
+# Upgrading to the next version: the ledger is closed up, the status page hides old tickets
+
+This is a feature release on top of 0.7.0 and nothing needs a change. Three things are new; each one is on by default and can be switched off.
+
+- **`LEDGER_SYNC_HOURS`** (default `6`, `0` = off). The ledger reads the state in the forge of the tickets it holds as open and marks the closed ones closed, at most 60 reads a pass. On the first start a ledger with many dead tickets is worked off over several passes. Needs `FORGEJO_URL` and `FORGEJO_TOKEN`.
+- **`STATUS_HIDE_DAYS`** (default `7`, `0` = hide nothing). Closed tickets older than that are left off `/status` and `/status.json`; `/status.json` gets `hidden` (their count) and `?all=1` shows them. The counters are not affected.
+- **The follow-up figure in the digest** (`NOTIFY_DIGEST`): one line on the follow-up fixes after the automatic merges of 7 days. It is read from the forge, at most 120 calls a digest, and Forgejo and Gitea only. It is a quality figure, not a task for you.
+
 ## Also in 0.7.0: the workspace is cleaned up
 
 Every OpenHands run clones the repository into its own directory below the workspace, and nothing removed them. On one host 35 GB sat in about 60 of them (mostly `node_modules`), the disk filled up, and the next deploy and the runs failed. From 0.7.0 ForgeHands can remove them itself and keep new runs from starting while the disk is nearly full.

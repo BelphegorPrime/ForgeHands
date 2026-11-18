@@ -84,6 +84,10 @@ export class JobStore {
     }
     return changed;
   }
+  // The ledger sync asked the forge about this ticket at `now`: every job of the ticket keeps it (the oldest-checked ticket is asked first).
+  noteChecked(ticket: string, now: number): void {
+    for (const job of this.list().filter((entry) => entry.key.startsWith(ticket + ':'))) job.synced_at = now;
+  }
   add(job: NewJob): Job {
     const record: Job = { id: randomUUID(), attempts: 0, ...job };
     this.jobs.set(record.id, record);

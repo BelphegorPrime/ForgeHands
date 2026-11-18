@@ -147,6 +147,14 @@ function diskFreeGbOf(value: string | undefined): number {
   return gb;
 }
 
+// LEDGER_SYNC_HOURS (0 = off) and STATUS_HIDE_DAYS (0 = hide nothing): whole numbers with a default.
+function wholeOf(value: string | undefined, fallback: number, name: string, max: number): number {
+  if (value === undefined || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0 || number > max) throw new Error(name + ' must be an integer between 0 and ' + max);
+  return number;
+}
+
 function remindDays(value: string | undefined): number {
   if (value === undefined || value === '') return 0;
   const days = Number(value);
@@ -376,6 +384,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     splitLabel: env.SPLIT_LABEL?.trim() || null,
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
+    // The ledger sync (src/agent/ledger-sync.ts) asks the forge about the open tickets of the ledger this often; 0 switches it off.
+    ledgerSyncHours: wholeOf(env.LEDGER_SYNC_HOURS, 6, 'LEDGER_SYNC_HOURS', 720),
+    // The status page and /status.json leave out closed tickets whose last activity is older than this many days (?all=1 shows them).
+    statusHideDays: wholeOf(env.STATUS_HIDE_DAYS, 7, 'STATUS_HIDE_DAYS', 3650),
     // The Forgejo login to mention in the comments that hand something to a human (and only there), so that Forgejo mails him when his
     // notification setting is "only on mention". Needs an agent user of its own: Forgejo does not mail the actor of an action.
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),

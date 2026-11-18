@@ -138,6 +138,10 @@ export interface DirectConfig extends BaseConfig {
   quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
+  /** LEDGER_SYNC_HOURS: how often the ledger sync asks the forge about tickets it holds as open; 0 = off. */
+  ledgerSyncHours: number;
+  /** STATUS_HIDE_DAYS: closed tickets whose last activity is older than this many days are not on the status page (0 = hide nothing). */
+  statusHideDays: number;
   remindAfterDays: number;
   remindMax: number;
   staleLabel: string | null;
@@ -283,6 +287,8 @@ export interface Job {
   archived?: boolean;
   /** The issue of this job is closed in the forge: the status page lists it as closed, never as waiting or failed. */
   archived_view?: boolean;
+  /** When the ledger sync (LEDGER_SYNC_HOURS) last asked the forge about this ticket; kept on every job of it, so the oldest-checked ticket goes first. */
+  synced_at?: number;
   error_retry?: number;
   delivery_retry?: number;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */

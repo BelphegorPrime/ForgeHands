@@ -30,6 +30,8 @@ export interface Status {
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats }> }>;
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
+  hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
   waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
@@ -153,8 +155,8 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null): Status {
-  const byIssue = new Map<string, { key: string; title: string; runs: Run[] }>();
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null, options: { all?: boolean } = {}): Status {
+  const byIssue = new Map<string, { key: string; title: string; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
     const route = config.routes.get(job.label);
@@ -167,12 +169,16 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created,
       resumes: job.status === 'running' && job.resumes ? job.resumes : undefined, escalated_after: job.escalated_after
     };
-    const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [] };
+    const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [], last: 0 };
     entry.runs.push(run);
+    entry.last = Math.max(entry.last, job.finished || job.started || job.created);
     byIssue.set(base, entry);
   }
   // An issue is closed when every job of it is marked (see JobStore.markClosed): a new run on a reopened issue shows it as open again.
   const closed = new Set([...byIssue.keys()].filter((key) => jobs.list().filter((job) => job.key.startsWith(key + ':')).every((job) => job.archived_view)));
+  // A closed ticket whose last activity is older than STATUS_HIDE_DAYS is left out of the list (its counters stay in the summary); 0 hides nothing.
+  const hideBefore = config.statusHideDays > 0 && !options.all ? now - config.statusHideDays * DAY_MS : null;
+  let hidden = 0;
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
@@ -180,9 +186,14 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     return {
       issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
-      runs: entry.runs.map(({ created: _created, ...run }) => run)
+      runs: entry.runs.map(({ created: _created, ...run }) => run),
+      last: entry.last
     };
-  });
+  }).filter((issue) => {
+    if (!(hideBefore !== null && issue.closed && issue.last < hideBefore)) return true;
+    hidden += 1;
+    return false;
+  }).map(({ last: _last, ...issue }) => issue);
   issues.sort((a, b) => (b.runs[0]?.started || '').localeCompare(a.runs[0]?.started || ''));
   const running = jobs.list('running').length;
   // A dry run starts nothing: its would-be jobs say nothing about merges or cost.
@@ -200,6 +211,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier] }])) }])),
     issues,
+    hidden,
     waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
     workspace
   };
@@ -250,6 +262,7 @@ export function renderStatus(status: Status): string {
   const closedIssues = status.issues.filter((issue) => issue.closed);
   const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';
   const rows = status.issues.filter((issue) => !issue.closed).map(line).join('\n');
+  const hiddenNote = status.hidden ? '<p><a href="?all=1">' + status.hidden + ' older closed ticket(s) hidden: show all</a></p>' : '';
   const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + ' #' + entry.pr
     + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
@@ -257,5 +270,5 @@ export function renderStatus(status: Status): string {
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
     + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + renderWorkspace(status) + waiting
     + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
-    + head + rows + '</table>' + closedSection;
+    + head + rows + '</table>' + closedSection + hiddenNote;
 }

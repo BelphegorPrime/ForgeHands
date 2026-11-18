@@ -6,9 +6,10 @@ import { Merger } from './merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
+import { LedgerSync } from './ledger-sync.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
-import { collectDigest, digestDue } from '../notify/digest.ts';
-import { digestMessage, immediateMessage } from '../notify/texts.ts';
+import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
+import { digestIsEmpty, digestMessage, immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
@@ -64,6 +65,8 @@ export class Dispatcher {
   notifier: Notifier;
   /** The workspace cleanup and the disk guard (WORKSPACE_CLEANUP_DIR); off unless that is set. */
   workspace: Workspace;
+  /** Closes the tickets the forge has closed (LEDGER_SYNC_HOURS); off unless that is set. */
+  ledgerSync: LedgerSync;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   lastArchive = 0;
@@ -92,6 +95,7 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now);
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -761,7 +765,10 @@ export class Dispatcher {
     const { due, date } = digestDue(digest, timezone, now, dry ? this.digestDone : this.jobs.meta.digest_sent);
     if (!due) return false;
     try {
-      const message = digestMessage(language, collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now), this.config.allowedRepos.size > 1);
+      const data = collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now);
+      // The follow-up figure is read from the forge only when a digest goes out: it is shown in a digest and never sends one by itself.
+      if (!digestIsEmpty(data)) data.fixes = await collectFixes(this.config, this.jobs, this.forge, now, this.logger);
+      const message = digestMessage(language, data, this.config.allowedRepos.size > 1);
       if (message) this.notifier.notify(message);
     } catch (error) {
       this.logger.error('could not build the digest:', error.message);
@@ -914,9 +921,10 @@ export class Dispatcher {
     this.timer = setInterval(() => this.tick().catch((error) => this.logger.error('dispatch failed:', error.message)), intervalMs);
     this.timer.unref?.();
     this.workspace.start();
+    this.ledgerSync.start();
     return this.tick();
   }
-  stop(): void { clearInterval(this.timer); this.workspace.stop(); }
+  stop(): void { clearInterval(this.timer); this.workspace.stop(); this.ledgerSync.stop(); }
 
   // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
   // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.

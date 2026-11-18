@@ -72,7 +72,8 @@ export function createApp(
     throw new Error("direct mode needs a dispatcher");
   // Only the webhook half of the forge is used here: the signature check and the event normalization.
   const forge = createForge(config, createTransport(config, send));
-  const status = () =>
+  // all: closed tickets older than STATUS_HIDE_DAYS are listed too (the query ?all=1 of the status page and /status.json).
+  const status = (all = false) =>
     buildStatus(
       config as DirectConfig,
       dispatcher!.jobs,
@@ -80,6 +81,7 @@ export function createApp(
       dispatcher!.dry,
       [...dispatcher!.reminder.waiting.values()],
       dispatcher!.workspace.state(),
+      { all },
     );
   const authenticateStatus = (
     req: IncomingMessage,
@@ -154,10 +156,12 @@ export function createApp(
       }
     }
     // Read only views of the work in flight (direct mode): /status for people, /status.json for tools, /metrics for Prometheus.
+    const statusPath = req.url?.split("?")[0];
+    const showAll = /(?:^|&)all=1(?:&|$)/.test(req.url?.split("?")[1] || "");
     if (
       req.method === "GET" &&
-      (req.url === "/status" ||
-        req.url === "/status.json" ||
+      (statusPath === "/status" ||
+        statusPath === "/status.json" ||
         req.url === "/metrics") &&
       dispatcher
     ) {
@@ -180,8 +184,8 @@ export function createApp(
           ),
         );
       }
-      const snapshot = status();
-      if (req.url === "/status.json") return json(res, 200, snapshot);
+      const snapshot = status(showAll);
+      if (statusPath === "/status.json") return json(res, 200, snapshot);
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",

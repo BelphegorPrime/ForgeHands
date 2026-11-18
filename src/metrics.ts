@@ -28,6 +28,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
   forgehands_resumes_total: 'Runs that ended stuck or timed out and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS).',
+  forgehands_ledger_sync_closed_total: 'Tickets the ledger sync (LEDGER_SYNC_HOURS) found closed or merged in the forge and marked closed on the status page.',
   forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
 const GAUGES: Record<string, string> = {
