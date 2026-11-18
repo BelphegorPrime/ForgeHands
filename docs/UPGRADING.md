@@ -122,6 +122,16 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
 - **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
 
+# Upgrading to the next version: a merged revert reopens and restarts its ticket
+
+**New, on by default (`REVERT_RETRIES`, default `1`).** Until now a revert of a merge that turned the default branch red was started, but after it was merged nothing followed: the ticket stayed closed. Now, when the revert pull request is merged, ForgeHands reopens the ticket, comments once with the cause, and starts the worker again, once (see README, "After the revert").
+
+- **What you see.** The ticket reopens and the worker runs again. The comment quotes the revert's own account of the failed step; the revert run now also writes that account into its pull request body. The counter `forgehands_revert_retries_total` counts the restarts. At the limit the ticket gets `ai:blocked` and the human is called.
+- **Reopened tickets block their dependents.** A ticket that depends on the reopened one waits again. That is the intended order.
+- **Needs push events.** The revert's merge is seen on the push to the default branch, so `UPDATE_BRANCHES` must not be `0`.
+- **Caveat.** A revert that was merged before this version is not picked up: its record does not exist. Reopen such a ticket by hand, or leave it.
+- **Rollback.** Set `REVERT_RETRIES=0`. The ledger gains `reverts`; the previous version ignores it.
+
 # Upgrading to the next version: the review sweep starts the missing reviews
 
 **New, on by default.** A pull request whose head never got a review (a lost or deferred event, or a round that ended without a new commit) used to wait for ever. Now every `REVIEW_SWEEP_MINUTES` (default `10`) ForgeHands starts the review of such a head, when its CI is green or absent.
