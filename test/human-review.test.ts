@@ -313,3 +313,24 @@ test('the webhook events of the review routes are the ones named in the README (
   assert.equal(normalizeEvent(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), new Set([repo]), [], {}), null, 'off without the option');
   assert.equal(normalizeEvent(CHANGES_NAME, reviewPayload('pull_request_review_rejected', { id: 'x' }), new Set([repo]), [], options).review.id, undefined);
 });
+
+test('a human round that gets stuck is tried once more on the escalation profile (stage B), which counts as no round and no second round for his review', async () => {
+  const a = await app({ RESUME_ATTEMPTS: '0' }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
+  try {
+    assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 's-1'), 'queued');
+    await a.dispatcher.tick();
+    states[a.jobs.list()[0].conversation_id] = 'stuck';
+    await a.dispatcher.tick();
+    const stageB = a.jobs.list().filter((job) => job.failure_escalation);
+    assert.equal(stageB.length, 1, 'one extra try for the stuck round');
+    assert.equal(stageB[0].key, 'owner/hello#26:ai:changes:cafe0000');
+    assert.equal(stageB[0].event.review.human, true, 'it carries the review of the operator');
+    assert.equal(a.dispatcher.countsAsRound(stageB[0]), false, 'stage B does not count as a round');
+    assert.equal(a.dispatcher.rounds(a.jobs.list()[0].event), 1, 'only the human round counts');
+    await a.dispatcher.tick();
+    assert.equal(openhands.at(-1).agent_profile_id, ESCALATE, 'the extra try runs on the escalation profile');
+    // the same review again starts nothing, neither a round nor another extra try
+    assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 's-2'), 'duplicate_review');
+    assert.equal(a.jobs.list().length, 2);
+  } finally { await a.close(); }
+});
