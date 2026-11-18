@@ -4,6 +4,7 @@ import type { DirectConfig, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { DigestData, DigestItem, FixPair, FixQuote } from './texts.ts';
 import { cleanTitle } from './texts.ts';
+import { pullBranch } from '../agent/bot.ts';
 import type { Forge, PullRequest } from '../types/forge.ts';
 
 const DAY_MS = 86400000;
@@ -134,7 +135,7 @@ export async function collectFixes(config: DirectConfig, jobs: JobStore, forge: 
         const at = Date.parse(String(pr.merged_at ?? ''));
         if (!pr.merged || !Number.isFinite(at) || at < since || at > now) continue;
         merged.push({ repository: name, number: pr.number, title: String(pr.title ?? ''), url: pr.html_url || pullLink(config, name, pr.number), at,
-          key: name.toLowerCase() + '#' + pr.number, branch: String(pr.head?.ref ?? ''), author: String(pr.user?.login ?? pr.user?.username ?? '').toLowerCase() });
+          key: name.toLowerCase() + '#' + pr.number, branch: pullBranch(pr), author: String(pr.user?.login ?? pr.user?.username ?? '').toLowerCase() });
       }
       if (list.length < LIST_PAGE || Date.parse(list.at(-1)!.updated_at) < since) break;
     }

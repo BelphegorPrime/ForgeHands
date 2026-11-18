@@ -1,6 +1,6 @@
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
-import { isBotPull } from './bot.ts';
+import { isBotPull, pullBranch } from './bot.ts';
 import { DryLog } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
@@ -106,7 +106,7 @@ export class Reminder {
         if (files.some((name) => policy.deny.some((pattern) => pattern.test(name)))) return 'it is approved and green, but touches protected paths, so it is left to you to merge';
       }
     }
-    const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
+    const issue = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))![1]);
     const base = repository.toLowerCase() + '#' + issue + ':';
     if (this.jobs.list(true).some((job) => job.key.startsWith(base) && (job.status === 'queued' || job.status === 'running' || job.status === 'waiting'))) return null;
     const touched = Date.parse(pr.updated_at);
@@ -120,7 +120,7 @@ export class Reminder {
     let written = 0;
     let looked = 0;
     for (const pr of Array.isArray(pulls) ? pulls : []) {
-      const match = /^ai\/issue-(\d+)$/.exec(pr?.head?.ref || '');
+      const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
       // A dependency bot's pull request (BOT_AUTHORS) has no ticket: it is reminded only when it is marked blocked.
       const bot = !match && isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if ((!match && !bot) || pr.state !== 'open' || pr.merged) continue;

@@ -1,4 +1,4 @@
-import { isBotPull, REVERT_BRANCH, type BotRules } from '../agent/bot.ts';
+import { isBotPull, pullBranch, REVERT_BRANCH, type BotRules } from '../agent/bot.ts';
 import type { BranchPushEvent, ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {
@@ -102,7 +102,7 @@ function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>
   const fullName = payload.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
-  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
   const bot = !match && !!bots && isBotPull(bots, pr, fullName);
   const issueNumber = bot ? pr.number : match ? Number(match[1]) : 0;
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
@@ -133,7 +133,7 @@ function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>
       comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
       labels: present
     },
-    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
     review: { reviewer, ...(human !== undefined ? { human: true, ...(reviewId ? { id: reviewId } : {}), commit: String(pr.head.sha || '') } : {}) },
     sender: { login: reviewer }
   };
@@ -149,7 +149,7 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
   const fullName = payload.repository?.full_name;
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
-  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
   // A dependency bot's pull request has no ticket: it stands for itself. It takes part in rounds only when BOT_FIX_ROUNDS allows them.
   const bot = !match && !!bots && isBotPull(bots, pr, fullName);
   const issueNumber = bot ? pr.number : match ? Number(match[1]) : 0;
@@ -190,7 +190,7 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
       comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
       labels: present
     },
-    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
     sender: { login: payload.sender?.login || null }
   };
 }
@@ -211,7 +211,7 @@ function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>,
   try { data = JSON.parse(run.event_payload); } catch { return null; }
   const pr = data?.pull_request;
   if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged) return null;
-  const match = /^ai\/issue-(\d+)$/.exec(String(pr.head?.ref || ''));
+  const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
   const bot = !match && !!bots && isBotPull(bots, pr, fullName);
   // A red commit of a bot's pull request is only worth a fix round when BOT_FIX_ROUNDS asks for it.
   if (bot && event === 'action_run_failure' && !bots!.fixRounds) return null;
@@ -237,7 +237,7 @@ function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>,
       comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0,
       labels: []
     },
-    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
     ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
     sender: { login: run.trigger_user?.login || null }
   };
@@ -376,13 +376,13 @@ function normalizeBranchPull(payload: Json, allowedRepos: Set<string>, bots?: No
   const pr = payload?.pull_request;
   const fullName = payload?.repository?.full_name;
   if (!pr || typeof pr !== 'object' || typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
-  if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged || !reviewableBranch(pr.head?.ref, bots)) return null;
+  if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || pr.state !== 'open' || pr.merged || !reviewableBranch(pullBranch(pr), bots)) return null;
   if (typeof pr.head?.sha !== 'string' || !SHA.test(pr.head.sha)) return null;
   return {
     type: 'push.branch',
     source: 'forgejo',
     repository: { full_name: fullName, clone_url: payload.repository.clone_url || null, html_url: payload.repository.html_url || null, default_branch: payload.repository.default_branch || null },
-    branch: pr.head.ref,
+    branch: pullBranch(pr),
     after: pr.head.sha,
     pull_request: pr.number,
     sender: { login: payload.sender?.login || null }

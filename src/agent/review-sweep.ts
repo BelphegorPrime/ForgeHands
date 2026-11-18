@@ -1,4 +1,4 @@
-import { isBotPull, REVERT_BRANCH } from './bot.ts';
+import { isBotPull, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { isDry } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import type { Merger } from './merge.ts';
@@ -129,7 +129,7 @@ export class ReviewSweep {
   candidate(repository: string, pr: Json): { issue: number; bot: boolean } | null {
     if (!pr || pr.state !== 'open' || pr.merged || pr.draft === true || typeof pr.head?.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(pr.head.sha)) return null;
     if (!Number.isSafeInteger(pr.number) || pr.number <= 0) return null;
-    const ref = String(pr.head?.ref || '');
+    const ref = pullBranch(pr);
     if (typeof pr.head?.repo?.full_name === 'string' && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return null;
     const labels = (Array.isArray(pr.labels) ? pr.labels : []).map((label: Json) => label?.name);
     if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel, this.config.holdLabel].some((name) => labels.includes(name))) return null;
@@ -165,7 +165,7 @@ export class ReviewSweep {
       repository: { full_name: repository, clone_url: base.clone_url || null, html_url: base.html_url || null, default_branch: base.default_branch || null },
       issue: { number: candidate.issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null,
         comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0, labels: [] },
-      pull_request: { number: pr.number, head_ref: String(pr.head?.ref || ''), html_url: pr.html_url || null },
+      pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
       ci: { run_id: null, workflow: '', commit_sha: sha, status: state === 'no_ci' ? 'no_ci' : 'success', html_url: null },
       sender: { login: pr.user?.login || null }
     };

@@ -1,4 +1,5 @@
 import type { ForgeEvent, Json, NormalizedEvent } from '../../types.ts';
+import { pullBranch } from '../../agent/bot.ts';
 import { normalizeEvent, type NormalizeOptions } from '../../webhook/events.ts';
 
 // Gitea's webhooks, as ForgeHands reads them. The headers differ (X-Gitea-Event, X-Gitea-Signature), but the payloads of issues, pull
@@ -32,11 +33,11 @@ function normalizeWorkflowRun(payload: Json, allowedRepos: Set<string>, ci: { fa
   if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase())) return null;
   if (typeof run.head_sha !== 'string' || !/^[0-9a-f]{7,64}$/i.test(run.head_sha)) return null;
   const pulls: Json[] = Array.isArray(run.pull_requests) ? run.pull_requests : [];
-  const pr = pulls.find((entry) => /^ai\/issue-\d+$/.test(String(entry?.head?.ref || ''))
+  const pr = pulls.find((entry) => /^ai\/issue-\d+$/.test(pullBranch(entry))
     && Number.isSafeInteger(entry.number) && entry.number > 0
     && (entry.head?.repo?.id === undefined || repository.id === undefined || entry.head.repo.id === repository.id));
   if (!pr) return null;
-  const issueNumber = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
+  const issueNumber = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))![1]);
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
   const html = typeof repository.html_url === 'string' ? repository.html_url.replace(/\/$/, '') + '/pulls/' + pr.number : null;
   return {
@@ -51,7 +52,7 @@ function normalizeWorkflowRun(payload: Json, allowedRepos: Set<string>, ci: { fa
       default_branch: repository.default_branch || null
     },
     issue: { number: issueNumber, title: '', body: '', html_url: html, comments: 0, labels: [] },
-    pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: html },
+    pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: html },
     ci: {
       run_id: run.id ?? null,
       // `path` is "<workflow file>@<ref>".

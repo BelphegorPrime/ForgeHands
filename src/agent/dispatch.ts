@@ -4,7 +4,7 @@ import { parseDeclaredFiles } from './files.ts';
 import { anyOverlap } from '../utils/path-overlap.ts';
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
-import { REVERT_BRANCH } from './bot.ts';
+import { isPullRef, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { redact } from '../utils/redact.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
@@ -280,15 +280,15 @@ export class Dispatcher {
     let pr: Json;
     try {
       if (event.pull_request) pr = await this.forge.getPull(repository, event.pull_request);
-      else pr = (await this.forge.listPulls(repository, { state: 'open', limit: 50 })).find((entry: Json) => entry?.head?.ref === event.branch && entry.state === 'open');
+      else pr = (await this.forge.listPulls(repository, { state: 'open', limit: 50 })).find((entry: Json) => pullBranch(entry) === event.branch && entry.state === 'open');
     } catch (error) {
       this.logger.error('could not look for the pull request of ' + repository + ' ' + event.branch + ':', error.message);
       return 'pull_unreadable';
     }
-    if (!pr || pr.state !== 'open' || pr.merged || pr.head?.ref !== event.branch) return 'no_open_pull';
+    if (!pr || pr.state !== 'open' || pr.merged || pullBranch(pr) !== event.branch) return 'no_open_pull';
     if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return 'not_an_agent_branch';
     const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
-    const match = /^ai\/issue-(\d+)$/.exec(pr.head.ref);
+    const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
     if (!bot && !match) return 'not_an_agent_branch';
     // As for a CI outcome: an agent's commit counts only from a sender who may trigger runs; a bot is let in by BOT_AUTHORS.
     if (!bot && this.config.allowedSenders && !this.config.allowedSenders.has(String(event.sender.login || '').toLowerCase())) return 'sender_not_allowed';
@@ -308,7 +308,7 @@ export class Dispatcher {
       html_url: pr.html_url || null, comments: Number.isSafeInteger(pr.comments) && pr.comments > 0 ? pr.comments : 0, labels: [] as string[] };
     const ci: ForgeEvent = {
       type: 'ci.success', source: this.forge.kind, action: 'no_ci', ...(bot ? { bot: true } : {}), label,
-      repository: event.repository, issue, pull_request: { number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+      repository: event.repository, issue, pull_request: { number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
       ci: { run_id: null, workflow: '', commit_sha: sha, status: 'no_ci', html_url: null }, sender: event.sender
     };
     const result = await this.enqueue(ci);
@@ -761,12 +761,12 @@ export class Dispatcher {
     try {
       const pulls = await this.forge.listPulls(repository, { state: 'closed', sort: 'recentupdate', limit: 20 });
       for (const pr of Array.isArray(pulls) ? pulls : []) {
-        const reverted = /^ai\/revert-(\d+)$/.exec(String(pr?.head?.ref || ''));
+        const reverted = /^ai\/revert-(\d+)$/.exec(pullBranch(pr));
         if (reverted && pr.merged && (!event.repository.default_branch || !pr.base?.ref || pr.base.ref === event.repository.default_branch)) {
           closed += (await this.revertMerged(repository, pr, Number(reverted[1]))) ? 1 : 0;
           continue;
         }
-        const match = /^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''));
+        const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
         if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
         // A merged pull request whose change was reverted: its ticket is reopened by the revert, not closed again here.
         if (this.revertOf(repository, Number(pr.number))) continue;
@@ -802,12 +802,32 @@ export class Dispatcher {
     return this.jobs.reverts.find((entry) => entry.repository === repository.toLowerCase() && entry.number === number);
   }
 
+  // The record of the revert of pull request n is missing (the revert ran, but its record was never kept, or the ledger predates it), while the
+  // ledger knows the merge of n: when that merge was of an agent's branch (ai/issue-<m>) the record is made now, as onMainFailure would have made it.
+  // The branch is read from the pull request when the ledger holds a pull request ref (refs/pull/<n>/head). A bot's or a ticketless merge: none.
+  async recoverRevert(repository: string, number: number): Promise<RevertRecord | undefined> {
+    if (!this.config.revertRetries) return undefined;
+    const name = repository.toLowerCase();
+    const merge = this.jobs.merges.find((entry) => entry.repository === name && entry.number === number);
+    if (!merge) return undefined;
+    let branch = String(merge.branch || '');
+    if (isPullRef(branch)) {
+      try { branch = pullBranch(await this.forge.getPull(repository, number)); } catch (error) { this.logger.error('could not read #' + number + ' to name its branch:', error.message); }
+    }
+    const ticket = /^ai\/issue-(\d+)$/.exec(branch);
+    if (!ticket) return undefined;
+    const record: RevertRecord = { repository: name, number, issue: Number(ticket[1]), sha: String(merge.sha || ''), state: 'started', at: this.now() };
+    this.jobs.reverts.push(record);
+    this.logger.error(name + '#' + number + ': the record of its revert was missing, made again from the ledger (ticket #' + record.issue + ')');
+    return record;
+  }
+
   // The revert of an agent's merge is merged (by ForgeHands or by a human; seen on the push to the default branch that merged it). Once per revert:
   // the ticket is reopened (its work was undone), one comment says what broke and quotes the revert's own account (redacted), and the worker route
   // starts again, as a newly added label does, while REVERT_RETRIES allows it. Then the ticket gets BLOCKED_LABEL and the human is called. Each step
   // is recorded, so a step that failed is tried again on the next push, and the steps done are not repeated. Returns whether it closed something.
   async revertMerged(repository: string, revert: Json, number: number): Promise<boolean> {
-    const record = this.revertOf(repository, number);
+    const record = this.revertOf(repository, number) ?? await this.recoverRevert(repository, number);
     if (!record || record.state === 'handled' || !this.config.forgejo) return false;
     const name = repository.toLowerCase();
     const ticket = record.issue;
@@ -932,10 +952,14 @@ export class Dispatcher {
     const short = sha.slice(0, 8);
     const branch = event.repository.default_branch || 'the default branch';
     let title = '';
-    try { title = String((await this.forge.getPull(repository, number))?.title || ''); } catch (error) { this.logger.error('could not read #' + number + ':', error.message); }
+    let pull: Json | undefined;
+    try { pull = await this.forge.getPull(repository, number); title = String(pull?.title || ''); } catch (error) { this.logger.error('could not read #' + number + ':', error.message); }
+    // The branch of the merged pull request: the ledger's name, unless it holds a pull request ref (refs/pull/<n>/head, as Forgejo reports a merged
+    // pull request whose branch is deleted); then the pull request itself names the branch.
+    const head = isPullRef(merge.branch) ? pullBranch(pull) || merge.branch : merge.branch;
     // The pull request as the notice names it: the merged one, or the revert that went red (whose merge was a revert).
-    const told = { ...event, issue: { ...event.issue, number, title: title.slice(0, 1000), html_url: null }, pull_request: { number, head_ref: merge.branch, html_url: null } };
-    if (REVERT_BRANCH.test(merge.branch)) {
+    const told = { ...event, issue: { ...event.issue, number, title: title.slice(0, 1000), html_url: null }, pull_request: { number, head_ref: head, html_url: null } };
+    if (REVERT_BRANCH.test(head)) {
       this.tell('failed', told, { why: 'revert_red' });
       return { status: 'revert_red_told' };
     }
@@ -949,7 +973,7 @@ export class Dispatcher {
     }
     if (!route) return { status: 'handed_to_human' };
     // REVERT_RETRIES: the revert of an agent's merge is recorded, so that its merged revert can reopen and restart the ticket (see revertMerged).
-    const ticket = /^ai\/issue-(\d+)$/.exec(merge.branch);
+    const ticket = /^ai\/issue-(\d+)$/.exec(head);
     const record = this.config.revertRetries && ticket ? { repository: repository.toLowerCase(), number, issue: Number(ticket[1]), sha, state: 'started' as const, at: this.now() } : null;
     if (record) this.jobs.reverts.push(record);
     const job = this.jobs.add({ key: repository.toLowerCase() + '!pr' + number + ':' + route + ':' + short, label: route, status: 'queued', created: this.now(),
@@ -1195,7 +1219,7 @@ export class Dispatcher {
       if (!issue || issue.state !== 'open') return;
       const branch = 'ai/issue-' + event.issue.number;
       const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
-      if (pulls.some((pr) => pr.head?.ref === branch && Date.parse(pr.updated_at) >= since)) return;
+      if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
       const comments = await this.forge.listComments(repository, event.issue.number, 50);
       if (comments.some((comment) => Date.parse(comment.created_at) >= since)) return;
       const parent = await this.parentDelivery(event, since);
@@ -1426,7 +1450,7 @@ export class Dispatcher {
   async refreshPull(event: PushEvent, pr: Json, tip: string): Promise<{ changed: boolean; deferred: boolean }> {
     const none = { changed: false, deferred: false };
     const base = event.repository.full_name.toLowerCase() + '#';
-    const match = /^ai\/issue-(\d+)$/.exec(pr.head?.ref || '');
+    const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
     if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) return none;
     if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) return none;
     const issue = Number(match[1]);
@@ -1434,7 +1458,7 @@ export class Dispatcher {
     const labels = (pr.labels || []).map((label: Json) => label.name);
     if (labels.includes(this.config.blockedLabel)) return none;
     const approved = labels.includes(this.config.approvedLabel);
-    const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
       issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
     let reviewed = approved;
     if (!reviewed) { try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; } }
@@ -1548,7 +1572,7 @@ export class Dispatcher {
     try {
       const pulls = await this.forge.listPulls(repository, { state: 'open', limit: FILE_PULLS_LOOKED_AT });
       for (const pr of (Array.isArray(pulls) ? pulls : []).slice(0, FILE_PULLS_LOOKED_AT)) {
-        const other = Number(/^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''))?.[1]);
+        const other = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))?.[1]);
         if (!other || other >= number || blockers.has(other)) continue;
         const files = await this.forge.pullFiles(repository, pr.number, 100);
         const names = (Array.isArray(files) ? files : []).flatMap((file) => [file.filename, file.previous_filename].filter((name): name is string => !!name));
@@ -1693,7 +1717,7 @@ export class Dispatcher {
     const number = event.issue.number;
     try {
       const pulls = await this.forge.listPulls(repository, { state: 'open', limit: 50 });
-      const pr = (Array.isArray(pulls) ? pulls : []).find((entry) => entry?.head?.ref === 'ai/issue-' + number && entry.state === 'open');
+      const pr = (Array.isArray(pulls) ? pulls : []).find((entry) => pullBranch(entry) === 'ai/issue-' + number && entry.state === 'open');
       if (!pr) return;
       if (isDry(this.config, repository)) {
         this.logger.error('DRY RUN: pull request #' + pr.number + ' of #' + number + ' would be closed, the ticket went to ' + label);

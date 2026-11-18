@@ -6,6 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/agent/dispatch.ts';
+import { isBotPull, pullBranch, isPullRef, REVERT_BRANCH } from '../src/agent/bot.ts';
 import { buildPrompt } from '../src/agent/prompt.ts';
 import { loadConfig } from '../src/config.ts';
 import { JobStore } from '../src/store/jobs.ts';
@@ -272,4 +273,133 @@ test('a token in the revert pull request body never reaches the comment', async 
   const cause = comments().find((text) => /turned the CI of main red/.test(text));
   assert.doesNotMatch(cause, /tok-secret-value/);
   assert.match(cause, /token=\[redacted\]/);
+});
+
+// Forgejo's shape of a merged pull request whose head branch was deleted: head.ref is refs/pull/<n>/head, head.label still names the branch.
+function forgejoShape(number, label, { sha = SHA, title = 'Add the feature', body = '' } = {}) {
+  return { number, state: 'closed', merged: true, merged_at: new Date(clock).toISOString(), title, body,
+    head: { ref: 'refs/pull/' + number + '/head', label, sha }, base: { ref: 'main', repo: { default_branch: 'main' } } };
+}
+// Pull request 27 (ticket 26) and its revert 40 as Forgejo lists them after the merges: both branches are gone, both are listed as closed.
+function mergedAsForgejo(revertNumber, original, { body = 'Step: lint. error TS2322: Type string is not assignable to number.' } = {}) {
+  const revert = forgejoShape(revertNumber, 'ai/revert-' + original, { title: 'WIP: Revert: Add the feature', body, sha: 'beef' + '0'.repeat(36) });
+  world.pulls[revertNumber] = revert;
+  world.pulls[original] = forgejoShape(original, 'ai/issue-26');
+  world.closed = [revert, world.pulls[original]];
+  return revert;
+}
+
+test('the helper names the branch of a Forgejo pull request: head.ref when it is a branch, else head.label without the owner of a fork', () => {
+  assert.equal(pullBranch({ head: { ref: 'ai/issue-26', label: 'ai/issue-26' } }), 'ai/issue-26');
+  assert.equal(pullBranch({ head: { ref: 'refs/pull/27/head', label: 'ai/issue-26' } }), 'ai/issue-26');
+  assert.equal(pullBranch({ head: { ref: 'refs/pull/30/head', label: 'ai/revert-29' } }), 'ai/revert-29');
+  assert.equal(pullBranch({ head: { ref: 'refs/pull/27/head', label: 'forker:ai/issue-26' } }), 'ai/issue-26');
+  assert.equal(pullBranch({ head: { ref: 'refs/pull/27/head', label: '' } }), '');
+  assert.equal(pullBranch({}), '');
+  assert.equal(pullBranch(null), '');
+  assert.ok(isPullRef('refs/pull/27/head'));
+  assert.ok(!isPullRef('ai/issue-26'));
+  assert.ok(REVERT_BRANCH.test(pullBranch({ head: { ref: 'refs/pull/30/head', label: 'ai/revert-29' } })));
+});
+
+test('a revert of a bot or ticketless pull request is recognised by its label too: the bot path, a fork is not', () => {
+  const rules = { authors: new Set(), prefixes: [] };
+  const revert = { head: { ref: 'refs/pull/30/head', label: 'ai/revert-29', repo: { full_name: repo } }, user: { login: 'forgehands' } };
+  assert.equal(isBotPull(rules, revert, repo), true);
+  const fork = { head: { ref: 'refs/pull/30/head', label: 'forker:ai/revert-29', repo: { full_name: 'forker/hello' } }, user: { login: 'forker' } };
+  assert.equal(isBotPull(rules, fork, repo), false);
+  const agent = { head: { ref: 'refs/pull/27/head', label: 'ai/issue-26', repo: { full_name: repo } }, user: { login: 'forgehands' } };
+  assert.equal(isBotPull(rules, agent, repo), false, 'an agent branch is never a bot pull request');
+});
+
+test('a merged revert whose pull request reports refs/pull/<n>/head is found by its label: reopened, commented once, started again once', async () => {
+  const t = await build();
+  seed(t);
+  await t.dispatcher.enqueue(red());
+  assert.equal(t.jobs.reverts.length, 1);
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(world.issue.state, 'open', 'the ticket is reopened');
+  assert.equal(reopens().length, 1);
+  const cause = comments().filter((text) => /turned the CI of main red/.test(text));
+  assert.equal(cause.length, 1);
+  assert.match(cause[0], /the merge of #27 turned the CI of main red \(commit abcdef01\); it was reverted by #40\./);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+  assert.equal(t.jobs.reverts[0].restarted, true);
+  assert.equal(t.jobs.reverts[0].state, 'handled');
+  // the next push, while the forge still lists the same pull requests: nothing more
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(reopens().length, 1);
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+});
+
+test('onMainFailure names the branch from the pull request when the ledger holds a pull request ref: the record is made, the revert is found', async () => {
+  const t = await build();
+  seed(t);
+  t.jobs.merges[0].branch = 'refs/pull/27/head';
+  world.pulls[27] = forgejoShape(27, 'ai/issue-26');
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'queued');
+  assert.equal(t.jobs.reverts.length, 1);
+  assert.equal(t.jobs.reverts[0].issue, 26);
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(reopens().length, 1);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+});
+
+test('a red revert whose ledger holds a pull request ref is told as a revert, not as an agent merge', async () => {
+  const t = await build();
+  t.jobs.merges.push({ repository: repo, number: 40, branch: 'refs/pull/40/head', sha: SHA, merged_at: clock - MINUTE, two_keys: false });
+  world.pulls[40] = forgejoShape(40, 'ai/revert-27', { title: 'WIP: Revert: Add the feature' });
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'revert_red_told');
+  assert.equal(t.jobs.reverts.length, 0, 'no record for a revert of a revert');
+  await t.dispatcher.tick();
+  assert.equal(starts().length, 0);
+});
+
+test('a missing record of a merged revert is made again from the ledger: the ticket of its merge is reopened and started once', async () => {
+  const t = await build();
+  seed(t); // the merge of #27 is in the ledger; no red run was recorded, so there is no record
+  assert.equal(t.jobs.reverts.length, 0);
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(t.jobs.reverts.length, 1, 'the record is made now');
+  assert.equal(t.jobs.reverts[0].issue, 26);
+  assert.equal(t.jobs.reverts[0].sha, SHA);
+  assert.ok(logs.some((line) => /the record of its revert was missing, made again from the ledger \(ticket #26\)/.test(line)));
+  assert.equal(reopens().length, 1);
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+  assert.equal(t.jobs.reverts[0].state, 'handled');
+});
+
+test('a missing record is made again even when the ledger kept the merge as a pull request ref: the branch comes from the pull request', async () => {
+  const t = await build();
+  seed(t);
+  t.jobs.merges[0].branch = 'refs/pull/27/head';
+  world.pulls[27] = forgejoShape(27, 'ai/issue-26');
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(t.jobs.reverts.length, 1);
+  assert.equal(t.jobs.reverts[0].issue, 26);
+  assert.equal(reopens().length, 1);
+});
+
+test('no record is made for a merged revert whose ledger merge is not an agent branch', async () => {
+  const t = await build();
+  seed(t, { number: 27, branch: 'renovate/dep-1.x' });
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(t.jobs.reverts.length, 0);
+  assert.equal(reopens().length, 0);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 0);
+});
+
+test('a revert with no merge in the ledger at all is not recorded either', async () => {
+  const t = await build();
+  mergedAsForgejo(40, 27);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(t.jobs.reverts.length, 0);
+  assert.equal(reopens().length, 0);
 });
