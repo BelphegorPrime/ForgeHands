@@ -111,3 +111,12 @@ FAILURE_ESCALATE=0
 ```
 
 **Rollback.** Go back to 0.5.1. A job whose conversation was continued when it went back is polled as before: its conversation state decides, and a stuck conversation goes to the human as 0.5.1 did. The unanswered run call of such a job (`resume_pending`) is not repeated by 0.5.1.
+## Also in 0.6.0: a request for changes of the operator starts a round
+
+In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for changes of `HUMAN_LOGIN` on a pull request did nothing; the label `ai:changes` had to be set by hand. From 0.6.0 that request starts the changes round itself, as the label does.
+
+- **The switch is `HUMAN_REVIEW_ROUNDS`, default `1`.** `0` restores the old behaviour. It needs `HUMAN_LOGIN`; without it the feature is off and the start logs nothing about it. Any other value than `0` or `1` stops the start with `HUMAN_REVIEW_ROUNDS must be 0 or 1`.
+- **Webhook events.** The review events of the webhook must reach ForgeHands: **Pull request review approved**, **Pull request review rejected** and **Pull request review comment** (`pull_request_review_approved`, `pull_request_review_rejected`, `pull_request_review_comment`). The reference installation's hooks already deliver them: its Forgejo **Pull request** event expands to them, so nothing has to be added there. Without the events nothing changes.
+- **ALLOWED_SENDERS.** The request is checked against `ALLOWED_SENDERS` like any rejection. If that is set, `HUMAN_LOGIN` has to be on it, or his review starts nothing.
+- **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
+- **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
