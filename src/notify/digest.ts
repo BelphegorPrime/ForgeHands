@@ -2,8 +2,9 @@
 // No message when there is nothing (the operator wants no "all fine" mail).
 import type { DirectConfig, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
-import type { DigestData, DigestItem } from './texts.ts';
+import type { DigestData, DigestItem, FixPair, FixQuote } from './texts.ts';
 import { cleanTitle } from './texts.ts';
+import type { Forge, PullRequest } from '../types/forge.ts';
 
 const DAY_MS = 86400000;
 
@@ -75,4 +76,118 @@ export function collectDigest(config: DirectConfig, jobs: JobStore, waiting: Wai
   const merged = new Set(all.filter((job) => job.merged_at && job.merged_at >= now - DAY_MS).map((job) => job.key.split(':')[0])).size;
   waitingItems.sort((a, b) => (b.days ?? 0) - (a.days ?? 0));
   return { waiting: waitingItems, blocked: blockedItems, failed: failedItems, quota, merged };
+}
+
+// ---- Follow-up fixes after automatic merges (the quality figure of the digest) ----
+// Of the pull requests that the agent user merged in the last 7 days, how many were followed within 48 hours by another merged pull request of
+// the same repository whose title is a Conventional Commit `fix` and that touches one of the same files. Who merged is asked of the forge
+// (merged_by of a single pull request), because the ledger misses merges; the list endpoint does not carry it. Only Forgejo and Gitea say it.
+// Approximation: the fix type is read from the title only (no commit reads), and only the newest 250 updated closed pull requests are listed.
+const FIX_WINDOW_DAYS = 7;
+const FIX_AFTER_MS = 48 * 3600000;
+// Forge calls per digest (listing pages, single reads, file reads) taken together.
+export const FIX_READS = 120;
+const LIST_PAGE = 50;
+const LIST_PAGES = 5;
+const FIX_TITLE = /^\s*(?:\[WIP\]|WIP:)?\s*fix(?:\([^)\n]*\))?!?:/i;
+export const isFixTitle = (title: unknown): boolean => FIX_TITLE.test(String(title ?? ''));
+
+interface Merged { repository: string; number: number; title: string; url?: string; at: number; key: string; branch: string; author: string }
+
+export type FixForge = Pick<Forge, 'agentLogin' | 'listPulls' | 'getPull' | 'pullFiles'>;
+
+// The figure of the last 7 days (null when no automatic merge is in it, or the forge cannot say who merged). A read that fails skips its pull
+// request and says so in the log; a pull request whose files cannot be read is left out of the count.
+export async function collectFixes(config: DirectConfig, jobs: JobStore, forge: FixForge, now: number, logger: { error(...args: unknown[]): void } = console, budget = FIX_READS): Promise<FixQuote | null> {
+  let left = budget;
+  const take = (): boolean => { if (left <= 0) return false; left -= 1; return true; };
+  const since = now - FIX_WINDOW_DAYS * DAY_MS;
+  const errText = (error: unknown) => String((error as Error)?.message ?? error).slice(0, 200);
+  const fullNames = new Map<string, string>();
+  for (const job of jobs.list()) {
+    const name = job.event?.repository?.full_name;
+    if (name) fullNames.set(String(name).toLowerCase(), name);
+  }
+  const nameOf = (repository: string) => fullNames.get(repository) || repository;
+
+  let login: string | null = null;
+  try {
+    if (take()) login = (await forge.agentLogin?.()) ?? null;
+  } catch (error) {
+    logger.error('digest: could not read the agent user, the follow-up figure is skipped:', errText(error));
+    return null;
+  }
+  if (!login) return null;
+  const agent = login.toLowerCase();
+
+  // The merged pull requests of the window, per repository, newest updated first (a page of 50 each, up to 5 pages).
+  const merged: Merged[] = [];
+  for (const repository of [...config.allowedRepos].sort()) {
+    const name = nameOf(repository);
+    for (let page = 1; page <= LIST_PAGES; page++) {
+      if (!take()) { logger.error('digest: read budget used up while listing the merged pull requests of ' + name); break; }
+      let list: PullRequest[];
+      try { list = await forge.listPulls(name, { state: 'closed', sort: 'recentupdate', limit: LIST_PAGE, page }); }
+      catch (error) { logger.error('digest: could not list the closed pull requests of ' + name + ':', errText(error)); break; }
+      if (!Array.isArray(list) || !list.length) break;
+      for (const pr of list) {
+        const at = Date.parse(String(pr.merged_at ?? ''));
+        if (!pr.merged || !Number.isFinite(at) || at < since || at > now) continue;
+        merged.push({ repository: name, number: pr.number, title: String(pr.title ?? ''), url: pr.html_url || pullLink(config, name, pr.number), at,
+          key: name.toLowerCase() + '#' + pr.number, branch: String(pr.head?.ref ?? ''), author: String(pr.user?.login ?? pr.user?.username ?? '').toLowerCase() });
+      }
+      if (list.length < LIST_PAGE || Date.parse(list.at(-1)!.updated_at) < since) break;
+    }
+  }
+  merged.sort((a, b) => a.at - b.at);
+
+  // Who merged: only the pull requests that ForgeHands or a dependency bot could have merged are asked (their branch or author says so).
+  const automatic = merged.filter((pr) => /^ai\/issue-\d+$/.test(pr.branch) || config.botBranchPrefixes.some((prefix) => pr.branch.startsWith(prefix)) || config.botAuthors.has(pr.author));
+  const originals: Merged[] = [];
+  for (const pr of automatic) {
+    if (!take()) { logger.error('digest: read budget used up while asking who merged the pull requests'); break; }
+    try {
+      const single = await forge.getPull(pr.repository, pr.number);
+      if (String(single.merged_by?.login ?? '').toLowerCase() === agent) originals.push(pr);
+    } catch (error) {
+      logger.error('digest: could not read ' + pr.repository + ' #' + pr.number + ', left out of the figure:', errText(error));
+    }
+  }
+
+  // The fix candidates: merged in the window with a fix title. Their files and those of an original are read once each.
+  const fixes = merged.filter((pr) => isFixTitle(pr.title));
+  const files = new Map<string, Set<string> | null>();
+  const filesOf = async (pr: Merged): Promise<Set<string> | null> => {
+    if (files.has(pr.key)) return files.get(pr.key) ?? null;
+    if (!take()) return null;
+    try {
+      const list = await forge.pullFiles(pr.repository, pr.number, 100);
+      const names = new Set<string>();
+      for (const file of Array.isArray(list) ? list : []) { if (file?.filename) names.add(file.filename); if (file?.previous_filename) names.add(file.previous_filename); }
+      files.set(pr.key, names);
+      return names;
+    } catch (error) {
+      logger.error('digest: could not read the files of ' + pr.repository + ' #' + pr.number + ':', errText(error));
+      files.set(pr.key, null);
+      return null;
+    }
+  };
+
+  const pairs: FixPair[] = [];
+  let total = 0;
+  for (const original of originals) {
+    const following = fixes.filter((fix) => fix.repository === original.repository && fix.number !== original.number && fix.at > original.at && fix.at <= original.at + FIX_AFTER_MS);
+    if (!following.length) { total += 1; continue; }
+    const own = await filesOf(original);
+    if (!own) continue;
+    total += 1;
+    for (const fix of following) {
+      const theirs = await filesOf(fix);
+      if (!theirs || ![...theirs].some((name) => own.has(name))) continue;
+      pairs.push({ fix: { repository: fix.repository, number: fix.number, title: fix.title, url: fix.url }, original: { repository: original.repository, number: original.number, title: original.title, url: original.url } });
+      break;
+    }
+  }
+  if (!total) return null;
+  return { fixed: pairs.length, total, pairs };
 }

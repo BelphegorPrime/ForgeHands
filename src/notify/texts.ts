@@ -72,6 +72,8 @@ const T = {
     reminder: (nth: number, of: number) => 'Reminder ' + nth + ' of ' + of + '.',
     age: (days: number) => days <= 0 ? 'waiting since today' : 'waiting ' + days + (days === 1 ? ' day' : ' days'),
     digestSubject: (count: number) => 'ForgeHands: ' + count + (count === 1 ? ' thing needs' : ' things need') + ' you',
+    fixLine: (fixed: number, total: number, pct: number) => 'Follow-up fixes after automatic merges (7 days): ' + fixed + ' of ' + total + ' (' + pct + ' %)',
+    fixPair: 'fixes',
     waiting: 'Waiting for you', blockedList: 'Blocked', quota: 'Held back by a quota', failedList: 'Failed in the last 24 hours',
     back: (time: string) => 'back about ' + time,
     merged: (count: number) => 'Merged in the last 24 hours: ' + count + '.',
@@ -99,6 +101,8 @@ const T = {
     reminder: (nth: number, of: number) => 'Erinnerung ' + nth + ' von ' + of + '.',
     age: (days: number) => days <= 0 ? 'wartet seit heute' : 'wartet seit ' + days + (days === 1 ? ' Tag' : ' Tagen'),
     digestSubject: (count: number) => 'ForgeHands: ' + count + (count === 1 ? ' Sache braucht' : ' Dinge brauchen') + ' dich',
+    fixLine: (fixed: number, total: number, pct: number) => 'Folgefixes nach automatischen Merges (7 Tage): ' + fixed + ' von ' + total + ' (' + pct + ' %)',
+    fixPair: 'behebt',
     waiting: 'Wartet auf dich', blockedList: 'Blockiert', quota: 'Wegen Kontingent zurückgehalten', failedList: 'Gescheitert in den letzten 24 Stunden',
     back: (time: string) => 'zurück gegen ' + time,
     merged: (count: number) => 'Gemergt in den letzten 24 Stunden: ' + count + '.',
@@ -162,6 +166,10 @@ export function diskMessage(language: NotifyLanguage, facts: DiskFacts): Notific
 }
 
 export interface DigestItem { repository: string; number: number; title: string; days?: number; result?: string; /** Where to look: the pull request or, without one, the issue. */ url?: string }
+/** A fix that followed an automatic merge: `fix` is the later pull request, `original` the merged one it fixes. */
+export interface FixPair { fix: DigestItem; original: DigestItem }
+/** The quality figure of the automatic merges of 7 days: `fixed` of `total` were followed by a fix within 48 hours. */
+export interface FixQuote { fixed: number; total: number; pairs: FixPair[] }
 export interface DigestData {
   waiting: DigestItem[];
   blocked: DigestItem[];
@@ -169,6 +177,8 @@ export interface DigestData {
   /** Tiers whose model is out of quota and when they are expected back (formatted by the caller, in the digest's time zone). */
   quota: { tier: string; back: string }[];
   merged: number;
+  /** The follow-up fixes of the automatic merges; null or absent when there are none to count. Shown in a digest, never sent by itself. */
+  fixes?: FixQuote | null;
 }
 
 export const digestIsEmpty = (data: DigestData): boolean => !data.waiting.length && !data.blocked.length && !data.failed.length && !data.quota.length;
@@ -179,6 +189,8 @@ export function digestMessage(language: NotifyLanguage, data: DigestData, showRe
   if (digestIsEmpty(data)) return null;
   const t = T[language];
   const ref = (item: DigestItem) => (showRepository ? shortRepo(item.repository) : '') + '#' + item.number;
+  // A pair names its repository always: it can be another repository than the one of the digest's other items.
+  const fullRef = (item: DigestItem) => item.repository + ' #' + item.number;
   type Entry = { section: string; cells: string[]; ref?: string; url: string | null; line: string };
   const item = (section: string, it: DigestItem, extra: string): Entry => ({ section, ref: ref(it), url: safeUrl(it.url), cells: [cleanTitle(it.title), extra], line: ref(it) + ' ' + cleanTitle(it.title) + (extra ? ' (' + extra + ')' : '') });
   const entries: Entry[] = [
@@ -201,6 +213,16 @@ export function digestMessage(language: NotifyLanguage, data: DigestData, showRe
         inSection.map((entry) => isQuota ? entry.cells.map(esc) : [anchor(entry.url, entry.ref || ''), esc(entry.cells[0]), esc(entry.cells[1])])));
   }
   if (entries.length > shown.length) { out.push('', t.more(entries.length - shown.length)); blocks.push('<p style="margin:0 0 12px;color:#57606a">' + esc(t.more(entries.length - shown.length)) + '</p>'); }
+  // The quality figure: one line, and the pairs as links only for up to 5 of them.
+  const fixes = data.fixes;
+  if (fixes && fixes.total > 0) {
+    const pct = Math.round(fixes.fixed / fixes.total * 100);
+    const label = t.fixLine(fixes.fixed, fixes.total, pct);
+    out.push('', label);
+    const pairs = fixes.fixed <= 5 ? fixes.pairs : [];
+    for (const pair of pairs) { out.push(fullRef(pair.fix) + ' ' + t.fixPair + ' ' + fullRef(pair.original)); if (safeUrl(pair.fix.url)) out.push('  ' + pair.fix.url); }
+    blocks.push('<p style="margin:14px 0 0;font-weight:600">' + esc(label) + '</p>' + pairs.map((pair) => '<p style="margin:4px 0 0">' + anchor(safeUrl(pair.fix.url), fullRef(pair.fix)) + ' ' + esc(t.fixPair) + ' ' + esc(fullRef(pair.original)) + '</p>').join(''));
+  }
   if (data.merged > 0) { out.push('', t.merged(data.merged)); blocks.push('<p style="margin:12px 0 0;color:#57606a">' + esc(t.merged(data.merged)) + '</p>'); }
   const subject = t.digestSubject(entries.length);
   return { kind: 'digest', subject, text: out.join('\n').trim(), html: page('<p style="margin:0;font-size:16px;font-weight:600">' + esc(subject) + '</p>' + blocks.join('')) };

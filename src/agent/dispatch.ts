@@ -8,8 +8,8 @@ import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
-import { collectDigest, digestDue } from '../notify/digest.ts';
-import { digestMessage, immediateMessage } from '../notify/texts.ts';
+import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
+import { digestIsEmpty, digestMessage, immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
@@ -765,7 +765,10 @@ export class Dispatcher {
     const { due, date } = digestDue(digest, timezone, now, dry ? this.digestDone : this.jobs.meta.digest_sent);
     if (!due) return false;
     try {
-      const message = digestMessage(language, collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now), this.config.allowedRepos.size > 1);
+      const data = collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now);
+      // The follow-up figure is read from the forge only when a digest goes out: it is shown in a digest and never sends one by itself.
+      if (!digestIsEmpty(data)) data.fixes = await collectFixes(this.config, this.jobs, this.forge, now, this.logger);
+      const message = digestMessage(language, data, this.config.allowedRepos.size > 1);
       if (message) this.notifier.notify(message);
     } catch (error) {
       this.logger.error('could not build the digest:', error.message);
