@@ -395,6 +395,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
     // A comment of HUMAN_LOGIN on an issue whose last run failed (or waits for him) starts that run again; this many times per issue and label.
     commentRestarts: commentRestartsOf(env.COMMENT_RESTARTS),
+    // PLAN_ANSWER_RESTARTS: 0 to 20, default 5; a comment of HUMAN_LOGIN answers a planner that finished without sub-issues (0 switches it off).
+    planAnswerRestarts: wholeOf(env.PLAN_ANSWER_RESTARTS, 5, 'PLAN_ANSWER_RESTARTS', 20),
     // HUMAN_REVIEW_ROUNDS: a request for changes of HUMAN_LOGIN on an agent pull request starts a round in comment mode too. Off without HUMAN_LOGIN.
     humanReviewRounds: humanReviewRoundsOf(env.HUMAN_REVIEW_ROUNDS) && parseHumanLogin(env.HUMAN_LOGIN) !== null,
     // NUDGE_AT_PERCENT: a worker run that has used this share of its iteration limit without a branch ai/issue-<n> is told to stop exploring and

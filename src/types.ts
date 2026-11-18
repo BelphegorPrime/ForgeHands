@@ -156,6 +156,8 @@ export interface DirectConfig extends BaseConfig {
   humanLogin: string | null;
   /** COMMENT_RESTARTS: how often a comment of HUMAN_LOGIN may start a failed or handed-over run again, per issue and label; 0 switches it off. */
   commentRestarts: number;
+  /** PLAN_ANSWER_RESTARTS: a planner that finished without sub-issues starts again on a comment of HUMAN_LOGIN (0: off). See Dispatcher.planAnswer. */
+  planAnswerRestarts: number;
   /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
   humanReviewRounds: boolean;
   /** STALL_ALERT_MINUTES: a notification when nothing has started for this long while work waits on a hold that is not a dependency (0 = off). */
@@ -248,6 +250,8 @@ export interface ForgeEvent extends BaseEvent {
   protected_files?: string[];
   /** A comment of HUMAN_LOGIN that started this run again (COMMENT_RESTARTS): the comment's id and its author. */
   comment?: { id: string; login: string | null };
+  /** A comment of HUMAN_LOGIN that started a planner again, because it had finished without sub-issues (PLAN_ANSWER_RESTARTS). */
+  plan_answer?: boolean;
 }
 
 /** A push to the default branch. */
