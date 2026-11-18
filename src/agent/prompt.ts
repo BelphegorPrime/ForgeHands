@@ -1,5 +1,7 @@
 import { agentApi } from '../forge/index.ts';
 import type { DirectConfig, ForgeEvent } from '../types.ts';
+import { checkFactsLines } from './checks.ts';
+import type { CheckFacts } from './checks.ts';
 
 const OPEN = '<<<UNTRUSTED_ISSUE_TEXT';
 const CLOSE = 'UNTRUSTED_ISSUE_TEXT>>>';
@@ -48,12 +50,14 @@ export function workspacePath(config: DirectConfig, event: ForgeEvent): string {
 
 // Runs that work on a pull request of an agent issue (branch ai/issue-<n>): a follow-up round asked for by a label, a fix round
 // after a failed CI run, and the review after a green one.
-function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string {
+function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig, checks: CheckFacts | null): string {
   const { repository, issue, label, sender } = event;
   // Present on every event that reaches this builder (see buildPrompt); `ci` only on CI events.
   const pr = event.pull_request!;
   const ci = event.ci!;
   const mode = event.type === 'ci.failure' ? 'fix' : event.type === 'ci.success' ? 'review' : event.type === 'ci.sensitive' ? 'sensitive' : event.type === 'pull_request.conflict' ? 'conflict' : 'round';
+  // The check result of the head, as ForgeHands read it from the forge (CHECKS_FROM_CI): the reviews are given it and do not re-derive it.
+  const checkBlock = mode === 'review' || mode === 'sensitive' ? checkFactsLines(checks) : [];
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);
   // A dependency bot's pull request (BOT_AUTHORS) has no ticket: its own title and description are the task, and every word of them is untrusted.
@@ -76,6 +80,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI is green (commit ' + ci.commit_sha.slice(0, 8) + ') and it changes protected paths: ' + (files || 'see the diff') + '. A human merges it after you. Give a security review. You do not change code.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. ' + issueRead + ' Read the diff (GET ' + agent.pullDiff(pr.number) + ') and check out the branch ' + pr.head_ref + ' read-only. Read ' + reading + '.',
       trust,
@@ -94,6 +99,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI is green (' + ci.workflow + ', commit ' + ci.commit_sha.slice(0, 8) + '). Review it. You do not change code.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. ' + issueRead + ' Read the diff (GET ' + agent.pullDiff(pr.number) + ') and, where needed, check out the branch ' + pr.head_ref + ' read-only. Read ' + reading + '. Work out from the diff which packages, images or actions are updated, from which version to which (manifests, lock files, Dockerfiles, workflow files).',
       trust,
@@ -107,6 +113,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI is green (' + ci.workflow + ', commit ' + ci.commit_sha.slice(0, 8) + '). Review it. You do not change code.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. ' + issueRead + ' Read the diff (GET ' + agent.pullDiff(pr.number) + ') and, where needed, check out the branch ' + pr.head_ref + ' read-only to look at the files. Read ' + reading + '.',
       trust,
@@ -122,6 +129,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI is green (' + ci.workflow + ', commit ' + ci.commit_sha.slice(0, 8) + '). Review it. You do not change code.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. ' + issueRead + ' Read the diff (GET ' + agent.pullDiff(pr.number) + ') and, where needed, check out the branch ' + pr.head_ref + ' read-only. Read ' + reading + '. Work out from the diff which packages, images or actions are updated, from which version to which (manifests, lock files, Dockerfiles, workflow files).',
       trust,
@@ -137,6 +145,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI is green (' + ci.workflow + ', commit ' + ci.commit_sha.slice(0, 8) + '). Review it. You do not change code.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. ' + issueRead + ' Read the diff (GET ' + agent.pullDiff(pr.number) + ') and, where needed, check out the branch ' + pr.head_ref + ' read-only to look at the files. Read ' + reading + '.',
       trust,
@@ -152,6 +161,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its branch conflicts with ' + branch + ' (which moved to ' + String(event.base_sha || '').slice(0, 8) + '). Resolve the conflict.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. Check out the branch ' + pr.head_ref + ' and fetch: `git fetch origin`.',
       '2. Rebase the branch onto the default branch: `git rebase origin/' + branch + '`. This is the one kind of run in which a rebase and a force push are allowed. Resolve every conflict so that the purpose of the pull request stays (its acceptance criteria are in the issue: GET ' + agent.issue(issue.number) + ') and what the default branch brought in is kept: never resolve by taking one side wholesale. A generated file or a lock file is regenerated with the repository\'s own command, not edited between the markers.',
@@ -165,6 +175,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' Its CI failed: workflow ' + ci.workflow + (ci.html_url ? ' (' + ci.html_url + ')' : '') + ', commit ' + ci.commit_sha.slice(0, 8) + '. Fix the failure.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. Check out the branch ' + pr.head_ref + ' of the pull request.',
       '2. Find out what failed: run the checks the repository documents (AGENTS.md / CONTRIBUTING.md / the workflow files in ' + agent.workflows + ') and reproduce the failure. ' + issueRead + ' Also read ' + reading + '.',
@@ -180,6 +191,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
     return [
       where + ' A review asks for changes' + (sender.login ? ' (by ' + sender.login + ')' : '') + '. It needs another round.',
       clone, never,
+      ...checkBlock,
       'Do this, in order:',
       '1. Check out the branch ' + pr.head_ref + ' of the pull request.',
       '2. Read what was said: ' + reading + '. ' + issueRead + ' The reviewer who asks for changes may have written earlier reviews of this pull request as well (an approval or a comment review, with inline review comments): read every review of that reviewer that is newer than the last round, and all of its inline review comments, since each of them can carry a request.',
@@ -255,10 +267,11 @@ function buildRevertPrompt(event: ForgeEvent, config: DirectConfig): string {
   ].join('\n');
 }
 
-export function buildPrompt(event: ForgeEvent, config: DirectConfig): string {
+// `checks`: the check result of the pull request's head as ForgeHands read it (checkFacts); null when CHECKS_FROM_CI is off.
+export function buildPrompt(event: ForgeEvent, config: DirectConfig, checks: CheckFacts | null = null): string {
   if (event.type === 'epic.done') return buildEpicPrompt(event, config);
   if (event.type === 'ci.main_failure') return buildRevertPrompt(event, config);
-  if (event.pull_request) return buildPullRequestPrompt(event, config);
+  if (event.pull_request) return buildPullRequestPrompt(event, config, checks);
   const { repository, issue, label, sender } = event;
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);

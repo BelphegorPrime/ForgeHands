@@ -366,6 +366,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // A repository without any workflow file never reports a CI run, so a pull request there would never be reviewed: with this on (the
     // default) the review starts on the new commit without waiting. A repository with workflows is not affected. 0 switches it off.
     reviewWithoutCi: reviewSwitch(env.REVIEW_WITHOUT_CI),
+    // The forge's check result of a commit is what the reviewer is given and what a failed commit is refused by (agent/checks.ts). 0 switches it off.
+    checksFromCi: checksFromCiOf(env.CHECKS_FROM_CI),
     // Off unless 1: a ticket whose declared files ('## Exact files' in its body) overlap those of an older open ticket or agent pull request waits.
     waitForSameFiles: switchOff(env.WAIT_FOR_SAME_FILES, 'WAIT_FOR_SAME_FILES'),
     // Wait this long after the last push to the default branch before looking at the pull requests (a merge is often followed by another).
@@ -472,6 +474,13 @@ function reviewSwitch(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('REVIEW_WITHOUT_CI must be 0 or 1');
+}
+
+// CHECKS_FROM_CI: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.
+function checksFromCiOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '1') return true;
+  if (value === '0') return false;
+  throw new Error('CHECKS_FROM_CI must be 0 or 1');
 }
 
 // FAILURE_ESCALATE: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.

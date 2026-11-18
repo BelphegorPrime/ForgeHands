@@ -4,6 +4,8 @@ import { isBotPull, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
 import { immediateMessage } from '../notify/texts.ts';
+import { checksMessage } from '../notify/checks.ts';
+import { checkFacts } from './checks.ts';
 import type { Facts } from '../notify/texts.ts';
 import type { Notify } from '../notify/index.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
@@ -40,6 +42,8 @@ export class Merger {
   // Repository@commit pairs known to have no workflow file (REVIEW_WITHOUT_CI), for this process only. "Has CI" is never kept: a workflow
   // file can arrive with the next commit, and a commit that has them must be looked at again.
   noCiSeen = new Set<string>();
+  // Repositories whose missing CI was reported (CHECKS_FROM_CI), once per process.
+  checksNoticed = new Set<string>();
   // The ledger (the dispatcher sets it): holds of two-key merges are kept there, so that a restart neither loses nor shortens one.
   ledger: JobStore | null = null;
   now: () => number = Date.now;
@@ -130,6 +134,8 @@ export class Merger {
       if (labels.includes(this.config.blockedLabel)) return metrics.refused('blocked');
       // The verdict for this very commit is the proof. Without one nothing is merged.
       const review = await this.reviewOf(repository, number, sha);
+      // A failed check is the same refusal as a red CI at the merge gate below, and takes no approval label off.
+      if (review.reason === 'ci_failed') return metrics.refused('ci_not_green');
       // No label to take off: a review that does not (yet) say yes is simply not a reason to merge.
       if (!labelled && !review.ok) return review.reason === 'changes_requested' ? 'changes_requested' : review.reason === 'not_enough' ? 'awaiting_approvals' : 'not_approved';
       // The reviewer sometimes sets the label a moment before it posts the verdict comment. A label that arrives first is looked at
@@ -379,6 +385,10 @@ export class Merger {
 
   // The verdict of the pull request for this commit, from the source the operator chose (VERDICT_SOURCE).
   async reviewOf(repository: string, number: number, sha: string): Promise<{ ok: boolean; reason?: string }> {
+    if (this.config.checksFromCi) {
+      const refused = await this.checksVerdict(repository, sha);
+      if (refused) return refused;
+    }
     const source = this.config.verdictSource;
     if (source === 'comment') return this.commentVerdict(repository, number, sha);
     let native: { ok: boolean; reason?: string };
@@ -392,6 +402,21 @@ export class Merger {
     if (native.ok || source === 'review' || native.reason === 'changes_requested') return native;
     // `both`: a verdict comment counts too, unless a current review asks for changes (that one wins).
     return this.commentVerdict(repository, number, sha);
+  }
+
+  // CHECKS_FROM_CI: a head whose recorded check failed gets no OK, whatever the reviewer wrote. A head without any CI is reported once per
+  // repository to the human and is judged as before: revert-on-red and verification need CI, so the operator should know it is missing.
+  // Never throws; an unreadable check is `unknown` and decides nothing.
+  async checksVerdict(repository: string, sha: string): Promise<{ ok: false; reason: string } | null> {
+    const facts = await checkFacts(this.forge, repository, sha, this.logger, this.config.reviewWithoutCi);
+    if (facts.state === 'failure') return { ok: false, reason: 'ci_failed' };
+    const key = repository.toLowerCase();
+    if (facts.state === 'none' && !this.checksNoticed.has(key)) {
+      this.checksNoticed.add(key);
+      this.logger.error(repository + ' has no CI (no workflow file at ' + sha.slice(0, 8) + '): revert-on-red and verification cannot work there');
+      if (this.notifier.wants('checks')) this.notifier.notify(checksMessage(this.config.notify.language, repository, sha), repository);
+    }
+    return null;
   }
 
   // The native reviews of the head commit: per reviewer only the latest approval or request for changes counts, and only when it is not
