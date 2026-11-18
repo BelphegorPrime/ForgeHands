@@ -25,7 +25,9 @@ const COUNTERS: Record<string, string> = {
   forgehands_reminders_total: 'Reminders to the human about a pull request that waits for him.',
   forgehands_notifications_total: 'Notifications to the human by channel, kind (handover, blocked, conflict, failed, reminder, digest) and result (sent, failed, dry).',
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
-  forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).'
+  forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
+  forgehands_resumes_total: 'Runs that ended stuck or timed out and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS).',
+  forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -110,7 +112,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 

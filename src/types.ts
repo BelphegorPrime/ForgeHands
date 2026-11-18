@@ -118,6 +118,10 @@ export interface DirectConfig extends BaseConfig {
   requiredApprovals: number;
   approvalGraceMs: number;
   errorRetries: number;
+  /** RESUME_ATTEMPTS: how often a run that ended stuck or timed out continues on its own conversation (one message, then run again); 0 switches it off. */
+  resumeAttempts: number;
+  /** FAILURE_ESCALATE: a round that is still stuck, timed out or out of iterations then starts once more on the profile of its escalate_to route (once per head commit); 0 switches it off. */
+  failureEscalate: boolean;
   quotaHoldMaxMs: number;
   quotaGiveUpMs: number;
   splitLabel: string | null;
@@ -250,6 +254,16 @@ export interface Job {
   verdict_retry?: number;
   round_reset?: boolean;
   escalated?: boolean;
+  /** Stage A (RESUME_ATTEMPTS): how often the run was continued on its conversation, the state it stopped in before the latest continuation, when that
+   * continuation started, and whether its message is still to be sent to OpenHands (the run call failed or was not answered yet). */
+  resumes?: number;
+  resumed_from?: string;
+  resumed_at?: number;
+  resume_pending?: boolean;
+  /** Stage B (FAILURE_ESCALATE): a fresh run of a round on the profile of its escalate_to route, started after `escalated_after` (the state the run stopped in).
+   * It is not a follow-up round: it does not count against MAX_ROUNDS. */
+  failure_escalation?: boolean;
+  escalated_after?: string;
   /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */
   fell_back?: string;
   archived?: boolean;

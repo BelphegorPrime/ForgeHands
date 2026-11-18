@@ -8,6 +8,7 @@ interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
   started: string | null; finished: string | null; cost: number | null; retry_at: number | undefined; waiting_for: number[] | undefined; waiting_for_files: number[] | undefined;
   waiting_for_run: true | undefined; escalated: string | undefined; fell_back: string | undefined; delivered_on: number | undefined; created: number;
+  resumes: number | undefined; escalated_after: string | undefined;
 }
 export interface Summary {
   merged: number; merged_without_human: number; blocked: number; split: number;
@@ -65,7 +66,7 @@ function summarize(config: DirectConfig, jobs: Job[], days: number, now: number)
       merged += 1;
       if (ticket.some((job) => job.merged_at === mergedAt && job.merged_by === 'agent') && !at('blocked_at')) free += 1;
       times.push(Math.max(0, Math.round((mergedAt - Math.min(...ticket.map((job) => job.created))) / 1000)));
-      rounds += ticket.filter((job) => ROUND_KINDS.has(config.routes.get(job.label)?.kind) && (job.started || job.status !== 'failed')).length;
+      rounds += ticket.filter((job) => ROUND_KINDS.has(config.routes.get(job.label)?.kind) && !job.failure_escalation && (job.started || job.status !== 'failed')).length;
     }
     times.sort((a, b) => a - b);
     result[repo] = {
@@ -133,7 +134,8 @@ const KIND_TEXT: Record<string, string> = {
 function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   const active = runs.find((run) => run.status === 'running' || run.status === 'queued');
   if (active && active.retry_at && active.status === 'queued') return 'model quota used up, ' + KIND_TEXT[active.kind] + ' tries again after ' + new Date(active.retry_at).toISOString().slice(11, 16) + ' UTC';
-  if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running' + (active.escalated ? ' (escalated to ' + active.escalated + ')' : '') + (active.fell_back ? ' (fallback to ' + active.fell_back + ')' : '');
+  if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running' + (active.resumes ? ' (resumed)' : '')
+    + (active.escalated_after ? ' (escalated after ' + active.escalated_after + ')' : active.escalated ? ' (escalated to ' + active.escalated + ')' : '') + (active.fell_back ? ' (fallback to ' + active.fell_back + ')' : '');
   const waiting = runs.find((run) => run.status === 'waiting');
   if (waiting?.waiting_for_files?.length && !waiting.waiting_for?.length) return 'waiting for ' + waiting.waiting_for_files.map((n: number) => '#' + n).join(', ') + ' (same files)';
   if (waiting) return waiting.waiting_for_run ? 'CI result kept, waiting for the running agent to finish' : 'waiting for ' + (waiting.waiting_for || []).map((n: number) => '#' + n).join(', ');
@@ -157,7 +159,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       started: job.started ? new Date(job.started).toISOString() : null,
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
-      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created
+      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created,
+      resumes: job.status === 'running' && job.resumes ? job.resumes : undefined, escalated_after: job.escalated_after
     };
     const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [] };
     entry.runs.push(run);
@@ -167,7 +170,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const closed = new Set([...byIssue.keys()].filter((key) => jobs.list().filter((job) => job.key.startsWith(key + ':')).every((job) => job.archived_view)));
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
-    const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && (run.started || run.status !== 'failed')).length;
+    const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
       issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds),
