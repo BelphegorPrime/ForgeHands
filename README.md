@@ -766,7 +766,7 @@ scrape_configs:
 
 ## End-to-end suite
 
-After each deploy (`E2E_ON_START=1`) or on demand (`POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>`; without `STATUS_TOKEN` the endpoint answers `403`), ForgeHands runs scenarios against a test repository: a ticket gets its run, the pull request is reviewed and merged, and a change that turns the default branch red is reverted, reopened and started again once. Each scenario cleans up after itself (tickets, pull requests, branches, the default branch). A failed scenario sends a notification of kind `failed` (`NOTIFY_IMMEDIATE`), and `forgehands_e2e_scenario_ok{scenario}` and the status page show the result. The test repository must be dedicated to this: see [docs/e2e.md](docs/e2e.md) for its setup, the CI step, the scenarios and their preconditions. Forgejo and Gitea only.
+After each deploy (`E2E_ON_START=1`) or on demand (`POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>`; without `STATUS_TOKEN` the endpoint answers `403`), ForgeHands runs scenarios against a test repository: a ticket gets its run, the pull request is reviewed and merged, and a change that turns the default branch red is reverted, reopened and started again once. Each scenario cleans up after itself (tickets, pull requests, branches, the default branch). A failed scenario sends a notification of kind `failed` (`NOTIFY_IMMEDIATE`), and `forgehands_e2e_scenario_ok{scenario}` and the status page show the result. The scenarios' tickets must pass the ticket pre-flight. The test repository must be dedicated to this: see [docs/e2e.md](docs/e2e.md) for its setup, the CI step, the scenarios and their preconditions. Forgejo and Gitea only.
 
 ## Dry run
 

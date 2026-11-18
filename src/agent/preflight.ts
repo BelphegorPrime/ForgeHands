@@ -18,6 +18,9 @@ import type { DirectConfig, ForgeEvent, Logger } from '../types.ts';
 
 export interface Violation { rule: 1 | 2 | 3 | 4; text: string }
 
+/** The first words of the comment that rejects a ticket; the end-to-end suite looks for them to fail a scenario at once. */
+export const PREFLIGHT_REJECTION = 'ForgeHands: the ticket breaks the pre-flight';
+
 /** Whether a path exists on the default branch: true, false, or null when the forge cannot say. */
 export type Exists = (path: string) => Promise<boolean | null>;
 
@@ -223,7 +226,7 @@ export class TicketPreflight {
       const rules = violations.map((v) => '- rule ' + v.rule + ': ' + v.text).join('\n');
       const next = split ? 'It goes back to the planner (' + split + ') to be written again.' : 'A human has to fix the ticket and set its label again.';
       try {
-        await this.forge.addComment(repository, number, (split ? '' : mentionOf(this.config)) + 'ForgeHands: the ticket breaks the pre-flight, so no worker starts on it:\n'
+        await this.forge.addComment(repository, number, (split ? '' : mentionOf(this.config)) + PREFLIGHT_REJECTION + ', so no worker starts on it:\n'
           + rules + '\n' + next + ' This comment is written once per revision of the ticket.', 'issue');
         if (!dry) this.jobs.note(key, now);
       } catch (error) {

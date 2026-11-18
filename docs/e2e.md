@@ -67,12 +67,14 @@ Scenarios 1 and 2 are deterministic on the repository above. Scenarios 3 to 5 de
 
 `E2E_SCENARIOS` names the scenarios to run, in order. Unset, every non-experimental scenario runs.
 
+**Scenario tickets must pass the ticket pre-flight** (the README section "A ticket is checked before a worker starts"), whether or not `TICKET_PREFLIGHT` is on at the instance. A ticket that breaks a rule gets no worker: the planner splits it, the run goes elsewhere, and the scenario waits for a pull request that never comes from its branch. So every ticket body in `src/e2e/scenarios.ts` has a `## Files` section (exact paths, or marked `(new)`), a `## Steps` section that names only listed paths, and a `## Acceptance` section with a fenced command that the worker can run and that is deterministic for the scenario. A unit test runs every ticket body of every scenario, the experimental ones too, through the pre-flight and fails on a violation: a new scenario gets that check for free. A ticket of a scenario that the pre-flight rejects anyway fails the scenario at once with the reason `preflight_rejected` (the rule of the comment is in the reason), instead of at its timeout.
+
 ## Format
 
 Scenarios are data, in the format of `src/e2e/format.ts`. A new bug becomes a new scenario: a list of steps and a predicate per check. Steps:
 
 - `ticket`: creates an issue with a title and body, puts a label on it and names it (`as`). ForgeHands' route for the label starts a run.
-- `wait`: polls a predicate until it holds, or until its `timeoutMinutes` (default: the rest of the scenario's time). With `as` on a `findPull` wait it captures the number of the pull request it found.
+- `wait`: polls a predicate until it holds, or until its `timeoutMinutes` (default: the rest of the scenario's time; a `findPull` wait defaults to 20 minutes, because a pull request that does not appear by then is a failed run). With `as` on a `findPull` wait it captures the number of the pull request it found. Every poll and every `assert` first checks the tickets of the run for the pre-flight rejection comment (`ForgeHands: the ticket breaks the pre-flight`): one that carries it fails the scenario with `preflight_rejected`.
 - `assert`: checks a predicate once.
 - `settle`: waits a number of seconds without asking anything, so that a late restart or merge shows up in the checks after it.
 
@@ -83,7 +85,7 @@ Predicates name a resource by `$name` (`$ticket`, `$pr`) and check one thing: `i
 The cleanup runs whatever the scenario did (it is in a `finally`, after a failure, a timeout or a read error). In this order:
 
 1. Pull requests **open** with a number above the first ticket of the run are closed.
-2. The run's tickets are closed (a closed ticket stops its runs).
+2. The run's tickets are closed (a closed ticket stops its runs), and so is every other open issue above the first ticket: a planner that split a ticket leaves sub-issues with numbers above it, and a pull request that merges can leave them open. Issues and pull requests share one number space, so the walk goes up from the first ticket and ends after three numbers in a row that do not exist.
 3. Branches `ai/issue-<n>` and `ai/revert-<n>` with `n` at or above the first ticket are deleted.
 4. The default branch is put back to the tree it had when the scenario started. The forge's REST API cannot move a branch pointer, so every file that differs is written back (or deleted) by a commit of its own. The history grows by one commit per changed file, and each commit runs CI. The run then checks that the default branch has the start's tree again and reports it as a failed cleanup if not.
 

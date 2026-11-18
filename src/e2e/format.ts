@@ -50,6 +50,8 @@ export interface Scenario {
   steps: Step[];
 }
 
+/** The default timeout of a wait for a pull request (findPull), when the step names none. */
+export const DEFAULT_FIND_PULL_MINUTES = 20;
 const NAME = /^[a-z0-9][a-z0-9-]{0,60}$/;
 const VARIABLE = /^[a-z][a-zA-Z0-9]{0,40}$/;
 const REFERENCE = /\$([a-z][a-zA-Z0-9]{0,40})/g;
@@ -148,7 +150,8 @@ export function parseScenario(value: unknown): Scenario {
         const as = capture();
         if (as && !('findPull' in for_)) fail(at, 'only a findPull wait captures a number (as)');
         if (as) known.add(as);
-        const minutes = timeout();
+        // A pull request that does not appear within 20 minutes is a failed run, not a reason to wait for the rest of the scenario's time.
+        const minutes = timeout() ?? ('findPull' in for_ ? DEFAULT_FIND_PULL_MINUTES : undefined);
         return { do: 'wait', for: for_, ...(as ? { as } : {}), ...(minutes === undefined ? {} : { timeoutMinutes: minutes }) };
       }
       case 'assert': {
