@@ -12,6 +12,7 @@ import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
 import { ReviewSweep } from './review-sweep.ts';
+import { TicketPreflight } from './preflight.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
 import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '../notify/texts.ts';
@@ -122,6 +123,8 @@ export class Dispatcher {
   workspace: Workspace;
   /** Closes the tickets the forge has closed (LEDGER_SYNC_HOURS); off unless that is set. */
   ledgerSync: LedgerSync;
+  /** The ticket pre-flight (TICKET_PREFLIGHT): a worker's ticket that breaks a rule starts no run. See src/agent/preflight.ts. */
+  preflight: TicketPreflight;
   /** The reconciler of REVIEW_SWEEP_MINUTES: starts the review of a head that has none in the ledger. */
   sweep: ReviewSweep;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
@@ -179,6 +182,7 @@ export class Dispatcher {
       rounds: (repository, issue) => this.rounds({ repository: { full_name: repository }, issue: { number: issue } } as ForgeEvent)
     });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
+    this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
   }
 
   // Facts for the summary on the status page (merged, handed to a human, split), kept on the ticket's newest job. Best effort.
@@ -566,6 +570,8 @@ export class Dispatcher {
       await this.roundsUsedUp(event);
       return { status: 'rounds_exceeded' };
     }
+    // A worker's ticket that breaks the pre-flight rules starts no run (src/agent/preflight.ts). Planners and pull requests are not checked.
+    if (!event.pull_request && kind === 'issue' && !this.isPlannerLabel(label) && await this.preflight.rejects(event, label)) return { status: 'ticket_rejected' };
     // An issue that depends on open issues waits until the last of them closes (Forgejo's issue dependencies).
     const open = !event.pull_request && kind === 'issue' ? await this.openDependencies(event, event.issue.number) : [];
     const job = this.jobs.add({ key, label, event: { ...event, label }, status: open.length ? 'waiting' : 'queued', ...(open.length ? { waiting_for: open } : {}), created: this.now() });

@@ -21,6 +21,7 @@ const env = (extra = {}) => ({
   FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
+  TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify(ROUTES),
   UPDATE_BRANCHES: '0',

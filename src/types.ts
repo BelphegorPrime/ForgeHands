@@ -147,6 +147,8 @@ export interface DirectConfig extends BaseConfig {
   quotaHoldMaxMs: number;
   quotaGiveUpMs: number;
   splitLabel: string | null;
+  /** TICKET_PREFLIGHT (on by default, 0 = off): a worker's ticket that breaks a rule of src/agent/preflight.ts starts no run. */
+  ticketPreflight: boolean;
   archiveAfterDays: number;
   /** REVERT_RETRIES (0 = off, at most 5): how often a ticket whose change was reverted after a red default branch is started again. See Dispatcher.revertMerged. */
   revertRetries: number;

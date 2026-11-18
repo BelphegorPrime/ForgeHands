@@ -178,6 +178,11 @@ export interface Forge {
    * ForgeHands cannot tell: there a pull request is only ever reviewed after a CI run (REVIEW_WITHOUT_CI has no effect).
    */
   hasWorkflows?(repository: string, sha: string): Promise<boolean>;
+  /**
+   * Does a file exist at this ref (the default branch when absent)? Throws when the forge cannot say. Absent where ForgeHands cannot read
+   * files: the ticket pre-flight then does not check that the files of a ticket exist (see src/agent/preflight.ts).
+   */
+  fileExists?(repository: string, path: string, ref?: string): Promise<boolean>;
   /** The login (lower case) of the user the forge token belongs to, the agent. Absent where ForgeHands cannot tell; throws when the forge cannot say. */
   agentLogin?(): Promise<string | null>;
   /** The sha of the tip of a branch, or null. */

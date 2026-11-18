@@ -19,6 +19,7 @@ const env = (extra = {}) => ({
   FORGE_WEBHOOK_SECRET: 'forge-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
+  TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' } }),
   FORGE_URL: 'https://forge.example/',
