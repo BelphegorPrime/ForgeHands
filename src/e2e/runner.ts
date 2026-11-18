@@ -1,7 +1,10 @@
 // Runs scenarios against a test repository through the forge client. A scenario has a deadline (E2E_TIMEOUT_MINUTES); its cleanup runs
-// whatever happened: the pull requests it opened are closed, its tickets are closed, the branches of its tickets and reverts are deleted,
+// whatever happened: the pull requests and the issues above its first ticket are closed (sub-issues included), the branches of its tickets
+// and reverts are deleted,
 // and the default branch is put back to the tree it had when the scenario started. The cleanup only touches what the run created: pull
 // requests and branches with numbers from the first ticket of the run on, which nothing else in the test repository should use.
+// A ticket that the pre-flight rejects ends the scenario at once (preflight_rejected): no worker starts on it, so no pull request comes.
+import { PREFLIGHT_REJECTION } from '../agent/preflight.ts';
 import type { Predicate, Scenario, Step } from './format.ts';
 import { probe, type Probe, type Verdict } from './predicates.ts';
 import type { E2eForge, LedgerPort } from './port.ts';
@@ -84,11 +87,26 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
 
   const probeOf = (): Probe => ({ forge, repository, defaultBranch, ledger: options.ledger, vars });
 
+  // The reason a ticket of this run was rejected by the pre-flight, or null. A read that fails is no rejection: the wait goes on.
+  const rejectedTicket = async (): Promise<string | null> => {
+    for (const number of tickets) {
+      let comments: { body?: string }[];
+      try { comments = await forge.listComments(repository, number, 100); } catch { continue; }
+      const note = comments.find((comment) => String(comment.body || '').includes(PREFLIGHT_REJECTION));
+      if (!note) continue;
+      const rules = String(note.body).split('\n').filter((line) => line.startsWith('- rule')).map((line) => line.slice(2)).join('; ');
+      return 'preflight_rejected: ticket #' + number + ' breaks the pre-flight, so no worker starts on it' + (rules ? ' (' + rules.slice(0, 400) + ')' : '');
+    }
+    return null;
+  };
+
   // A read that fails counts as "not yet" in a wait, so that one flaky answer does not end the scenario.
   const waitFor = async (step: Extract<Step, { do: 'wait' }>): Promise<void> => {
     const limit = step.timeoutMinutes === undefined ? deadline : Math.min(deadline, now() + step.timeoutMinutes * 60000);
     let verdict: Verdict = { ok: false, detail: 'not checked yet' };
     for (;;) {
+      const rejected = await rejectedTicket();
+      if (rejected) throw new StepFailed(rejected);
       try { verdict = await probe(step.for, probeOf()); }
       catch (error) { verdict = { ok: false, detail: 'read failed: ' + String(error?.message || error).slice(0, 200) }; }
       if (verdict.ok) {
@@ -113,6 +131,8 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
     }
     if (step.do === 'wait') return waitFor(step);
     if (step.do === 'assert') {
+      const rejected = await rejectedTicket();
+      if (rejected) throw new StepFailed(rejected);
       const verdict = await probe(step.that, probeOf());
       if (!verdict.ok) throw new StepFailed((step.message ? step.message + ': ' : '') + verdict.detail);
       return;
@@ -170,6 +190,20 @@ export async function cleanup(repository: string, forge: E2eForge, created: Crea
       for (const pr of pulls.filter((entry) => entry.number > first)) await attempt('close pull request #' + pr.number, () => forge.closePull(repository, pr.number));
     });
     for (const number of created.tickets) await attempt('close ticket #' + number, () => forge.closeIssue(repository, number));
+    // A ticket the planner split (or a run that opened another ticket) has its issues above the first ticket, and the pull request of a
+    // sub-issue can merge without closing it: those are closed too. Issues and pull requests share one number space, so the walk goes up
+    // from the first ticket and ends after three numbers in a row that do not exist.
+    await attempt('close the issues above the first ticket', async () => {
+      let missing = 0;
+      for (let number = first; missing < 3; number++) {
+        let issue: { state: string } | null = null;
+        try { issue = await forge.getIssue(repository, number); }
+        catch (error) { if (!/HTTP 404\b/.test(String(error?.message))) throw error; }
+        if (!issue) { missing++; continue; }
+        missing = 0;
+        if (issue.state === 'open') await attempt('close issue #' + number, () => forge.closeIssue(repository, number));
+      }
+    });
     await attempt('list branches', async () => {
       for (const branch of await forge.listBranches(repository)) {
         const match = /^ai\/(?:issue|revert)-(\d+)$/.exec(branch.name);

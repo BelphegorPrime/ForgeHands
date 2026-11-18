@@ -2,6 +2,8 @@
 // The end-to-end suite (src/e2e) against a fake forge that stands in for ForgeHands: a worker opens a pull request for a ticket with the
 // worker label, a reviewer approves it, and the merge lands on the default branch. Covered: pass, fail, timeout, cleanup after a failing
 // step, off by default, the version trigger that runs once, the protected endpoint, the gauge, the status section and the notification.
+// Also: every ticket of the built-in scenarios passes the real pre-flight, a pre-flight rejection fails a scenario at once, and the cleanup
+// of a delivery that happened under another ticket (a sub-issue) closes the sub-issue and takes its file off main.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -10,8 +12,9 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { parseScenario, type Scenario } from '../src/e2e/format.ts';
 import { E2eController } from '../src/e2e/controller.ts';
-import { runScenario, runSuite, restoreBranch } from '../src/e2e/runner.ts';
-import { SCENARIO_NAMES, selectScenarios } from '../src/e2e/scenarios.ts';
+import { cleanup, runScenario, runSuite, restoreBranch } from '../src/e2e/runner.ts';
+import { SCENARIO_NAMES, SCENARIOS, selectScenarios } from '../src/e2e/scenarios.ts';
+import { PREFLIGHT_REJECTION, ticketViolations } from '../src/agent/preflight.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { DeliveryStore } from '../src/store/deliveries.ts';
 import { Dispatcher } from '../src/agent/dispatch.ts';
@@ -317,6 +320,84 @@ test('E2E_* values are validated: a repository outside ALLOWED_REPOS, an unknown
   assert.throws(() => loadConfig(withE2e({ E2E_TIMEOUT_MINUTES: '0' }), quiet), /E2E_TIMEOUT_MINUTES must be an integer/);
   const config = loadConfig(withE2e({ E2E_ON_START: '1', E2E_SCENARIOS: 'conflict-round', E2E_TIMEOUT_MINUTES: '45' }), quiet);
   assert.deepEqual(config.e2e, { repository: 'owner/hello', onStart: true, scenarios: ['conflict-round'], timeoutMinutes: 45 });
+});
+
+test('every ticket of every built-in scenario passes the real ticket pre-flight, the experimental ones too', async () => {
+  // Every file a ticket lists counts as missing here, so a file that is not marked "new" is a violation as well.
+  const neverExists = async () => false;
+  let tickets = 0;
+  for (const entry of SCENARIOS) {
+    for (const step of entry.steps) {
+      if (step.do !== 'ticket') continue;
+      tickets++;
+      const violations = await ticketViolations(step.body, neverExists);
+      assert.deepEqual(violations, [], entry.name + ', ticket ' + step.as + ': ' + violations.map((v) => 'rule ' + v.rule + ': ' + v.text).join('; '));
+    }
+  }
+  assert.ok(tickets >= 6, 'the scenarios have their tickets: ' + tickets);
+});
+
+test('the pre-flight check is live: the bodies of the first version of the scenarios are rejected (no sections, no command)', async () => {
+  const oldBody = 'Create the file e2e/delivery.txt with the single line "delivered". Change nothing else.';
+  const violations = await ticketViolations(oldBody);
+  assert.deepEqual(violations.map((v) => v.rule), [2]);
+});
+
+test('a ticket the pre-flight rejects fails the scenario at once with preflight_rejected, and the cleanup still runs', async () => {
+  const forge = new FakeForge();
+  forge.progress = (fake) => {
+    // The bot's comment as ForgeHands writes it: a mention in front when no SPLIT_LABEL is set, then the rule that failed.
+    for (const issue of fake.issues.values()) {
+      if (!issue.labels.some((label) => label.name === 'ai:ready') || issue.comments.some((body) => body.includes(PREFLIGHT_REJECTION))) continue;
+      issue.comments.push('@human ' + PREFLIGHT_REJECTION + ', so no worker starts on it:\n- rule 2: the ticket has no Acceptance section with a fenced command block\n'
+        + 'A human has to fix the ticket and set its label again.');
+    }
+  };
+  const started = Date.now();
+  const result = await runScenario(scenario([
+    ticketStep,
+    { do: 'wait', as: 'pr', for: { findPull: 'ai/issue-$ticket' } },
+    { do: 'wait', for: { pull: '$pr', state: 'merged' } },
+  ]), runOptions(forge, { timeoutMs: 60000 }));
+  assert.equal(result.ok, false);
+  assert.equal(result.failed_step, 1);
+  assert.match(result.reason, /^step 2 \(wait for findPull\): preflight_rejected: ticket #\d+ breaks the pre-flight, so no worker starts on it \(rule 2: the ticket has no Acceptance/);
+  assert.ok(Date.now() - started < 5000, 'the scenario ends at once, not at its timeout');
+  assert.equal(result.cleanup, 'ok', result.cleanup_reason);
+  assert.equal([...forge.issues.values()][0].state, 'closed');
+});
+
+test('a wait for a pull request has a default timeout of 20 minutes; the other waits keep the rest of the scenario time', () => {
+  const parsed = scenario([
+    ticketStep,
+    { do: 'wait', as: 'pr', for: { findPull: 'ai/issue-$ticket' } },
+    { do: 'wait', as: 'explicit', for: { findPull: 'ai/other' }, timeoutMinutes: 30 },
+    { do: 'wait', for: { pull: '$pr', state: 'merged' } },
+  ]);
+  assert.equal(parsed.steps[1].timeoutMinutes, 20);
+  assert.equal(parsed.steps[2].timeoutMinutes, 30);
+  assert.equal(parsed.steps[3].timeoutMinutes, undefined);
+});
+
+test('the cleanup of a delivery under another ticket closes the sub-issue and its pull request, deletes its branch and takes the file off main', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  // The run's ticket (101) was split by the planner into a sub-issue (102); its pull request (103) merged the file onto main.
+  const ticket = forge.createIssue('owner/hello', 'E2E normal delivery', 'B');
+  const sub = forge.createIssue('owner/hello', 'E2E normal delivery, part', 'B');
+  forge.commitOn('ai/issue-' + sub.number, 'main', { 'e2e/delivery.txt': 'delivered' });
+  const pr = forge.openPull('ai/issue-' + sub.number, 'E2E normal delivery, part', sub.number);
+  forge.mergePull(pr.number);
+  assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main') !== null, true, 'the delivery is on main');
+
+  const problem = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline });
+  assert.equal(problem, null);
+  assert.equal(sub.state, 'closed', 'the sub-issue is closed');
+  assert.equal(ticket.state, 'closed', 'the run ticket is closed');
+  assert.equal(forge.pulls.get(pr.number).merged, true, 'the merged pull request stays as it is');
+  assert.deepEqual([...forge.branches.keys()].filter((name) => name.startsWith('ai/')), [], 'the branch of the sub-issue is deleted');
+  assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main'), null, 'main has the tree of the start again');
+  assert.equal(await restoreBranch(forge, 'owner/hello', 'main', baseline), 0);
 });
 
 // A controller over a ledger file of its own, for the trigger tests.

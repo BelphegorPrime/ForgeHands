@@ -14,7 +14,8 @@ export const SCENARIOS: Scenario[] = [
     precondition: null,
     steps: [
       { do: 'ticket', as: 'ticket', label: 'ai:ready', title: 'E2E normal delivery',
-        body: 'Create the file e2e/delivery.txt with the single line "delivered". Change nothing else.' },
+        body: '## Files\n- e2e/delivery.txt (new)\n\n## Steps\n1. Create the file e2e/delivery.txt with the single line "delivered".\n2. Change nothing else.\n\n'
+          + '## Acceptance\n```sh\ntest "$(cat e2e/delivery.txt)" = "delivered"\n```' },
       { do: 'wait', as: 'pr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$ticket' } },
       { do: 'wait', timeoutMinutes: 45, for: { pull: '$pr', state: 'merged' } },
       { do: 'assert', that: { pull: '$pr', comment: { contains: 'Verdict: OK' } }, message: 'the review verdict is missing' },
@@ -30,7 +31,10 @@ export const SCENARIOS: Scenario[] = [
     steps: [
       // The test repository's CI fails on the default branch while RED_MARKER exists (docs/e2e.md); the pull request itself stays green.
       { do: 'ticket', as: 'ticket', label: 'ai:ready', title: 'E2E revert on red',
-        body: 'Create the file ' + RED_MARKER + ' with the single line "red". Change nothing else.' },
+        body: '## Files\n- ' + RED_MARKER + ' (new)\n\n## Steps\n1. Create the file ' + RED_MARKER + ' with the single line "red".\n2. Change nothing else.\n\n'
+          + '## Acceptance\n```sh\ntest "$(cat ' + RED_MARKER + ')" = "red"\n```\n\n'
+          + '## Notes\nThe default branch is meant to turn red after this change: the test repository\'s CI fails on main while the marker file exists. '
+          + 'That red is intended; do not remove the marker file.' },
       { do: 'wait', as: 'pr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$ticket' } },
       { do: 'wait', timeoutMinutes: 45, for: { pull: '$pr', state: 'merged' } },
       { do: 'wait', timeoutMinutes: 20, for: { mergeCommit: '$pr', status: 'failure' } },
@@ -53,7 +57,9 @@ export const SCENARIOS: Scenario[] = [
       + 'with "escalate_to" on ai:ready, and the human hand-over must put the label ai:blocked on the ticket (assumed: check it on your instance).',
     steps: [
       { do: 'ticket', as: 'ticket', label: 'ai:ready', title: 'E2E empty runs',
-        body: 'Post the answer "42" as a comment on this ticket and open no pull request. This ticket is a test of an empty run.' },
+        body: '## Files\n- none\n\n## Steps\n1. Fetch the answer from the address named in Acceptance and post it as a comment on this ticket.\n'
+          + '2. If the agent cannot reach that address, say so in a comment and open no pull request. This ticket is a test of an empty run.\n\n'
+          + '## Acceptance\n```sh\ncurl -fsS --max-time 10 https://answer.e2e.invalid/42 | grep -qx 42\n```' },
       { do: 'wait', timeoutMinutes: 60, for: { runs: '$ticket', label: 'ai:ready', atLeast: 2 } },
       { do: 'wait', timeoutMinutes: 60, for: { runs: '$ticket', label: 'ai:escalate', atLeast: 1 } },
       { do: 'wait', timeoutMinutes: 30, for: { issue: '$ticket', hasLabel: 'ai:blocked' } },
@@ -70,7 +76,9 @@ export const SCENARIOS: Scenario[] = [
       + 'the same head. The block puts the label ai:blocked on the pull request (assumed: check it on your instance).',
     steps: [
       { do: 'ticket', as: 'ticket', label: 'ai:ready', title: 'E2E stuck pull request',
-        body: 'The file e2e/impossible.txt must exist and must not exist at the same time. This criterion cannot be met; say so in the pull request.' },
+        body: '## Files\n- e2e/impossible.txt (new)\n\n## Steps\n1. Make the file e2e/impossible.txt exist.\n'
+          + '2. Make the file e2e/impossible.txt not exist, at the same time as step 1. This cannot be met: say so in the pull request.\n\n'
+          + '## Acceptance\n```sh\ntest -f e2e/impossible.txt && test ! -e e2e/impossible.txt\n```' },
       { do: 'wait', as: 'pr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$ticket' } },
       { do: 'wait', timeoutMinutes: 45, for: { pull: '$pr', comment: { contains: 'Verdict: NOT OK', min: 1 } } },
       { do: 'wait', timeoutMinutes: 30, for: { pull: '$pr', hasLabel: 'ai:blocked' } },
@@ -87,9 +95,11 @@ export const SCENARIOS: Scenario[] = [
       + 'route label ai:conflict is what a run of this kind is recorded under (assumed: check it on your instance).',
     steps: [
       { do: 'ticket', as: 'first', label: 'ai:ready', title: 'E2E conflict first',
-        body: '## Exact files\n- e2e/conflict.txt\n\nSet the file e2e/conflict.txt to the single line "first".' },
+        body: '## Exact files\n- e2e/conflict.txt (new)\n\n## Steps\n1. Set the file e2e/conflict.txt to the single line "first".\n\n'
+          + '## Acceptance\n```sh\ntest "$(cat e2e/conflict.txt)" = "first"\n```' },
       { do: 'ticket', as: 'second', label: 'ai:ready', title: 'E2E conflict second',
-        body: '## Exact files\n- e2e/conflict.txt\n\nSet the file e2e/conflict.txt to the single line "second".' },
+        body: '## Exact files\n- e2e/conflict.txt (new)\n\n## Steps\n1. Set the file e2e/conflict.txt to the single line "second".\n\n'
+          + '## Acceptance\n```sh\ntest "$(cat e2e/conflict.txt)" = "second"\n```' },
       { do: 'wait', as: 'firstPr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$first' } },
       { do: 'wait', as: 'secondPr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$second' } },
       { do: 'wait', timeoutMinutes: 45, for: { pull: '$firstPr', state: 'merged' } },
