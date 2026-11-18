@@ -20,6 +20,8 @@ export interface PullRequest {
   mergeable?: boolean;
   merge_base?: string;
   merged_at?: string | null;
+  /** Who merged it (Forgejo and Gitea answer it on a single pull request, not in a list). */
+  merged_by?: { login?: string } | null;
   updated_at: string;
   html_url?: string | null;
   user?: { login?: string; username?: string };
@@ -64,7 +66,7 @@ export type ReviewVerdict = 'approve' | 'request_changes' | 'comment';
  */
 export type Subject = 'issue' | 'pull';
 
-export interface ListPullsOptions { state: 'open' | 'closed' | 'all'; limit: number; sort?: 'recentupdate' }
+export interface ListPullsOptions { state: 'open' | 'closed' | 'all'; limit: number; sort?: 'recentupdate'; /** 1-based page of the list (Forgejo, Gitea). */ page?: number }
 
 export interface MergeOptions {
   /** One of MERGE_METHOD: merge, squash, rebase, rebase-merge, fast-forward-only. */

@@ -6,6 +6,7 @@ import { Merger } from './merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
+import { LedgerSync } from './ledger-sync.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, digestDue } from '../notify/digest.ts';
 import { digestMessage, immediateMessage } from '../notify/texts.ts';
@@ -64,6 +65,8 @@ export class Dispatcher {
   notifier: Notifier;
   /** The workspace cleanup and the disk guard (WORKSPACE_CLEANUP_DIR); off unless that is set. */
   workspace: Workspace;
+  /** Closes the tickets the forge has closed (LEDGER_SYNC_HOURS); off unless that is set. */
+  ledgerSync: LedgerSync;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   lastArchive = 0;
@@ -92,6 +95,7 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now);
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -914,9 +918,10 @@ export class Dispatcher {
     this.timer = setInterval(() => this.tick().catch((error) => this.logger.error('dispatch failed:', error.message)), intervalMs);
     this.timer.unref?.();
     this.workspace.start();
+    this.ledgerSync.start();
     return this.tick();
   }
-  stop(): void { clearInterval(this.timer); this.workspace.stop(); }
+  stop(): void { clearInterval(this.timer); this.workspace.stop(); this.ledgerSync.stop(); }
 
   // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
   // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.

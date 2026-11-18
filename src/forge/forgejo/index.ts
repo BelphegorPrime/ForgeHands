@@ -87,8 +87,8 @@ export class ForgejoForge implements Forge {
   normalizeEvent(...args: Parameters<Forge['normalizeEvent']>): ReturnType<Forge['normalizeEvent']> { return normalizeEvent(...args); }
 
   getPull(repository: string, number: number): Promise<PullRequest> { return this.call(repository, 'GET', '/pulls/' + number); }
-  listPulls(repository: string, { state, limit, sort }: ListPullsOptions): Promise<PullRequest[]> {
-    return this.call(repository, 'GET', '/pulls?state=' + state + (sort ? '&sort=' + sort : '') + '&limit=' + limit);
+  listPulls(repository: string, { state, limit, sort, page }: ListPullsOptions): Promise<PullRequest[]> {
+    return this.call(repository, 'GET', '/pulls?state=' + state + (sort ? '&sort=' + sort : '') + '&limit=' + limit + (page ? '&page=' + page : ''));
   }
   pullFiles(repository: string, number: number, limit: number, page?: number): Promise<ChangedFile[]> {
     return this.call(repository, 'GET', '/pulls/' + number + '/files?limit=' + limit + (page === undefined ? '' : '&page=' + page));
