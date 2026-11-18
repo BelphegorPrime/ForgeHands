@@ -210,3 +210,11 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - Once per ticket the log says `<repo>#<n>: deleted in the forge, its waiting jobs are dropped`; the counter `forgehands_deleted_tickets_total` counts them.
 - The ledger sync now also reads tickets with waiting or queued jobs (running ones are still left to their run), within its usual 60 reads a pass. A 404 of a dependency list alone changes nothing.
 - Rollback: go back to 0.8.1. Jobs marked `deleted` are not waiting there, so they stay out of the queue.
+
+# Upgrading to the version after 0.9.1: same-files waits no longer close cycles
+
+**Fix.** With `WAIT_FOR_SAME_FILES=1` a ticket that shares files with an older one waited for it, and the older one could already wait for the newer one through an explicit dependency (a split epic and its children, a ticket that depends on the epic). Nothing in such a loop could start. From this version the same-files wait is skipped when the older ticket already waits for this one, and nothing else changes.
+
+- Nothing to set. Skipped waits are logged once per pair (`not waiting for #m (same files): #m is blocked by this ticket (cycle)`) and counted in `forgehands_wait_cycles_broken_total`.
+- An explicit dependency cycle (A depends on B, B on A) is never broken automatically. It is logged once (`dependency cycle: ...`), counted as the idle reason `cycle` (`/status.json` `idle.reasons.cycle` and `cycles`, gauge `forgehands_idle_jobs{reason="cycle"}`), and it now raises the stall notification (`STALL_ALERT_MINUTES`, sent when `NOTIFY_IMMEDIATE` names `stalled`), which names the tickets. Break it by removing one of the dependencies in the forge.
+- Rollback: go back to 0.9.1. The same-files waits of the loop come back, and so do the deadlocks.
