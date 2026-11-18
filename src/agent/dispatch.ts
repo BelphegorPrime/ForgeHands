@@ -9,6 +9,7 @@ import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
+import { ReviewSweep } from './review-sweep.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
 import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '../notify/texts.ts';
@@ -117,6 +118,8 @@ export class Dispatcher {
   workspace: Workspace;
   /** Closes the tickets the forge has closed (LEDGER_SYNC_HOURS); off unless that is set. */
   ledgerSync: LedgerSync;
+  /** The reconciler of REVIEW_SWEEP_MINUTES: starts the review of a head that has none in the ledger. */
+  sweep: ReviewSweep;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   lastArchive = 0;
@@ -166,6 +169,7 @@ export class Dispatcher {
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
     this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket));
     this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
+    this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now);
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -1174,9 +1178,10 @@ export class Dispatcher {
     this.timer.unref?.();
     this.workspace.start();
     this.ledgerSync.start();
+    this.sweep.start();
     return this.tick();
   }
-  stop(): void { clearInterval(this.timer); this.workspace.stop(); this.ledgerSync.stop(); }
+  stop(): void { clearInterval(this.timer); this.workspace.stop(); this.ledgerSync.stop(); this.sweep.stop(); }
 
   // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
   // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.

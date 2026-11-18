@@ -146,6 +146,8 @@ export interface DirectConfig extends BaseConfig {
   quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
+  /** REVIEW_SWEEP_MINUTES (0 = off): how often a head without a review in the ledger is looked for and reviewed. See ReviewSweep. */
+  reviewSweepMinutes: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
   deleteAfterDays: number;
   /** The days after which a failed (or deleted) run's conversation goes: DELETE_FAILED_AFTER_DAYS, or DELETE_AFTER_DAYS when that is 0. */
