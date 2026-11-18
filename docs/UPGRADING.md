@@ -161,3 +161,12 @@ This is a feature release on top of 0.7.1. Two of the three changes are on by de
 - **Tokens are counted.** `forgehands_tokens_total{repository,tier,kind,type}` adds up the tokens of a run when its conversation ends, and each tier in `/status.json` has `tokens` for the last 7 days. Nothing to set. The cost stays what OpenHands reports, which is 0 for the gateway models.
 - **The ledger** gains `nudged`, `nudge_settled`, `tokens` and `tokens_seen` on a job. A 0.7.1 release ignores them, so rolling back is safe.
 - **Rollback.** Set `NUDGE_AT_PERCENT=0` and `STALL_ALERT_MINUTES=0` first, or go back to 0.7.1 directly.
+
+# Upgrading to the version after 0.8.0: the nudge waits for its answer in the background
+
+**Fix.** On a real run the nudge's message timed out after the normal 10 seconds (a message to a running conversation answers after the agent's current step) and was lost. From this version the nudge has its own timeout, `NUDGE_TIMEOUT_SECONDS` (default `180`, 10 to 600), it is sent in the background, and a timeout is checked in the events before the message is sent again.
+
+- Nothing to set. Any other value than an integer from 10 to 600 stops the start with `NUDGE_TIMEOUT_SECONDS must be an integer from 10 to 600`.
+- Resume is unchanged: its messages keep the normal timeout.
+- The log gains `nudge pending (timeout), checking the events` and `nudge confirmed in the events`. A nudge that never shows in the events is sent once more, then the run gets no further nudges (`the nudge was not delivered after 2 tries`).
+- Rollback: go back to 0.8.0. A pending nudge in the ledger (`nudge_pending`) is ignored there.

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { buildPrompt } from './prompt.ts';
 import { parseDeclaredFiles } from './files.ts';
 import { anyOverlap } from '../utils/path-overlap.ts';
@@ -44,6 +45,8 @@ const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
 // Nudge (NUDGE_AT_PERCENT): a run's actions are counted at most once a minute, and not before the run is three minutes old.
 const NUDGE_CHECK_EVERY_MS = 60000;
 const NUDGE_MIN_RUN_MS = 180000;
+// A nudge is sent at most this many times without a trace of it in the events (the first send and one resend after a timeout).
+const NUDGE_TRIES = 2;
 // The idle line is logged again after this long when nothing about the waiting work has changed (see reportIdle).
 const IDLE_LOG_EVERY_MS = 15 * 60000;
 // After a stall alert no other one for this long, unless nothing waits any more (see checkStall).
@@ -118,6 +121,8 @@ export class Dispatcher {
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
   nudgeChecks = new Map<string, number>(); // job id -> when the actions of its run were last counted (NUDGE_AT_PERCENT); in memory only
+  // job id -> the nudge being delivered in the background (see startNudge): the poll path never waits for a nudge; in memory only.
+  nudgeInflight = new Map<string, Promise<void>>();
   /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
   idle: IdleState | null = null;
   idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
@@ -976,7 +981,7 @@ export class Dispatcher {
 
   // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
   // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.
-  async api(method: string, path: string, body?: unknown, repository?: string): Promise<Response> {
+  async api(method: string, path: string, body?: unknown, repository?: string, timeoutMs = this.config.timeoutMs): Promise<Response> {
     if (isWrite(method) && isDry(this.config, repository)) {
       this.dry.record('OpenHands', method, path);
       return new Response('{}', { status: 200 });
@@ -985,7 +990,7 @@ export class Dispatcher {
       method,
       headers: { 'X-Session-API-Key': this.config.apiKey, 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(this.config.timeoutMs),
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: 'error'
     }).catch((error) => { metrics.apiError('openhands', null); throw error; });
     if (!response.ok) metrics.apiError('openhands', response.status);
@@ -1545,7 +1550,7 @@ export class Dispatcher {
       // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
       delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
       // The nudge is once per conversation too (see nudgeIfNoBranch).
-      delete job.nudged; delete job.nudge_settled; this.nudgeChecks.delete(job.id);
+      delete job.nudged; delete job.nudge_settled; delete job.nudge_pending; delete job.nudge_gave_up; this.nudgeChecks.delete(job.id);
       delete job.tokens_seen;
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
@@ -1739,9 +1744,10 @@ export class Dispatcher {
     for (const type of TOKEN_TYPES) if (delta[type] > 0) metrics.inc('forgehands_tokens_total', { ...labels, type }, delta[type]);
   }
 
-  // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it; shared by resume and the nudge.
-  async sendMessage(job: Job, text: string): Promise<void> {
-    const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, job.event.repository.full_name);
+  // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it (HTTP status in the message) or the call
+  // times out; shared by resume (the normal timeout) and the nudge (its own, longer timeout, see nudgeIfNoBranch).
+  async sendMessage(job: Job, text: string, timeoutMs?: number): Promise<void> {
+    const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, job.event.repository.full_name, timeoutMs);
     if (!response.ok) throw new Error('HTTP ' + response.status);
   }
 
@@ -1753,11 +1759,14 @@ export class Dispatcher {
     // Planner, epic and split routes are not workers: they plan, they do not push a branch of their own.
     const worker = !!route && route.kind === 'issue' && !job.event.pull_request && !job.event.bot && job.event.type !== 'epic.done'
       && !this.config.epicLabels.has(job.label) && job.label !== this.config.splitLabel;
-    if (!this.config.nudgeAtPercent || !worker || !this.config.forgejo || !job.started || !job.conversation_id || job.nudged !== undefined || job.nudge_settled) return false;
+    if (!this.config.nudgeAtPercent || !worker || !this.config.forgejo || !job.started || !job.conversation_id || job.nudged !== undefined || job.nudge_settled
+      || job.nudge_gave_up || this.nudgeInflight.has(job.id)) return false;
     if (now - job.started < NUDGE_MIN_RUN_MS) return false;
     const last = this.nudgeChecks.get(job.id);
     if (last !== undefined && now - last < NUDGE_CHECK_EVERY_MS) return false;
     this.nudgeChecks.set(job.id, now);
+    // A nudge that timed out earlier is resolved first (its marker is looked for), without counting again.
+    if (job.nudge_pending) { this.startNudge(job, { used: job.nudge_pending.used, max: job.nudge_pending.max }); return false; }
     const repository = job.event.repository.full_name;
     const number = job.event.issue.number;
     let used: number;
@@ -1777,16 +1786,79 @@ export class Dispatcher {
       return false;
     }
     if (pushed) { job.nudge_settled = true; return true; }
-    try {
-      await this.sendMessage(job, this.nudgeText(used, max, number));
-    } catch (error) {
-      this.logger.error(job.key + ': not nudged, the message was not sent (' + error.message + ')');
-      return false;
+    this.startNudge(job, { used, max });
+    return false;
+  }
+
+  // The nudge is delivered in the background: a message to a running conversation answers only after the agent's current step, so the poll
+  // path (and the dispatch loop with it) never waits for it. One delivery per job at a time (nudgeInflight); the ledger is written when it ends.
+  startNudge(job: Job, plan: { used: number; max: number }): void {
+    const flight = this.runNudge(job, plan)
+      .catch((error) => this.logger.error(job.key + ': nudge failed: ' + error.message))
+      .finally(() => {
+        this.nudgeInflight.delete(job.id);
+        this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
+      });
+    this.nudgeInflight.set(job.id, flight);
+  }
+
+  // Delivers the nudge once, with a marker in its text. A timeout does not say whether OpenHands stored the message (it may be queued behind the
+  // agent's step), so the events are read for the marker first; the message is sent again only when they do not hold it, and only NUDGE_TRIES
+  // times in all. A refusal (HTTP status: 409, 423, 429, ...) is not a delivery: the next look counts and tries again.
+  async runNudge(job: Job, plan: { used: number; max: number }): Promise<void> {
+    const number = job.event.issue.number;
+    const pending = job.nudge_pending ??= { marker: '[forgehands-nudge ' + randomUUID().slice(0, 8) + ']', tries: 0, used: plan.used, max: plan.max };
+    for (;;) {
+      if (pending.tries > 0) {
+        let stored: boolean;
+        try {
+          stored = await this.nudgeInEvents(job, pending.marker);
+        } catch (error) {
+          this.logger.error(job.key + ': nudge pending, the events could not be read (' + error.message + '), checking again on the next look');
+          return;
+        }
+        if (stored) {
+          this.logger.error(job.key + ': nudge confirmed in the events');
+          return this.nudgeDelivered(job, pending);
+        }
+        if (pending.tries >= NUDGE_TRIES) {
+          job.nudge_gave_up = true;
+          delete job.nudge_pending;
+          this.logger.error(job.key + ': the nudge was not delivered after ' + pending.tries + ' tries, no more nudges for this run');
+          return;
+        }
+      }
+      pending.tries += 1;
+      try {
+        await this.sendMessage(job, this.nudgeText(pending.used, pending.max, number) + ' ' + pending.marker, this.config.nudgeTimeoutMs);
+      } catch (error) {
+        // An answer with an HTTP status is a refusal: nothing was stored, and the next look tries again.
+        if (/^HTTP \d+$/.test(error.message)) {
+          delete job.nudge_pending;
+          this.logger.error(job.key + ': nudge refused (' + error.message + '), trying again on the next look');
+          return;
+        }
+        this.logger.error(job.key + ': nudge pending (timeout), checking the events');
+        continue;
+      }
+      return this.nudgeDelivered(job, pending);
     }
-    job.nudged = used;
-    metrics.inc('forgehands_nudges_total', { kind: route.kind });
-    this.logger.error(job.key + ': nudged at ' + used + '/' + max + ' actions, no branch yet');
-    return true;
+  }
+
+  // The nudge is in the conversation: the job is nudged once, and the count is kept.
+  nudgeDelivered(job: Job, pending: { used: number; max: number }): void {
+    job.nudged = pending.used;
+    delete job.nudge_pending;
+    metrics.inc('forgehands_nudges_total', { kind: 'issue' });
+    this.logger.error(job.key + ': nudged at ' + pending.used + '/' + pending.max + ' actions, no branch yet');
+  }
+
+  // Whether a user message with the marker is among the newest events of the conversation. Throws when the events cannot be read.
+  async nudgeInEvents(job: Job, marker: string): Promise<boolean> {
+    const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/search?limit=30&sort_order=TIMESTAMP_DESC', undefined, job.event.repository.full_name);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const items = ((await response.json()) as Json)?.items || [];
+    return items.some((item: Json) => item?.source !== 'agent' && JSON.stringify(item).includes(marker));
   }
 
   // The agent actions of a conversation so far: OpenHands' event count, restricted to ActionEvent. Throws when the count cannot be read.

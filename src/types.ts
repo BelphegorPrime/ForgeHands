@@ -164,6 +164,8 @@ export interface DirectConfig extends BaseConfig {
   nudgeAtPercent: number;
   /** NUDGE_MESSAGE: the text of the nudge instead of the default (null: the default). */
   nudgeMessage: string | null;
+  /** NUDGE_TIMEOUT_SECONDS in milliseconds: how long a nudge may take to be answered (a message to a running conversation waits for its agent step). */
+  nudgeTimeoutMs: number;
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
@@ -320,6 +322,10 @@ export interface Job {
   nudged?: number;
   /** The branch ai/issue-<n> exists, so the run needs no nudge: no more counting for this conversation. */
   nudge_settled?: boolean;
+  /** A nudge was sent and its answer is not known yet (a timeout): its marker is looked for in the events before any resend, `tries` counts the sends. */
+  nudge_pending?: { marker: string; tries: number; used: number; max: number };
+  /** The nudge was sent the maximum number of times without a trace in the events: no more nudges for this conversation. */
+  nudge_gave_up?: boolean;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
   /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */

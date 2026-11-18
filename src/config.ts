@@ -401,6 +401,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // push (once per run). 0 switches it off. NUDGE_MESSAGE replaces the text of that message.
     nudgeAtPercent: nudgePercentOf(env.NUDGE_AT_PERCENT),
     nudgeMessage: nudgeMessageOf(env.NUDGE_MESSAGE),
+    // NUDGE_TIMEOUT_SECONDS: a nudge is a message to a running conversation, which answers after the agent's current step: it gets this long.
+    nudgeTimeoutMs: nudgeTimeoutOf(env.NUDGE_TIMEOUT_SECONDS),
     // STALL_ALERT_MINUTES (0 = off): work waits on a quota, the disk or a limit and nothing has started for this long, so the human is told once.
     stallAlertMinutes: wholeOf(env.STALL_ALERT_MINUTES, 90, 'STALL_ALERT_MINUTES', 10080),
     // Notifications of ForgeHands' own (SMTP, webhook, digest) and whether the hand-over comments mention HUMAN_LOGIN, see src/notify.
@@ -457,6 +459,13 @@ function nudgePercentOf(value: string | undefined): number {
   if (value === undefined || value === '') return 65;
   if (!/^\d{1,2}$/.test(value) || Number(value) > 95) throw new Error('NUDGE_AT_PERCENT must be an integer from 0 (off) to 95');
   return Number(value);
+}
+
+// NUDGE_TIMEOUT_SECONDS: an integer from 10 to 600, default 180; returned in milliseconds.
+function nudgeTimeoutOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 180000;
+  if (!/^\d{1,3}$/.test(value) || Number(value) < 10 || Number(value) > 600) throw new Error('NUDGE_TIMEOUT_SECONDS must be an integer from 10 to 600');
+  return Number(value) * 1000;
 }
 
 // NUDGE_MESSAGE: the text of the nudge (unset or empty: the default text). At most 2000 characters.
