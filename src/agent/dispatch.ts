@@ -148,7 +148,8 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
-    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now);
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket));
+    this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -552,15 +553,73 @@ export class Dispatcher {
   }
 
   // The open issues the given issue depends on. Without Forgejo access, or when the call fails, none: the issue is not held back.
+  // A 404 here is not a read error: the ticket's own read tells a deleted ticket (its waiting jobs are dropped, and a job of it is `deleted` when the
+  // caller looks again) from a ticket without dependencies (nothing to wait for). Only a 404 of the ticket itself counts as deleted.
   async openDependencies(event: NormalizedEvent, number: number): Promise<number[]> {
     if (!this.config.forgejo) return [];
     try {
       const dependencies = await this.forge.dependencies(event.repository.full_name, number);
       return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => issue.number);
     } catch (error) {
+      if (/HTTP 404\b/.test(error.message) && !('pull_request' in event && event.pull_request)) {
+        await this.checkAndDropDeleted(event.repository.full_name, number);
+        return [];
+      }
       this.logger.error('could not read the dependencies of #' + number + ':', error.message);
       return [];
     }
+  }
+
+  // Whether the forge has no such issue: a 404 on GET /issues/{n}. Any other failure throws.
+  async ticketGone(repository: string, number: number): Promise<boolean> {
+    try {
+      await this.forge.getIssue(repository, number);
+      return false;
+    } catch (error) {
+      if (/HTTP 404\b/.test(error.message)) return true;
+      throw error;
+    }
+  }
+
+  // The ticket is checked and, when the forge says it is deleted, its waiting and queued jobs are dropped. Best effort: a failed read changes nothing.
+  async checkAndDropDeleted(repository: string, number: number): Promise<boolean> {
+    try {
+      if (!(await this.ticketGone(repository, number))) return false;
+    } catch (error) {
+      this.logger.error('could not check whether #' + number + ' of ' + repository + ' still exists:', error.message);
+      return false;
+    }
+    return this.dropDeleted(repository, number, false);
+  }
+
+  // A ticket (or, with `pull`, a pull request) is deleted in the forge: its waiting and queued jobs end as `deleted`, with no comment, no hand-over
+  // and no mail. An issue's jobs are closed on the status page too (archived_view); running jobs are left alone. One log line per ticket.
+  // Dry runs change nothing.
+  async dropDeleted(repository: string, number: number, pull: boolean): Promise<boolean> {
+    if (isDry(this.config, repository)) return false;
+    const name = repository.toLowerCase();
+    const ticket = name + '#' + number;
+    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued')
+      && job.event.repository.full_name.toLowerCase() === name
+      && (pull ? job.event.pull_request?.number === number : job.key.split(':')[0] === ticket));
+    if (!jobs.length) return false;
+    const now = this.now();
+    for (const job of jobs) {
+      Object.assign(job, { status: 'deleted', finished: now, result: 'deleted' });
+      delete job.waiting_for; delete job.waiting_for_files;
+    }
+    if (!pull) this.jobs.markClosed(ticket);
+    metrics.inc('forgehands_deleted_tickets_total');
+    this.logger.error(repository + (pull ? '!pr' : '#') + number + ': deleted in the forge, its waiting jobs are dropped');
+    await this.jobs.persist(now);
+    return true;
+  }
+
+  // The same for a ticket of the ledger ("repo#n" or "repo!pr<n>"), as the ledger sync names it.
+  async dropDeletedTicket(ticket: string): Promise<boolean> {
+    const match = /^(.+?)([#!])(?:pr)?(\d+)$/.exec(ticket);
+    if (!match) return false;
+    return this.dropDeleted(match[1], Number(match[3]), match[2] === '!');
   }
 
   // An issue closed: what depended on it may start now (a waiting job), and an epic whose last dependency this was is reviewed.
@@ -1486,6 +1545,8 @@ export class Dispatcher {
     // set): look again before a worker starts, so that the order the edges give is kept.
     if (this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && this.config.forgejo) {
       const open = await this.openDependencies(job.event, job.event.issue.number);
+      // The ticket was found deleted (and its jobs dropped): nothing starts for it.
+      if (job.status === 'deleted') return true;
       if (open.length) {
         Object.assign(job, { status: 'waiting', waiting_for: open });
         this.logger.error(job.key + ' waits for ' + open.map((number) => '#' + number).join(', ') + ' (dependencies added after it was queued)');

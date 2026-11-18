@@ -1086,7 +1086,9 @@ function fakeForgejo(routes) {
     const u = new URL(url);
     const body = request.body ? JSON.parse(request.body) : undefined;
     calls.push({ method: request.method, path: u.pathname, search: u.search, body });
-    const route = routes[request.method + ' ' + u.pathname];
+    let route = routes[request.method + ' ' + u.pathname];
+    // A ticket that is not routed exists and is open (a 404 of the ticket itself means it was deleted, see openDependencies).
+    if (route === undefined && request.method === 'GET' && /\/issues\/\d+$/.test(u.pathname)) route = { number: Number(u.pathname.split('/').pop()), state: 'open', labels: [] };
     if (route === undefined) return { ok: false, status: 404 };
     const value = typeof route === 'function' ? route(u, body) : route;
     if (value && value.__status) return { ok: false, status: value.__status };
@@ -3269,8 +3271,8 @@ test('a running job keeps its issue open on the page when the issue is closed', 
 test('the sweep marks tickets the forge reports closed, leaves open ones, and a forge error changes nothing', async () => {
   const { jobs, dispatcher, add } = await closedSetup({
     ['GET ' + API + '/issues/1']: issue(1, 'closed'),
-    ['GET ' + API + '/issues/2']: issue(2, 'open')
-    // issue 3 answers 404: the read fails
+    ['GET ' + API + '/issues/2']: issue(2, 'open'),
+    ['GET ' + API + '/issues/3']: { __status: 404 }, // the read fails
   });
   add(1, 'ai:ready', 'failed', { result: 'error' });
   add(2, 'ai:ready', 'failed', { result: 'max_iterations' });

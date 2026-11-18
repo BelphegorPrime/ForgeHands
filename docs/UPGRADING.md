@@ -170,3 +170,12 @@ This is a feature release on top of 0.7.1. Two of the three changes are on by de
 - Resume is unchanged: its messages keep the normal timeout.
 - The log gains `nudge pending (timeout), checking the events` and `nudge confirmed in the events`. A nudge that never shows in the events is sent once more, then the run gets no further nudges (`the nudge was not delivered after 2 tries`).
 - Rollback: go back to 0.8.0. A pending nudge in the ledger (`nudge_pending`) is ignored there.
+
+# Upgrading to the version after 0.8.1: tickets deleted in the forge leave the queue
+
+**Fix.** A ticket deleted in Forgejo kept its waiting jobs in the ledger: the dependency read answered 404 on every look, the log repeated the same line, and when its dependencies resolved a run would have started for a ticket that no longer exists. From this version a 404 of the ticket itself (not of its dependency list) drops its waiting and queued jobs.
+
+- Nothing to set. The jobs end with status `deleted` and the ticket shows as `deleted` on the status page, in the closed list. No comment is written, no human is called and no mail goes out.
+- Once per ticket the log says `<repo>#<n>: deleted in the forge, its waiting jobs are dropped`; the counter `forgehands_deleted_tickets_total` counts them.
+- The ledger sync now also reads tickets with waiting or queued jobs (running ones are still left to their run), within its usual 60 reads a pass. A 404 of a dependency list alone changes nothing.
+- Rollback: go back to 0.8.1. Jobs marked `deleted` are not waiting there, so they stay out of the queue.

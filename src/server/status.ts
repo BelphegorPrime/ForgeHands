@@ -158,6 +158,9 @@ const KIND_TEXT: Record<string, string> = {
   issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review'
 };
 
+// A ticket the forge reports deleted: some of its jobs were dropped for that, and none of its jobs is waiting, queued or running any more.
+const deletedTicket = (runs: Run[]): boolean => runs.some((run) => run.status === 'deleted') && !runs.some((run) => run.status === 'waiting' || run.status === 'queued' || run.status === 'running');
+
 // One line for the current state of an issue, from its newest relevant run.
 function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | null = null): string {
   const active = runs.find((run) => run.status === 'running' || run.status === 'queued');
@@ -208,7 +211,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
-      issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
+      issue: entry.key, title: entry.title, pr, rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last

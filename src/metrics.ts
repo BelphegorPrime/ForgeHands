@@ -30,6 +30,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_resumes_total: 'Runs that ended stuck, timed out or paused and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS, PAUSE_RESUMES).',
   forgehands_ledger_sync_closed_total: 'Tickets the ledger sync (LEDGER_SYNC_HOURS) found closed or merged in the forge and marked closed on the status page.',
   forgehands_tokens_total: 'Tokens of the agent runs, added up when the run ended, by repository, the tier it really ran on, route kind and type (prompt, completion, cache_read, reasoning).',
+  forgehands_deleted_tickets_total: 'Tickets or pull requests found deleted in the forge (a 404 on their own read); their waiting and queued jobs are dropped.',
   forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
   forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
@@ -49,7 +50,7 @@ const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from th
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
   'pull_request_approved', 'pull_request_rejected', 'pull_request_review_approved', 'pull_request_review_rejected', 'pull_request_review_comment',
   'Issue Hook', 'Merge Request Hook', 'Pipeline Hook', 'Push Hook'];
-const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed'];
+const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed', 'deleted'];
 const KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
 
 const escapeLabel = (value: string): string => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
