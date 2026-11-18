@@ -79,6 +79,7 @@ export function createApp(
       Date.now(),
       dispatcher!.dry,
       [...dispatcher!.reminder.waiting.values()],
+      dispatcher!.workspace.state(),
     );
   const authenticateStatus = (
     req: IncomingMessage,
@@ -174,6 +175,7 @@ export function createApp(
               dispatcher.jobs,
               dispatcher.cooldowns,
               Date.now(),
+              dispatcher.workspace.enabled ? dispatcher.workspace : null,
             ),
           ),
         );

@@ -5,6 +5,7 @@ import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
+import { Workspace } from './workspace.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, digestDue } from '../notify/digest.ts';
 import { digestMessage, immediateMessage } from '../notify/texts.ts';
@@ -61,6 +62,8 @@ export class Dispatcher {
   dry: DryLog;
   reminder: Reminder;
   notifier: Notifier;
+  /** The workspace cleanup and the disk guard (WORKSPACE_CLEANUP_DIR); off unless that is set. */
+  workspace: Workspace;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   lastArchive = 0;
@@ -88,6 +91,7 @@ export class Dispatcher {
     this.merger.notifier = this.notifier;
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
+    this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -909,9 +913,10 @@ export class Dispatcher {
     if (this.clearQuotaHolds()) await this.jobs.persist(this.now());
     this.timer = setInterval(() => this.tick().catch((error) => this.logger.error('dispatch failed:', error.message)), intervalMs);
     this.timer.unref?.();
+    this.workspace.start();
     return this.tick();
   }
-  stop(): void { clearInterval(this.timer); }
+  stop(): void { clearInterval(this.timer); this.workspace.stop(); }
 
   // Every OpenHands call passes here. A write of a dry run (DRY_RUN) is stopped: logged, never sent (the body can hold secrets, so it is not
   // logged), and answered with a stand-in. `repository` says whose dry run applies; without it any dry run does. Reads are real.
@@ -958,6 +963,8 @@ export class Dispatcher {
   async pass(): Promise<void> {
     let changed = false;
     const now = this.now();
+    // The disk guard is read first: a hold set here keeps the queued jobs waiting in the loop below.
+    await this.workspace.poll();
     for (const job of this.jobs.list('running')) {
       if (await this.poll(job, now)) changed = true;
     }
@@ -1330,6 +1337,8 @@ export class Dispatcher {
   }
 
   hasRoom(job: Job, now: number): boolean {
+    // Low disk space (DISK_MIN_FREE_GB): nothing new starts; running jobs are not touched.
+    if (this.workspace.holding) return false;
     const running = this.jobs.list('running');
     if (running.length >= this.config.maxConcurrent) return false;
     const effective = this.effectiveRoute(job, now).route;

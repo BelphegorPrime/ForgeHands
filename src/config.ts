@@ -1,4 +1,5 @@
 import { URL } from 'node:url';
+import { dirname, isAbsolute, normalize } from 'node:path';
 import { globToRegExp } from './utils/glob.ts';
 import { FORGES } from './forge/index.ts';
 import type { ForgeKind } from './types/forge.ts';
@@ -112,6 +113,38 @@ function archiveDays(value: string | undefined): number {
   const days = Number(value);
   if (!Number.isInteger(days) || days < 0 || days > 3650) throw new Error('ARCHIVE_AFTER_DAYS must be an integer between 0 and 3650');
   return days;
+}
+
+// WORKSPACE_CLEANUP_DIR: the host directory the OpenHands workspace is mounted from, as this container sees it. Empty switches the cleanup
+// off. It must be an absolute path that is not the root: a cleanup that deletes below "/" would be a disaster, so that is a start error.
+export function cleanupDirOf(value: string | undefined): string | null {
+  const text = (value ?? '').trim();
+  if (!text) return null;
+  if (!isAbsolute(text)) throw new Error('WORKSPACE_CLEANUP_DIR must be an absolute path (the directory as this container sees it), got a relative one');
+  const dir = normalize(text).replace(/(.)\/+$/, '$1');
+  if (dirname(dir) === dir) throw new Error('WORKSPACE_CLEANUP_DIR must not be the root directory');
+  return dir;
+}
+
+// Hours of the cleanup settings: a number of hours, 0 included, at most a year.
+function hoursOf(value: string | undefined, fallback: number, name: string): number {
+  if (value === undefined || value === '') return fallback;
+  const hours = Number(value);
+  if (!Number.isFinite(hours) || hours < 0 || hours > 8760) throw new Error(name + ' must be a number of hours between 0 and 8760');
+  return hours;
+}
+
+// DISK_WARN_PERCENT (an integer from 0 to 100, 0 = off) and DISK_MIN_FREE_GB (a number of gigabytes, 0 = off).
+function diskPercentOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 85;
+  if (!/^\d{1,3}$/.test(value) || Number(value) > 100) throw new Error('DISK_WARN_PERCENT must be an integer between 0 and 100');
+  return Number(value);
+}
+function diskFreeGbOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 3;
+  const gb = Number(value);
+  if (!Number.isFinite(gb) || gb < 0 || gb > 100000) throw new Error('DISK_MIN_FREE_GB must be a number of gigabytes between 0 and 100000');
+  return gb;
 }
 
 function remindDays(value: string | undefined): number {
@@ -285,6 +318,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     changesLabel: [...routes].find(([, route]) => route.kind === 'pull_request')?.[0] || 'ai:changes',
     agentSecrets,
     workspaceDir: env.WORKSPACE_DIR || '/projects',
+    // The cleanup of the workspace (README: Cleaning the workspace). Off unless WORKSPACE_CLEANUP_DIR names the mounted directory.
+    workspaceCleanupDir: cleanupDirOf(env.WORKSPACE_CLEANUP_DIR),
+    workspaceCleanupDry: switchOff(env.WORKSPACE_CLEANUP_DRY, 'WORKSPACE_CLEANUP_DRY'),
+    workspaceKeepHours: hoursOf(env.WORKSPACE_KEEP_HOURS, 12, 'WORKSPACE_KEEP_HOURS'),
+    workspaceKeepFailedHours: hoursOf(env.WORKSPACE_KEEP_FAILED_HOURS, 72, 'WORKSPACE_KEEP_FAILED_HOURS'),
+    workspaceOrphanHours: hoursOf(env.WORKSPACE_ORPHAN_HOURS, 48, 'WORKSPACE_ORPHAN_HOURS'),
+    // Disk guard, measured on the filesystem of WORKSPACE_CLEANUP_DIR: a warning notification at DISK_WARN_PERCENT, and no new run below DISK_MIN_FREE_GB.
+    diskWarnPercent: diskPercentOf(env.DISK_WARN_PERCENT),
+    diskMinFreeGb: diskFreeGbOf(env.DISK_MIN_FREE_GB),
     maxConcurrent: positiveInt(env.MAX_CONCURRENT, 4, 'MAX_CONCURRENT', 100),
     maxConcurrentPerTier: positiveInt(env.MAX_CONCURRENT_PER_TIER, 2, 'MAX_CONCURRENT_PER_TIER', 100),
     // Which repository gets the next free slot: weights per repository (JSON object, default 1), see Dispatcher.pickNext.

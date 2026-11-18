@@ -13,7 +13,8 @@ export type { Channel, Notification } from './channel.ts';
 
 export const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000];
 const MAX_PENDING = 100;
-const KINDS = [...NOTIFY_KINDS, 'digest'];
+// The disk warning (DISK_WARN_PERCENT) is not a kind of NOTIFY_IMMEDIATE: it is sent whenever a channel exists, at most once a day.
+const KINDS = [...NOTIFY_KINDS, 'digest', 'disk_full'];
 
 /** What the rest of ForgeHands needs of a notifier: is this kind wanted, and send it (`repository` says whose dry run applies). */
 export interface Notify {
@@ -54,7 +55,7 @@ export class Notifier implements Notify {
 
   // Is a message of this kind to be sent at all? The digest is switched by NOTIFY_DIGEST, the rest by NOTIFY_IMMEDIATE.
   wants(kind: string): boolean {
-    return this.channels.length > 0 && (kind === 'digest' || this.immediate.has(kind));
+    return this.channels.length > 0 && (kind === 'digest' || kind === 'disk_full' || this.immediate.has(kind));
   }
 
   // Fire and forget: returns at once, never throws.
