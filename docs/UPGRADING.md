@@ -182,6 +182,16 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - The log gains `nudge pending (timeout), checking the events` and `nudge confirmed in the events`. A nudge that never shows in the events is sent once more, then the run gets no further nudges (`the nudge was not delivered after 2 tries`).
 - Rollback: go back to 0.8.0. A pending nudge in the ledger (`nudge_pending`) is ignored there.
 
+# Upgrading to the next version: old conversations are deleted in OpenHands
+
+**New, off by default.** Archiving tags a run, but OpenHands keeps the conversation on disk, so its data directory grows every day. `DELETE_AFTER_DAYS` (default `0`, off) lets ForgeHands delete the conversation of an archived run that ended that many days ago. Set `ARCHIVE_AFTER_DAYS` as well: only archived runs are deleted.
+
+- **What is lost.** The trajectory and events of the deleted runs, in OpenHands. The ledger keeps every run with its result, cost and tokens, and the token and cost metrics stay.
+- **Failed runs** may keep their conversation longer: `DELETE_FAILED_AFTER_DAYS` (default `0`, the same value). It must not be lower than `DELETE_AFTER_DAYS`.
+- **Round size.** At most 40 deletions per hourly round. A large backlog goes down over a few rounds.
+- **What you should check.** Whether OpenHands removes the conversation's directory on disk when it is deleted: compare `du -sh` of its data directory and the count at `/api/conversations/count` before and after the first round. The first round logs `conversations: N deleted, M kept`.
+- **Rollback.** Set `DELETE_AFTER_DAYS=0`. Deleted conversations do not come back; the ledger and the status page keep working without them.
+
 # Upgrading to the next version: a comment answers a planner
 
 **Behaviour change.** A planner that asked its questions as comments and finished without sub-issues used to get no reaction to the operator's answers. Now a comment of `HUMAN_LOGIN` on such an issue starts the planner again (see README, "A comment answers a planner without sub-issues").
