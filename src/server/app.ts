@@ -20,6 +20,7 @@ import type {
 } from "../types.ts";
 import type { DeliveryStore } from "../store/deliveries.ts";
 import type { Dispatcher } from "../agent/dispatch.ts";
+import type { E2eController } from "../e2e/controller.ts";
 
 const json = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, {
@@ -67,14 +68,15 @@ export function createApp(
   send: Fetch = fetch,
   logger: Logger = console,
   dispatcher: Dispatcher | null = null,
+  e2e: E2eController | null = null,
 ): Server {
   if (config.mode === "direct" && !dispatcher)
     throw new Error("direct mode needs a dispatcher");
   // Only the webhook half of the forge is used here: the signature check and the event normalization.
   const forge = createForge(config, createTransport(config, send));
   // all: closed tickets older than STATUS_HIDE_DAYS are listed too (the query ?all=1 of the status page and /status.json).
-  const status = (all = false) =>
-    buildStatus(
+  const status = (all = false) => ({
+    ...buildStatus(
       config as DirectConfig,
       dispatcher!.jobs,
       Date.now(),
@@ -82,7 +84,9 @@ export function createApp(
       [...dispatcher!.reminder.waiting.values()],
       dispatcher!.workspace.state(),
       { all, idle: dispatcher!.idleState() },
-    );
+    ),
+    e2e: e2e?.state() ?? null,
+  });
   const authenticateStatus = (
     req: IncomingMessage,
     res: ServerResponse,
@@ -173,8 +177,8 @@ export function createApp(
           "cache-control": "no-store",
         });
         return res.end(
-          metrics.render(
-            gaugeSamples(
+          metrics.render([
+            ...gaugeSamples(
               config as DirectConfig,
               dispatcher.jobs,
               dispatcher.cooldowns,
@@ -182,7 +186,8 @@ export function createApp(
               dispatcher.workspace.enabled ? dispatcher.workspace : null,
               dispatcher.idleState(),
             ),
-          ),
+            ...(e2e?.gauges() ?? []),
+          ]),
         );
       }
       const snapshot = status(showAll);
@@ -192,6 +197,16 @@ export function createApp(
         "cache-control": "no-store",
       });
       return res.end(renderStatus(snapshot));
+    }
+    // The end-to-end suite on demand (E2E_REPO). It changes a test repository, so it takes only the bearer token of STATUS_TOKEN (never the
+    // session cookie of the status page, which another site could ride on), and it does not exist without that token.
+    if (req.method === "POST" && req.url?.split("?")[0] === "/e2e/run") {
+      if (!e2e?.repository) return json(res, 404, { error: "not_found" });
+      if (!config.statusToken) return json(res, 403, { error: "status_token_required" });
+      if (!hasToken(req.headers.authorization, config.statusToken)) return json(res, 401, { error: "unauthorized" });
+      const started = e2e.start("manual");
+      if (started.status === "started") return json(res, 202, { status: "started", scenarios: started.scenarios });
+      return json(res, 409, { status: started.status });
     }
     if (req.method !== "POST" || req.url !== forge.webhookPath) {
       return json(res, 404, { error: "not_found" });

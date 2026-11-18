@@ -2,6 +2,7 @@
 export type Json = any;
 
 import type { ForgeKind } from './types/forge.ts';
+import type { ScenarioResult } from './e2e/runner.ts';
 
 export type Fetch = typeof fetch;
 
@@ -202,9 +203,33 @@ export interface DirectConfig extends BaseConfig {
   epicLabels: Set<string>;
   pollMs: number;
   jobsFile: string;
+  /** The end-to-end suite (E2E_*): off unless `e2e.repository` names a test repository. See src/e2e. */
+  e2e: E2eConfig;
+}
+
+/** E2E_REPO, E2E_ON_START, E2E_SCENARIOS, E2E_TIMEOUT_MINUTES. A null repository switches the suite off. */
+export interface E2eConfig {
+  repository: string | null;
+  /** E2E_ON_START=1: run the suite once after a start whose version differs from the last recorded e2e version. */
+  onStart: boolean;
+  /** E2E_SCENARIOS: the names to run; null means every scenario that is not experimental. */
+  scenarios: string[] | null;
+  /** E2E_TIMEOUT_MINUTES: the time one scenario may take, cleanup not included. */
+  timeoutMinutes: number;
 }
 
 export type Config = WebhookConfig | DirectConfig;
+
+/** The last end-to-end run, kept in the ledger (meta.e2e): its ForgeHands version, what started it and the result of each scenario. */
+export interface E2eRecord {
+  version: string;
+  trigger: 'start' | 'manual';
+  started: number;
+  finished: number;
+  /** Set when the suite could not run at all (the scenarios are then not in `results`). */
+  error: string | null;
+  results: ScenarioResult[];
+}
 
 export interface RepositoryInfo {
   full_name: string;

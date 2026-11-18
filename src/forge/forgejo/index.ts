@@ -3,7 +3,7 @@ import { DryLog, isDry, isWrite } from '../../dry.ts';
 import { normalizeEvent } from '../../webhook/events.ts';
 import { deliveryId, verifyForgejoSignature } from '../../webhook/security.ts';
 import type { Config, Fetch, ForgejoAccess, Json } from '../../types.ts';
-import type { AgentApi, ChangedFile, Comment, CommitStatus, Compare, Forge, ForgeKind, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from '../../types/forge.ts';
+import type { AgentApi, BranchRef, ChangedFile, Comment, CommitStatus, Compare, FileAt, FileDelete, FileWrite, Forge, ForgeKind, Issue, Label, ListPullsOptions, MergeOptions, PullRequest, Review, ReviewVerdict, Transport, UpdateBranchResult } from '../../types/forge.ts';
 
 export interface ForgejoConfig { forgejo?: ForgejoAccess | null; timeoutMs: number; dryRun: Config['dryRun']; dryRunRepos: Config['dryRunRepos'] }
 
@@ -179,4 +179,45 @@ export class ForgejoForge implements Forge {
     await this.call(repository, 'POST', '/issues/' + number + '/labels', { labels: labels.map((label) => label.id) });
   }
   async removeLabel(repository: string, number: number, label: Label): Promise<void> { await this.call(repository, 'DELETE', '/issues/' + number + '/labels/' + label.id); }
+
+  // The end-to-end suite's fixtures (see Forge): a test repository's tickets, branches and files.
+  async getRepository(repository: string): Promise<{ default_branch: string }> {
+    const info = await this.call(repository, 'GET', '');
+    return { default_branch: String(info?.default_branch || '') };
+  }
+  createIssue(repository: string, title: string, body: string): Promise<Issue> { return this.call(repository, 'POST', '/issues', { title, body }); }
+  // Pages of 50 until a short page; ten pages at most, which is far more branches than a test repository keeps.
+  async listBranches(repository: string): Promise<BranchRef[]> {
+    const branches: BranchRef[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const list: Json = await this.call(repository, 'GET', '/branches?limit=50&page=' + page);
+      const entries = Array.isArray(list) ? list : [];
+      for (const entry of entries) branches.push({ name: String(entry?.name || ''), sha: String(entry?.commit?.id || '') });
+      if (entries.length < 50) break;
+    }
+    return branches;
+  }
+  async deleteBranch(repository: string, branch: string): Promise<void> { await this.call(repository, 'DELETE', '/branches/' + encodeURIComponent(branch)); }
+  // A missing file is an ordinary answer of the contents API (the 404 is not counted as an error).
+  async readFile(repository: string, path: string, ref: string): Promise<FileAt | null> {
+    let entry: Json;
+    try { entry = await this.call(repository, 'GET', '/contents/' + encodePath(path) + '?ref=' + encodeURIComponent(ref)); }
+    catch (error) {
+      if (/HTTP 404\b/.test(error.message)) return null;
+      throw error;
+    }
+    if (!entry || entry.type !== 'file') return null;
+    return { sha: String(entry.sha), content: String(entry.content || '') };
+  }
+  // Create (POST) when there is no blob id, update (PUT) when there is one.
+  async writeFile(repository: string, path: string, { message, branch, content, sha }: FileWrite): Promise<void> {
+    const body = { content, message, branch, ...(sha ? { sha } : {}) };
+    await this.call(repository, sha ? 'PUT' : 'POST', '/contents/' + encodePath(path), body);
+  }
+  async deleteFile(repository: string, path: string, { message, branch, sha }: FileDelete): Promise<void> {
+    await this.call(repository, 'DELETE', '/contents/' + encodePath(path), { message, branch, sha });
+  }
 }
+
+// Each segment of a repository path is encoded, the slashes between them are kept.
+function encodePath(path: string): string { return path.split('/').map((segment) => encodeURIComponent(segment)).join('/'); }
