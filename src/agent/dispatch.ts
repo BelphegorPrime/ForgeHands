@@ -18,6 +18,7 @@ import { isBotPull } from './bot.ts';
 import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
+import { cycleText, findCycles, reaches, ticketKey, waitGraph } from './waits.ts';
 
 // `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
@@ -89,7 +90,8 @@ function idleLine(reasons: IdleCounts, tiers: string[]): string {
   return 'idle: ' + total + ' waiting: ' + reasons.dependencies + ' on dependencies, ' + reasons.files + ' on files of older tickets, '
     + reasons.quota + ' held (quota ' + (tiers.join('/') || 'none') + '), ' + reasons.disk + ' held (low disk), '
     + reasons.hourly + ' over the hourly limit, ' + reasons.concurrency + ' over a concurrency limit'
-    + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '');
+    + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '')
+    + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '');
 }
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
@@ -127,6 +129,9 @@ export class Dispatcher {
   /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
   idle: IdleState | null = null;
   idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
+  // Same-files waits not taken ("repo#j>repo#t") and dependency cycles logged: each once, in memory.
+  cyclePairs = new Set<string>();
+  cyclesLogged = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
   stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
@@ -1219,6 +1224,7 @@ export class Dispatcher {
     for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
       if (await this.releaseDeferred(job, now)) changed = true;
     }
+    if (this.breakWaitCycles()) changed = true;
     // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
     const tried = new Set<string>();
     let started = 0;
@@ -1423,7 +1429,55 @@ export class Dispatcher {
       this.logger.error('could not compare the files of #' + number + ' with the open work, it is not held back:', error.message);
       return [];
     }
-    return [...blockers].sort((a, b) => a - b);
+    // A blocker that already waits for this ticket (explicit dependencies and the waits in force) would make a cycle: it is not waited for.
+    const graph = waitGraph(this.jobs.list(), true);
+    const me = repository.toLowerCase() + '#' + number;
+    return [...blockers].sort((a, b) => a - b).filter((other) => {
+      const key = repository.toLowerCase() + '#' + other;
+      if (!reaches(graph, key, me)) return true;
+      this.noteCycle(me, key);
+      return false;
+    });
+  }
+
+  // A same-files wait that closes a cycle is not taken: the older ticket already waits for this one, through explicit dependencies or other waits in
+  // force. Logged and counted once per pair (`waiting` is a ticket key, `other` the older one).
+  noteCycle(waiting: string, other: string): void {
+    const pair = waiting + '>' + other;
+    if (this.cyclePairs.has(pair)) return;
+    this.cyclePairs.add(pair);
+    metrics.inc('forgehands_wait_cycles_broken_total');
+    const number = other.split('#')[1];
+    this.logger.error(waiting + ': not waiting for #' + number + ' (same files): #' + number + ' is blocked by this ticket (cycle)');
+  }
+
+  // The waits in force are read from the ledger (no forge read): a same-files wait that closes a cycle is dropped, the explicit dependencies never. A job
+  // left with no wait is queued again. True when something changed.
+  breakWaitCycles(): boolean {
+    if (!this.config.waitForSameFiles) return false;
+    const graph = waitGraph(this.jobs.list(), true);
+    let changed = false;
+    for (const job of this.jobs.list('waiting')) {
+      if (!job.waiting_for_files?.length || job.waiting_for?.length || job.waiting_for_run || job.event.bot || job.event.pull_request) continue;
+      const me = ticketKey(job);
+      const repository = job.event.repository.full_name.toLowerCase();
+      const kept = job.waiting_for_files.filter((number) => {
+        const other = repository + '#' + number;
+        if (!reaches(graph, other, me)) return true;
+        this.noteCycle(me, other);
+        return false;
+      });
+      if (kept.length === job.waiting_for_files.length) continue;
+      changed = true;
+      graph.set(me, new Set(kept.map((number) => repository + '#' + number)));
+      if (kept.length) job.waiting_for_files = kept;
+      else {
+        job.status = 'queued';
+        delete job.waiting_for_files;
+        this.logger.error(job.key + ' no longer waits for the files of older tickets (cycle)');
+      }
+    }
+    return changed;
   }
 
   // Look again at the jobs that wait for the same files and queue those whose older tickets are gone. Called when something may have
@@ -1663,12 +1717,16 @@ export class Dispatcher {
   // open issues (and a CI result kept while its run goes on) is a dependency wait; a ticket that shares files with an older one is a files wait; a queued
   // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
   // and is not counted.
-  idleCounts(now: number): { reasons: IdleCounts; tiers: string[] } {
-    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0 };
+  idleCounts(now: number): { reasons: IdleCounts; tiers: string[]; cycles: string[] } {
+    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0 };
     const tiers = new Set<string>();
+    // Explicit dependencies only: a cycle of them is not broken by ForgeHands (the planner or a human made it), so its jobs wait for ever.
+    const cycles = findCycles(waitGraph(this.jobs.list(), false));
+    const inCycle = new Set(cycles.flat());
     for (const job of this.jobs.list(true)) {
       if (job.status === 'waiting') {
-        if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
+        if (job.waiting_for?.length && inCycle.has(ticketKey(job))) reasons.cycle += 1;
+        else if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
         else if (job.waiting_for_files?.length) reasons.files += 1;
         continue;
       }
@@ -1678,19 +1736,25 @@ export class Dispatcher {
       reasons[hold.reason] += 1;
       if (hold.tier) tiers.add(hold.tier);
     }
-    return { reasons, tiers: [...tiers].sort() };
+    return { reasons, tiers: [...tiers].sort(), cycles: cycles.map(cycleText) };
   }
 
   // The idle line of a pass in which something waits and nothing could start (`started` is the number of jobs this pass started). It is logged
   // when its composition changes and at most every 15 minutes otherwise; the same numbers are on /status.json and in the idle gauge.
   reportIdle(now: number, started: number): void {
-    const { reasons, tiers } = this.idleCounts(now);
+    const { reasons, tiers, cycles } = this.idleCounts(now);
     const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
+    // A dependency cycle is logged once, when it is found.
+    for (const text of cycles) {
+      if (this.cyclesLogged.has(text)) continue;
+      this.cyclesLogged.add(text);
+      this.logger.error(text + ', none of its tickets can start: a human has to break it');
+    }
     if (started) this.idleLogged = null;
     if (started || !total) this.idle = null;
     if (!total) { this.stallAlertAt = null; this.idleLogged = null; }
     if (started || !total) return;
-    this.idle = { since: this.idle?.since ?? now, reasons, tiers };
+    this.idle = { since: this.idle?.since ?? now, reasons, tiers, cycles };
     const key = JSON.stringify([reasons, tiers]);
     if (this.idleLogged?.key === key && now - this.idleLogged.at < IDLE_LOG_EVERY_MS) return;
     this.idleLogged = { key, at: now };
@@ -1707,15 +1771,16 @@ export class Dispatcher {
   checkStall(now: number): void {
     const minutes = this.config.stallAlertMinutes;
     if (!minutes || !this.idle) return;
-    const { reasons, tiers } = this.idle;
-    if (!(reasons.quota + reasons.disk + reasons.hourly + reasons.concurrency + reasons.could_start)) return;
+    const { reasons, tiers, cycles } = this.idle;
+    // A dependency cycle is not a normal chain: its jobs count as a hold too (the notification names the tickets).
+    if (!(reasons.quota + reasons.disk + reasons.hourly + reasons.concurrency + reasons.could_start + reasons.cycle)) return;
     if (this.jobs.list('running').length || now - this.lastStart < minutes * 60000) return;
     if (this.stallAlertAt !== null && now - this.stallAlertAt < STALL_REPEAT_MS) return;
     if (!this.notifier.wants('stalled')) return;
     this.stallAlertAt = now;
     const quiet = Math.round((now - this.lastStart) / 60000);
     this.logger.error('stall alert: nothing has started for ' + quiet + ' min and no run is running. ' + idleLine(reasons, tiers));
-    this.notifier.notify(stallMessage(this.config.notify.language, { minutes: quiet, reasons, tiers }));
+    this.notifier.notify(stallMessage(this.config.notify.language, { minutes: quiet, reasons, tiers, cycles }));
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {

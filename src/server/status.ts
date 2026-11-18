@@ -40,7 +40,7 @@ export interface Status {
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
   // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
-  idle?: { since: string; reasons: IdleCounts; quota_tiers: string[] };
+  idle?: { since: string; reasons: IdleCounts; quota_tiers: string[]; cycles: string[] };
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -250,7 +250,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     hidden,
     waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
     workspace,
-    ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers } } : {})
+    ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers, cycles: options.idle.cycles } } : {})
   };
 }
 
