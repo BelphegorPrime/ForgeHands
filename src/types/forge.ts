@@ -183,6 +183,8 @@ export interface Forge {
   // Issues
   getIssue(repository: string, number: number): Promise<Issue>;
   closeIssue(repository: string, number: number): Promise<void>;
+  /** Opens a closed issue again (REVERT_RETRIES). */
+  reopenIssue(repository: string, number: number): Promise<void>;
   /** Issues `number` depends on. */
   dependencies(repository: string, number: number): Promise<Issue[]>;
   /** Issues that depend on `number`. */

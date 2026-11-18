@@ -26,6 +26,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_workspace_cleaned_total: 'Clone directories of the workspace deleted by the cleanup (WORKSPACE_CLEANUP_DIR).',
   forgehands_notifications_total: 'Notifications to the human by channel, kind (handover, blocked, conflict, failed, reminder, digest, disk_full) and result (sent, failed, dry).',
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
+  forgehands_revert_retries_total: 'Tickets started again after their change was reverted for turning the default branch red (REVERT_RETRIES).',
   forgehands_review_sweep_starts_total: 'Reviews started by the review sweep for a head that had none in the ledger (REVIEW_SWEEP_MINUTES).',
   forgehands_conversations_deleted_total: 'Conversations deleted in OpenHands after DELETE_AFTER_DAYS (the ledger keeps the runs).',
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
