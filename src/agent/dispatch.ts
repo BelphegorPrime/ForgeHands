@@ -237,6 +237,9 @@ export class Dispatcher {
   // decides, so the event itself is only a trigger. A rejection starts the next round, once the reviews of the head commit say so too: a
   // review of somebody who may not request changes (a stranger, an outdated commit) starts nothing.
   async onReview(event: ForgeEvent, approved: boolean): Promise<string> {
+    // The review of HUMAN_LOGIN in comment mode (HUMAN_REVIEW_ROUNDS, see onHumanReview). Nobody else's review is an event in comment mode.
+    if (event.review?.human) return this.onHumanReview(event);
+    if (event.type === 'pull_request.review_comment') return 'ignored_review';
     if (approved) return this.merger.handle(event);
     if (!this.config.forgejo || !event.pull_request) return 'no_forgejo_access';
     const repository = event.repository.full_name;
@@ -249,6 +252,11 @@ export class Dispatcher {
       this.logger.error('could not check the review of #' + event.pull_request.number + ':', error.message);
       return 'review_unreadable';
     }
+    return this.startChangesRound(event);
+  }
+
+  // The changes round of a pull request, as the changes label starts it. A bot's pull request gets none without BOT_FIX_ROUNDS: a human is called.
+  async startChangesRound(event: ForgeEvent): Promise<string> {
     // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a human has to look at it.
     if (event.bot && !this.config.botFixRounds) {
       await this.markForHuman(event, 'ForgeHands: a review asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
@@ -256,6 +264,43 @@ export class Dispatcher {
     }
     if (!this.config.routes.get(this.config.changesLabel) || this.config.routes.get(this.config.changesLabel)!.kind !== 'pull_request') return 'no_round_route';
     return (await this.enqueueOne({ ...event, label: this.config.changesLabel })).status;
+  }
+
+  // HUMAN_REVIEW_ROUNDS in comment mode: a review of HUMAN_LOGIN on an agent pull request (see normalizeReview). His request for changes on the
+  // head commit starts the changes round, as the changes label does (humanTookOver applies: his action starts the rounds again). An approval or a
+  // comment starts nothing and merges nothing: the merge stays driven by the label and the verdict. Anything unclear starts nothing.
+  async onHumanReview(event: ForgeEvent): Promise<string> {
+    if (event.type !== 'pull_request.review_rejected') return 'human_review_no_round';
+    if (!this.config.forgejo || !event.pull_request) return 'no_forgejo_access';
+    const repository = event.repository.full_name;
+    const number = event.pull_request.number;
+    const human = String(this.config.humanLogin || '').toLowerCase();
+    let sha: string;
+    try {
+      const pr = await this.forge.getPull(repository, number);
+      if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
+      sha = pr.head.sha;
+      // Only his request on the head commit counts: a review of an older commit, or one he has since replaced, says nothing about the head.
+      if (!(await this.merger.nativeReviews(repository, number, sha)).changes.includes(human)) return 'ignored_review';
+    } catch (error) {
+      this.logger.error('could not check the review of #' + number + ':', error.message);
+      return 'review_unreadable';
+    }
+    const review = { ...event.review, reviewer: event.review?.reviewer ?? null, commit: sha };
+    // One round per review and head commit: the same review again (a redelivery under another delivery id) starts nothing. The ledger keeps it.
+    const base = this.issueKey(event) + ':';
+    if (this.jobs.list().some((job) => job.key.startsWith(base) && job.event.review?.human === true && job.event.review.id === review.id && job.event.review.commit === sha)) return 'duplicate_review';
+    // The approval was given for a commit that is now rejected: it comes off (best effort; the next green commit is reviewed again as usual).
+    try {
+      const approved = ((await this.forge.labelsOf(repository, number)) || []).find((label) => label.name === this.config.approvedLabel);
+      if (approved) {
+        await this.forge.removeLabel(repository, number, approved);
+        this.logger.error(this.issueKey(event) + ': ' + human + ' asked for changes, ' + this.config.approvedLabel + ' is taken off');
+      }
+    } catch (error) {
+      this.logger.error('could not take ' + this.config.approvedLabel + ' off #' + number + ':', error.message);
+    }
+    return this.startChangesRound({ ...event, review });
   }
 
   // A comment of HUMAN_LOGIN on an open issue starts the last run of that issue again when that run failed or was handed to the human. The label of

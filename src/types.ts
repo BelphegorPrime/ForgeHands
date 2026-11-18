@@ -132,6 +132,8 @@ export interface DirectConfig extends BaseConfig {
   humanLogin: string | null;
   /** COMMENT_RESTARTS: how often a comment of HUMAN_LOGIN may start a failed or handed-over run again, per issue and label; 0 switches it off. */
   commentRestarts: number;
+  /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
+  humanReviewRounds: boolean;
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
@@ -199,7 +201,7 @@ export interface ForgeEvent extends BaseEvent {
   epic?: { children: { number: number; title: string }[] };
   base_sha?: string;
   /** A native review (VERDICT_SOURCE review or both) that triggered this event: who wrote it. */
-  review?: { reviewer: string | null };
+  review?: { reviewer: string | null; human?: boolean; id?: string; commit?: string };
   /** The changed files that match the deny list of the merge policy (security review runs only). */
   protected_files?: string[];
   /** A comment of HUMAN_LOGIN that started this run again (COMMENT_RESTARTS): the comment's id and its author. */

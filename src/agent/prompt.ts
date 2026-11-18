@@ -162,7 +162,7 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
       clone, never,
       'Do this, in order:',
       '1. Check out the branch ' + pr.head_ref + ' of the pull request.',
-      '2. Read what was said: ' + reading + '. ' + issueRead,
+      '2. Read what was said: ' + reading + '. ' + issueRead + ' The reviewer who asks for changes may have written earlier reviews of this pull request as well (an approval or a comment review, with inline review comments): read every review of that reviewer that is newer than the last round, and all of its inline review comments, since each of them can carry a request.',
       trust,
       '3. Fix what the trusted reviews and comments ask for and nothing beyond it. Run the checks the repository documents.',
       '4. Push to the SAME branch ' + pr.head_ref + '. Never open another pull request or branch for this issue.',
