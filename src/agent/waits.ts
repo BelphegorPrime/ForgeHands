@@ -25,20 +25,6 @@ export function waitGraph(jobs: Job[], files: boolean): WaitGraph {
   return graph;
 }
 
-// Whether `to` can be reached from `from` by following the waits. Breadth first; the graph is small.
-export function reaches(graph: WaitGraph, from: string, to: string): boolean {
-  const seen = new Set([from]);
-  const queue = [from];
-  for (let i = 0; i < queue.length; i += 1) {
-    const node = queue[i];
-    if (node === to) return true;
-    for (const next of graph.get(node) ?? []) {
-      if (!seen.has(next)) { seen.add(next); queue.push(next); }
-    }
-  }
-  return false;
-}
-
 // The cycles of the graph (strongly connected parts with a way back), each as the walk of its tickets that returns to the first one.
 export function findCycles(graph: WaitGraph): string[][] {
   let counter = 0;

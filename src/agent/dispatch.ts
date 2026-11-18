@@ -18,7 +18,7 @@ import { isBotPull } from './bot.ts';
 import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
-import { cycleText, findCycles, reaches, ticketKey, waitGraph } from './waits.ts';
+import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
 
 // `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
@@ -53,6 +53,10 @@ const NUDGE_TRIES = 2;
 const IDLE_LOG_EVERY_MS = 15 * 60000;
 // After a stall alert no other one for this long, unless nothing waits any more (see checkStall).
 const STALL_REPEAT_MS = 6 * 3600000;
+// The open dependencies of a ticket that has no waiting job in the ledger are read from the forge, at most once per ticket per this long (cached).
+const DEP_CACHE_MS = 10 * 60000;
+// And at most this many such reads per pass: beyond that a ticket's edges are unknown for now (no edges, nothing is broken).
+const DEP_READS_PER_PASS = 40;
 
 // The route kinds, as the token counter labels them (a known set, see metrics.known).
 const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'];
@@ -132,6 +136,9 @@ export class Dispatcher {
   // Same-files waits not taken ("repo#j>repo#t") and dependency cycles logged: each once, in memory.
   cyclePairs = new Set<string>();
   cyclesLogged = new Set<string>();
+  // The open dependencies read from the forge for the wait graph: ticket key -> when read and what was open (a failed read is an empty answer).
+  depCache = new Map<string, { at: number; open: string[] }>();
+  depReads = 0; // reads spent in the current pass
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
   stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
@@ -1224,7 +1231,8 @@ export class Dispatcher {
     for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
       if (await this.releaseDeferred(job, now)) changed = true;
     }
-    if (this.breakWaitCycles()) changed = true;
+    this.depReads = 0;
+    if (await this.breakWaitCycles()) changed = true;
     // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
     const tried = new Set<string>();
     let started = 0;
@@ -1430,14 +1438,56 @@ export class Dispatcher {
       return [];
     }
     // A blocker that already waits for this ticket (explicit dependencies and the waits in force) would make a cycle: it is not waited for.
-    const graph = waitGraph(this.jobs.list(), true);
     const me = repository.toLowerCase() + '#' + number;
-    return [...blockers].sort((a, b) => a - b).filter((other) => {
+    const kept: number[] = [];
+    for (const other of [...blockers].sort((a, b) => a - b)) {
       const key = repository.toLowerCase() + '#' + other;
-      if (!reaches(graph, key, me)) return true;
-      this.noteCycle(me, key);
-      return false;
-    });
+      if (!(await this.waitReaches(key, me, true))) kept.push(other);
+      else this.noteCycle(me, key);
+    }
+    return kept;
+  }
+
+  // Whether `to` is waited for, directly or through other waits, starting from `from`: the waits in force (the ledger's waiting jobs, explicit and, with
+  // `files`, same-files) and, for a ticket that has no waiting job with explicit dependencies, its open dependencies in the forge (forgeEdges).
+  async waitReaches(from: string, to: string, files: boolean): Promise<boolean> {
+    const ledger = waitGraph(this.jobs.list(), files);
+    const explicit = waitGraph(this.jobs.list(), false);
+    const seen = new Set([from]);
+    const queue = [from];
+    for (let i = 0; i < queue.length; i += 1) {
+      const node = queue[i];
+      if (node === to) return true;
+      const edges = new Set(ledger.get(node) ?? []);
+      if (!explicit.has(node)) for (const next of await this.forgeEdges(node)) edges.add(next);
+      for (const next of edges) {
+        if (!seen.has(next)) { seen.add(next); queue.push(next); }
+      }
+    }
+    return false;
+  }
+
+  // The open dependencies of a ticket, read from the forge. Cached per ticket for DEP_CACHE_MS; a failed read counts as none (cached too, so the
+  // ticket is not read again in that time); past DEP_READS_PER_PASS reads in a pass the answer is none for now (not cached). A ticket whose jobs are
+  // all archived (closed on the status page) is not read: its open dependencies do not hold anything back.
+  async forgeEdges(node: string): Promise<string[]> {
+    const cached = this.depCache.get(node);
+    if (cached && this.now() - cached.at < DEP_CACHE_MS) return cached.open;
+    const own = this.jobs.list().filter((job) => ticketKey(job) === node);
+    if (!this.config.forgejo || (own.length && own.every((job) => job.archived_view))) return [];
+    if (this.depReads >= DEP_READS_PER_PASS) return [];
+    this.depReads += 1;
+    const at = own[0]?.event.repository.full_name ?? node.split('#')[0];
+    const number = Number(node.split('#')[1]);
+    let open: string[] = [];
+    try {
+      const dependencies = await this.forge.dependencies(at, number);
+      open = (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => node.split('#')[0] + '#' + issue.number);
+    } catch (error) {
+      this.logger.error('could not read the dependencies of #' + number + ', its waits are not known for now:', error.message);
+    }
+    this.depCache.set(node, { at: this.now(), open });
+    return open;
   }
 
   // A same-files wait that closes a cycle is not taken: the older ticket already waits for this one, through explicit dependencies or other waits in
@@ -1453,23 +1503,21 @@ export class Dispatcher {
 
   // The waits in force are read from the ledger (no forge read): a same-files wait that closes a cycle is dropped, the explicit dependencies never. A job
   // left with no wait is queued again. True when something changed.
-  breakWaitCycles(): boolean {
+  async breakWaitCycles(): Promise<boolean> {
     if (!this.config.waitForSameFiles) return false;
-    const graph = waitGraph(this.jobs.list(), true);
     let changed = false;
     for (const job of this.jobs.list('waiting')) {
       if (!job.waiting_for_files?.length || job.waiting_for?.length || job.waiting_for_run || job.event.bot || job.event.pull_request) continue;
       const me = ticketKey(job);
       const repository = job.event.repository.full_name.toLowerCase();
-      const kept = job.waiting_for_files.filter((number) => {
+      const kept: number[] = [];
+      for (const number of job.waiting_for_files) {
         const other = repository + '#' + number;
-        if (!reaches(graph, other, me)) return true;
-        this.noteCycle(me, other);
-        return false;
-      });
+        if (await this.waitReaches(other, me, true)) this.noteCycle(me, other);
+        else kept.push(number);
+      }
       if (kept.length === job.waiting_for_files.length) continue;
       changed = true;
-      graph.set(me, new Set(kept.map((number) => repository + '#' + number)));
       if (kept.length) job.waiting_for_files = kept;
       else {
         job.status = 'queued';

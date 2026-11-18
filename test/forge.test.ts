@@ -151,6 +151,8 @@ test('a fake forge drives the dispatcher: dependencies hold a job back, a closed
   blocker.state = 'closed';
   assert.equal(await dispatcher.onClosed({ ...event(11), type: 'issues.closed' }), 'started #12');
   assert.equal(jobs.list(true)[0].status, 'queued');
+  // The start is a pass of the dispatcher, which runs in the background after onClosed: wait for it.
+  await dispatcher.tick();
   // The last read is the look the dispatcher takes before it starts a worker (dependencies added after queueing).
   assert.deepEqual(forge.calls, ['dependencies(12)', 'blocks(11)', 'dependencies(12)', 'dependencies(12)']);
 });

@@ -39,16 +39,24 @@ const env = (extra = {}) => ({
 });
 
 // The forge: a ticket is open unless it is in `closed`; dependency lists and pull requests are empty. Reads are counted.
+// `deps[n]` are the open dependencies of ticket n (Forgejo's /issues/n/dependencies); `depsFail` makes that read answer 500.
 function forge() {
-  const world = { reads: 0 };
-  const reply = (value) => ({ ok: true, status: 200, json: async () => value });
+  const world = { reads: 0, depReads: {}, deps: {}, depsFail: false };
+  const reply = (status, value) => ({ ok: status < 300, status, json: async () => value });
   world.send = async (url, request) => {
-    if (request.method !== 'GET') return reply({ id: 77 });
+    if (request.method !== 'GET') return reply(201, { id: 77 });
     world.reads += 1;
     const path = new URL(url).pathname;
+    const dependencies = /\/issues\/(\d+)\/dependencies$/.exec(path);
+    if (dependencies) {
+      const number = Number(dependencies[1]);
+      world.depReads[number] = (world.depReads[number] || 0) + 1;
+      if (world.depsFail) return reply(500, {});
+      return reply(200, (world.deps[number] || []).map((n) => ({ number: n, state: 'open' })));
+    }
     const issue = /\/issues\/(\d+)$/.exec(path);
-    if (issue) return reply({ number: Number(issue[1]), state: closed.has(Number(issue[1])) ? 'closed' : 'open', labels: [] });
-    return reply([]);
+    if (issue) return reply(200, { number: Number(issue[1]), state: closed.has(Number(issue[1])) ? 'closed' : 'open', labels: [] });
+    return reply(200, []);
   };
   return world;
 }
@@ -93,9 +101,12 @@ const byNumber = (t, number) => t.jobs.list().find((job) => job.event.issue.numb
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-cycles-')); clock = 1_000_000; logs = []; sent = []; closed = new Set(); metrics.reset(); });
 afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }));
 
-test('example 1: the epic 234 waits for its children, 235 waits for 234; 278 does not wait for 235 (a cycle), only for the older 261 it shares files with', async () => {
+// The epics are as the ledger has them: their job is `done` (the planner split them and the worker finished), and their dependencies are only in the
+// forge (GET /issues/n/dependencies), as with homegraf #234 and #232.
+test('example 1 (homegraf #234): the epic has a done job, its children are in the forge; 278 does not wait for 235 (a cycle), only for 261', async () => {
   const t = await setup();
-  addJob(t, 234, 'waiting', { label: 'ai:plan', body: '', waiting_for: [278, 279, 280, 281, 282] });
+  t.fg.deps[234] = [278, 279, 280, 281, 282];
+  addJob(t, 234, 'done', { label: 'ai:plan', body: '' });
   addJob(t, 235, 'waiting', { waiting_for: [234] });
   // 261 is an older ticket with work in progress (an agent pull request in the forge would look the same): it is a blocker, not a waiter.
   const older = addJob(t, 261, 'running');
@@ -103,9 +114,10 @@ test('example 1: the epic 234 waits for its children, 235 waits for 234; 278 doe
   const child279 = addJob(t, 279, 'queued');
   await t.dispatcher.tick();
   assert.equal(child278.status, 'waiting');
-  assert.deepEqual(child278.waiting_for_files, [261], 'the wait for 235 is not taken: 235 waits for 234, which waits for 278');
+  assert.deepEqual(child278.waiting_for_files, [261], 'the wait for 235 is not taken: 235 waits for 234, which the forge says waits for 278');
   assert.equal(cycleLines(repo + '#278: not waiting for #235 (same files): #235 is blocked by this ticket (cycle)').length, 1);
   assert.deepEqual(started(t), []);
+  assert.equal(t.fg.depReads[234], 1, 'the epic is read once');
   // 261 is done: the deepest child 278 starts; 279 waits for it (the same files, an older ticket) and starts after it.
   older.status = 'done';
   closed.add(261);
@@ -121,15 +133,73 @@ test('example 1: the epic 234 waits for its children, 235 waits for 234; 278 doe
   assert.deepEqual(started(t), [278, 279]);
 });
 
-test('example 2: 232 (epic) waits for 269..271, 233 waits for 232; 269 does not wait for 233 and starts', async () => {
+test('example 2 (homegraf #232): the done epic with open children in the forge; 269 does not wait for 233 and starts', async () => {
   const t = await setup();
-  addJob(t, 232, 'waiting', { label: 'ai:plan', body: '', waiting_for: [269, 270, 271] });
+  t.fg.deps[232] = [269, 270, 271];
+  addJob(t, 232, 'done', { label: 'ai:plan', body: '' });
   addJob(t, 233, 'waiting', { waiting_for: [232] });
   const child = addJob(t, 269, 'queued');
   await t.dispatcher.tick();
-  assert.equal(child.status, 'running', 'the same-files wait for 233 closes a cycle and is not taken');
+  assert.equal(child.status, 'running', 'the same-files wait for 233 closes a cycle through the epic and is not taken');
   assert.deepEqual(started(t), [269]);
   assert.equal(cycleLines(repo + '#269: not waiting for #233 (same files): #233 is blocked by this ticket (cycle)').length, 1);
+});
+
+test('when the forge cannot say what the epic waits for, the same-files wait is kept (no edge is invented, nothing is broken)', async () => {
+  const t = await setup();
+  t.fg.deps[234] = [278, 279];
+  t.fg.depsFail = true;
+  addJob(t, 234, 'done', { label: 'ai:plan', body: '' });
+  addJob(t, 235, 'waiting', { waiting_for: [234] });
+  const older = addJob(t, 261, 'running');
+  const child = addJob(t, 278, 'queued');
+  await t.dispatcher.tick();
+  assert.deepEqual(child.waiting_for_files, [235, 261], 'the edge to 235 is kept: its path is not known');
+  assert.equal(cycleLines('(cycle)').length, 0);
+});
+
+test('the forge reads of the wait graph: once per ticket per cache period, none on the ticks in between', async () => {
+  const t = await setup();
+  // 278 waits for 261 (a same-files wait in force); 261 waits for the done ticket 262, which the search has to read on every look.
+  t.fg.deps[262] = [];
+  addJob(t, 262, 'done', { body: '' });
+  addJob(t, 261, 'waiting', { waiting_for: [262] });
+  addJob(t, 278, 'waiting', { waiting_for_files: [261] });
+  await t.dispatcher.tick();
+  assert.equal(t.fg.depReads[262], 1);
+  clock += 5 * MINUTE;
+  await t.dispatcher.tick();
+  clock += 4 * MINUTE;
+  await t.dispatcher.tick();
+  assert.equal(t.fg.depReads[262], 1, 'cached for ten minutes: no read on the ticks in between');
+  clock += 2 * MINUTE;
+  await t.dispatcher.tick();
+  assert.equal(t.fg.depReads[262], 2, 'read again once the period is over');
+});
+
+test('the wait graph reads at most 40 tickets a pass: beyond that the answer is none for now, and nothing is dropped', async () => {
+  const t = await setup();
+  // A chain of 60 done tickets 500 -> 501 -> ... -> 559, the last one waits for 600 (the newer ticket): the search would need 60 reads.
+  for (let k = 500; k < 560; k += 1) { t.fg.deps[k] = [k + 1]; addJob(t, k, 'done', { body: '' }); }
+  t.fg.deps[559] = [600];
+  addJob(t, 499, 'waiting', { waiting_for: [500] });
+  const newer = addJob(t, 600, 'queued');
+  await t.dispatcher.tick();
+  const reads = Object.entries(t.fg.depReads).filter(([number]) => Number(number) >= 500 && Number(number) < 560).reduce((sum, [, count]) => sum + count, 0);
+  assert.ok(reads <= 40, 'at most 40 reads of the chain in the pass (' + reads + ')');
+  assert.ok(reads > 0);
+  assert.deepEqual(newer.waiting_for_files, [499], 'the chain was not followed far enough: the wait stays');
+});
+
+test('a short chain inside the budget is followed: the older ticket reaches the newer through the epic and the wait is not taken', async () => {
+  const t = await setup();
+  for (let k = 500; k < 510; k += 1) { t.fg.deps[k] = [k + 1]; addJob(t, k, 'done', { body: '' }); }
+  t.fg.deps[509] = [600];
+  addJob(t, 499, 'waiting', { waiting_for: [500] });
+  const newer = addJob(t, 600, 'queued');
+  await t.dispatcher.tick();
+  assert.equal(newer.status, 'running');
+  assert.equal(cycleLines('not waiting for #499').length, 1);
 });
 
 test('a same-files wait that closes a cycle created later is dropped by the pass, and the job starts', async () => {
@@ -215,16 +285,17 @@ test('the cycle line is logged once across passes, and the same-files pair once 
   assert.equal(metrics.counters.get('forgehands_wait_cycles_broken_total'), 1);
 });
 
-test('the passes read the forge no more than the starts need: a pass over waiting jobs only reads nothing', async () => {
+test('a pass over waiting jobs only reads the forge for the epic it has not read yet: none on the next ticks', async () => {
   const t = await setup();
-  addJob(t, 234, 'waiting', { label: 'ai:plan', body: '', waiting_for: [278] });
+  t.fg.deps[234] = [278];
+  addJob(t, 234, 'done', { label: 'ai:plan', body: '' });
   addJob(t, 235, 'waiting', { waiting_for: [234] });
   addJob(t, 278, 'waiting', { waiting_for_files: [235] });
   await t.dispatcher.tick(); // the first pass may read what the sweep of closed tickets needs
   const reads = t.fg.reads;
-  clock += 5 * MINUTE;
+  clock += 3 * MINUTE;
   await t.dispatcher.tick();
-  clock += 5 * MINUTE;
+  clock += 3 * MINUTE;
   await t.dispatcher.tick();
-  assert.equal(t.fg.reads, reads, 'no forge read on the ticks: the graph comes from the ledger');
+  assert.equal(t.fg.reads, reads, 'no forge read on the ticks in the cache period');
 });
