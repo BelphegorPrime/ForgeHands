@@ -190,8 +190,9 @@ test('failed starts are retried with backoff, then marked failed', async () => {
   assert.equal(jobs.list()[0].status, 'failed');
 });
 
+// RESUME_ATTEMPTS=0 in the tests below that predate resuming: they pin what a stuck or timed out run did before it was continued (test/resume.test.ts).
 test('a run that never ends frees its slot after the timeout', async () => {
-  const { dispatcher, jobs } = await build({ MAX_RUN_MINUTES: '1' });
+  const { dispatcher, jobs } = await build({ MAX_RUN_MINUTES: '1', RESUME_ATTEMPTS: '0' });
   await dispatcher.enqueue(event('ai:ready', 1));
   await dispatcher.tick();
   clock += 61_000; await dispatcher.tick();
@@ -501,19 +502,21 @@ async function buildWatched(extra) {
 
 // A worker run that "finishes" without delivering anything is not a delivery.
 let deliveryRuns = 0;
-async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready' } = {}) {
+async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready', routes = {}, logger = quiet } = {}) {
   const config = loadConfig(env({ HUMAN_LOGIN: 'marcel' }));
   const jobs = new JobStore(join(dir, 'delivery-' + (deliveryRuns++) + '.json'));
   await jobs.load();
   const forgejo = fakeForgejo({
+    ['GET /api/v1/user']: { login: 'openhands' },
     ['GET ' + API + '/issues/26']: { number: 26, state: issueState, labels },
     ['GET ' + API + '/pulls']: () => pulls,
     ['GET ' + API + '/issues/26/comments']: () => comments,
-    ['POST ' + API + '/issues/26/comments']: {}
+    ['POST ' + API + '/issues/26/comments']: {},
+    ...routes
   });
   const api = fakeApi();
   const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
-  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  const dispatcher = new Dispatcher(config, jobs, send, logger, () => clock);
   await dispatcher.enqueue(event(label, 26));
   await dispatcher.tick();
   const job = jobs.list()[0];
@@ -552,6 +555,62 @@ test('a pull request or a comment since the run began, a closed issue or an epic
   assert.equal(stale.job.delivery_retry, 1, 'an old pull request and an old comment are not a delivery');
 });
 
+// A worker may deliver by a comment of the agent on the issue it blocks (its parent): #26 blocks #31, which is the report's place.
+test('a comment of the agent on the parent (the issue the run blocks) is a delivery, logged and not closed', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString();
+  const logs = [];
+  const t = await buildDelivery({
+    logger: { error: (...args) => logs.push(args.join(' ')) },
+    routes: {
+      ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }],
+      ['GET ' + API + '/issues/31/comments']: [{ created_at: at(60000), body: 'verification', user: { login: 'openhands' } }]
+    }
+  });
+  await t.end();
+  assert.equal(t.job.status, 'done');
+  assert.equal(t.job.delivery_retry, undefined, 'not run once more');
+  assert.equal(t.job.delivered_on, 31);
+  assert.ok(logs.includes('owner/hello#26: delivered as a comment on #31'), logs.join('\n'));
+  assert.ok(!t.forgejo.calls.some((call) => call.method !== 'GET' && call.path.includes('/issues/26') && !call.path.endsWith('/comments')), 'the ticket is not closed by ForgeHands');
+});
+
+test('a comment on an unrelated issue, of another user, or older than the run does not deliver for the parent', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString();
+  const cases = {
+    'an unrelated issue': { ['GET ' + API + '/issues/40/comments']: [{ created_at: at(60000), user: { login: 'openhands' } }] },
+    'another user': { ['GET ' + API + '/issues/31/comments']: [{ created_at: at(60000), user: { login: 'marcel' } }] },
+    'a comment before the run': { ['GET ' + API + '/issues/31/comments']: [{ created_at: at(-3600000), user: { login: 'openhands' } }] }
+  };
+  for (const name of Object.keys(cases)) {
+    const t = await buildDelivery({ routes: { ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }], ...cases[name] } });
+    await t.end();
+    assert.equal(t.job.delivery_retry, 1, name);
+    await t.end();
+    assert.equal(t.job.result, 'no_delivery', name);
+    assert.equal(t.job.delivered_on, undefined, name);
+  }
+});
+
+test('a forge error on blocks, on the parent comments or on the user keeps no_delivery, and nothing is thrown', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString();
+  const agentOnParent = { ['GET ' + API + '/issues/31/comments']: [{ created_at: at(60000), user: { login: 'openhands' } }] };
+  const cases = {
+    'blocks': { ['GET ' + API + '/issues/26/blocks']: { __status: 500 }, ...agentOnParent },
+    'the comments of the parent': { ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }], ['GET ' + API + '/issues/31/comments']: { __status: 500 } },
+    'the user of the token': { ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }], ...agentOnParent, ['GET /api/v1/user']: { __status: 500 } }
+  };
+  for (const name of Object.keys(cases)) {
+    const logs = [];
+    const t = await buildDelivery({ logger: { error: (...args) => logs.push(args.join(' ')) }, routes: cases[name] });
+    await t.end();
+    assert.equal(t.job.delivery_retry, 1, name);
+    await t.end();
+    assert.equal(t.job.result, 'no_delivery', name);
+    assert.equal(t.job.delivered_on, undefined, name);
+    assert.ok(logs.some((line) => /could not read/.test(line)), name);
+  }
+});
+
 test('a run that ends with an error is started once more after a pause; a second error is reported to the human on the issue', async () => {
   const { jobs, dispatcher, finish, comments } = await buildWatched({ ERROR_RETRIES: '1' });
   await dispatcher.enqueue(event('ai:ready', 26));
@@ -587,7 +646,7 @@ test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to t
   await plain.finish('paused');
   assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "paused"\. A human/);
   assert.ok(!plain.forgejo.some((c) => c.method === 'DELETE'));
-  const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan', RESUME_ATTEMPTS: '0' });
   await planner.dispatcher.enqueue(event('ai:plan', 59));
   await planner.finish('stuck');
   assert.match(planner.comments()[0], /^@marcel/, 'the planner itself is never sent to the planner');
@@ -3522,7 +3581,8 @@ test('BOT_REPOS limits the bot pull requests to some repositories; it must name 
 let commentRuns = 0;
 // The forge's view of issue 26 (state and labels) can be changed by a test; every other call of the forge is answered as fakeForgejo does.
 async function buildComments(extra = {}) {
-  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', ...extra }));
+  // Runs that end stuck are not continued here (RESUME_ATTEMPTS=0): these tests are about the comments that restart a failed run.
+  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', RESUME_ATTEMPTS: '0', ...extra }));
   const jobs = new JobStore(join(dir, 'comments-' + (commentRuns++) + '.json'));
   await jobs.load();
   const issue = { state: 'open', labels: ['ai:ready'], dependencies: [] };

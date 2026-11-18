@@ -29,6 +29,14 @@ const RECENT_STARTS = 50;
 // WAIT_FOR_SAME_FILES looks at no more open pull requests than this per check.
 const FILE_PULLS_LOOKED_AT = 20;
 const ACTIVE_STATUSES = new Set(['waiting', 'queued', 'running']);
+// Stage A (RESUME_ATTEMPTS): the states a run is continued in, on its own conversation. A run that reached its iteration limit is not among
+// them: nothing in the API raises that limit of a conversation, so the same run would end the same way (see resume).
+const RESUMABLE = new Set(['stuck', 'timeout']);
+// A continued run is given this long before its state counts again: the state it stopped in may still be reported for a moment.
+const RESUME_SETTLE_MS = 60000;
+// Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
+// `no_delivery` is not one of them: it is only ever reported for issue runs, which have no escalate_to.
+const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -376,8 +384,14 @@ export class Dispatcher {
   // Follow-up runs (pull request routes) already made for the issue of this event.
   rounds(event: ForgeEvent): number {
     const base = this.issueKey(event) + ':';
-    return this.jobs.list().filter((job) => job.key.startsWith(base) && !job.round_reset && ROUND_KINDS.has(this.config.routes.get(job.label)?.kind)
+    return this.jobs.list().filter((job) => job.key.startsWith(base) && this.countsAsRound(job)
       && (job.started || job.status === 'queued' || job.status === 'running')).length;
+  }
+
+  // A follow-up round that counts against MAX_ROUNDS: not one the human reset, and not a failure escalation (stage B), which is an extra try
+  // on the same commit and must not use up a round.
+  countsAsRound(job: Job): boolean {
+    return ROUND_KINDS.has(this.config.routes.get(job.label)?.kind) && !job.round_reset && !job.failure_escalation;
   }
 
   // The round this job is: the rounds of its issue that come before it in the ledger (oldest first), plus itself. Only the ledger is read, so it is the same before
@@ -389,7 +403,7 @@ export class Dispatcher {
     if (job.escalated) return target;
     const base = this.issueKey(job.event) + ':';
     const all = this.jobs.list();
-    const before = all.slice(0, all.indexOf(job)).filter((other) => other.key.startsWith(base) && !other.round_reset && ROUND_KINDS.has(this.config.routes.get(other.label)?.kind)
+    const before = all.slice(0, all.indexOf(job)).filter((other) => other.key.startsWith(base) && this.countsAsRound(other)
       && (other.started || other.status === 'queued' || other.status === 'running')).length;
     return before + 1 >= this.config.escalateFromRound ? target : undefined;
   }
@@ -762,6 +776,12 @@ export class Dispatcher {
       if (pulls.some((pr) => pr.head?.ref === branch && Date.parse(pr.updated_at) >= since)) return;
       const comments = await this.forge.listComments(repository, event.issue.number, 50);
       if (comments.some((comment) => Date.parse(comment.created_at) >= since)) return;
+      const parent = await this.parentDelivery(event, since);
+      if (parent) {
+        Object.assign(job, { delivered_on: parent });
+        this.logger.error(repository + '#' + event.issue.number + ': delivered as a comment on #' + parent);
+        return;
+      }
       if (!job.delivery_retry) {
         Object.assign(job, { status: 'queued', delivery_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
         this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
@@ -773,6 +793,30 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
     }
+  }
+
+  // A worker on a ticket that blocks another (the parent, where its report belongs) may deliver by a comment of the agent on that parent. Returns
+  // the number of the parent, or null. A read that fails counts as no comment: an unknown answer never reads as delivered.
+  async parentDelivery(event: ForgeEvent, since: number): Promise<number | null> {
+    let login: string | null;
+    let parents: Json;
+    try {
+      login = (await this.forge.agentLogin?.()) ?? null;
+      if (!login) return null;
+      parents = await this.forge.blocks(event.repository.full_name, event.issue.number);
+    } catch (error) {
+      this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message);
+      return null;
+    }
+    for (const parent of Array.isArray(parents) ? parents : []) {
+      try {
+        const comments = await this.forge.listComments(event.repository.full_name, parent.number, 50);
+        if (comments.some((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since)) return parent.number;
+      } catch (error) {
+        this.logger.error('could not read the comments of #' + parent.number + ':', error.message);
+      }
+    }
+    return null;
   }
 
   // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
@@ -1319,6 +1363,8 @@ export class Dispatcher {
       const created = (await response.json()) as Json;
       if (!created?.id) throw new Error('response without conversation id');
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
+      // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
+      delete job.resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
@@ -1331,6 +1377,16 @@ export class Dispatcher {
   }
 
   async poll(job: Job, now: number): Promise<boolean> {
+    // A continued run whose run call was not answered yet: the message is in its conversation already, so only the run call is repeated.
+    // Past the run timeout the continuation is given up and the run counts as timed out, without a second message.
+    if (job.resume_pending) {
+      if (job.resumed_at! + this.config.maxRunMs >= now) {
+        await this.startResumed(job);
+        return true;
+      }
+      delete job.resume_pending;
+      return this.failed(job, 'timeout', now);
+    }
     let state: string | null = null;
     let costChanged = false;
     try {
@@ -1379,6 +1435,9 @@ export class Dispatcher {
       return true;
     }
     if (state !== null && TERMINAL.has(state)) {
+      // A run continued a moment ago may still be reported in the state it stopped in: that is not news yet.
+      if (job.resumed_from === state && now - job.resumed_at! < RESUME_SETTLE_MS) return false;
+      if (await this.resume(job, state, now)) return true;
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       this.runEnded(job, state, now);
       await this.checkBranchAfterRun(job);
@@ -1386,19 +1445,102 @@ export class Dispatcher {
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
-      else if (state !== 'finished') await this.reportFailure(job, state);
+      else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
       else if (done === 'issue') await this.checkDelivery(job);
       return true;
     }
     if (costChanged) return true;
-    // Free the slot of a run that never ends; the conversation itself is left alone.
-    if (job.started && job.started + this.config.maxRunMs < now) {
-      Object.assign(job, { status: 'failed', result: 'timeout', finished: now });
-      this.runEnded(job, 'timeout', now);
-      await this.reportFailure(job, 'timeout');
-      return true;
+    // Free the slot of a run that never ends; the conversation itself is left alone unless the run is continued (see resume).
+    // A continued run counts its timeout from the continuation.
+    if (job.started && (job.resumed_at ?? job.started) + this.config.maxRunMs < now) {
+      if (await this.resume(job, 'timeout', now)) return true;
+      return this.failed(job, 'timeout', now);
     }
     return false;
+  }
+
+  // Stage A (RESUME_ATTEMPTS): a run that ended stuck or timed out goes on in its own conversation, which keeps its context. One message says
+  // what happened and asks for another approach, then the run is started again; the job is running again and counts the resume. Once
+  // RESUME_ATTEMPTS are used up, or the run is not one of RESUMABLE (an iteration limit: nothing in the API raises it, so a continued run would
+  // stop at the same limit), this returns false and the next stage decides. A message that could not be sent counts as not continued.
+  async resume(job: Job, state: string, now: number): Promise<boolean> {
+    const resumes = job.resumes || 0;
+    if (!RESUMABLE.has(state) || !job.conversation_id || resumes >= this.config.resumeAttempts) return false;
+    const repository = job.event.repository.full_name;
+    const conversation = '/api/conversations/' + encodeURIComponent(job.conversation_id);
+    // A timed out run is still running in OpenHands: it is paused first, so that the message does not go to a busy agent (best effort).
+    if (state === 'timeout') {
+      try { await this.api('POST', conversation + '/pause', undefined, repository); }
+      catch (error) { this.logger.error('could not pause ' + job.key + ' before it is continued:', error.message); }
+    }
+    // The message and the run are two calls: a run call that is not answered is repeated on its own (startResumed), never the message.
+    const text = 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
+    try {
+      const response = await this.api('POST', conversation + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, repository);
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+    } catch (error) {
+      this.logger.error(job.key + ': ' + state + ', the message to continue it was not sent (' + error.message + '), the next stage decides');
+      return false;
+    }
+    Object.assign(job, { status: 'running', resumes: resumes + 1, resumed_from: state, resumed_at: now, resume_pending: true, finished: undefined, result: undefined });
+    metrics.inc('forgehands_resumes_total', { kind: this.config.routes.get(job.label)?.kind || 'issue', state: known(state, RESUMABLE) });
+    this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + job.resumes + '/' + this.config.resumeAttempts + ')');
+    await this.startResumed(job);
+    return true;
+  }
+
+  // The run call of a continued conversation. 200 starts it, 409 says it runs already: both clear the pending call. 404 means the conversation is
+  // gone (the next poll says so). Any other answer, or no answer, keeps the call pending for the next poll.
+  async startResumed(job: Job): Promise<void> {
+    try {
+      const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/run', undefined, job.event.repository.full_name);
+      if (response.ok || response.status === 409) {
+        delete job.resume_pending;
+        job.resumed_at = this.now();
+      } else if (response.status === 404) {
+        delete job.resume_pending;
+      } else {
+        this.logger.error(job.key + ': the continued run was not started (HTTP ' + response.status + '), trying again');
+      }
+    } catch (error) {
+      this.logger.error(job.key + ': the continued run was not started (' + error.message + '), trying again');
+    }
+  }
+
+  // Stage B (FAILURE_ESCALATE): a round that is still stuck, timed out or out of iterations (after stage A, or at once for the iteration limit) starts
+  // once more on the profile of its escalate_to route, on the same pull request and branch, with the own route's prompt and limits. It is one
+  // extra try per head commit: a second failure on the same commit goes to the human, and it does not use up a MAX_ROUNDS round. The run is
+  // queued like any run (the escalation is the same as the last-round escalation: the job is `escalated`). Returns true when it was queued.
+  async escalateFailure(job: Job, state: string): Promise<boolean> {
+    const route = this.config.routes.get(job.label);
+    if (!this.config.failureEscalate || !route?.escalateTo || !ROUND_KINDS.has(route.kind) || !job.event.pull_request || job.escalated
+      || !ESCALATABLE.has(state) || !this.config.forgejo) return false;
+    const repository = job.event.repository.full_name;
+    const number = job.event.pull_request.number;
+    let head: string;
+    try {
+      const pr = await this.forge.getPull(repository, number);
+      if (!pr || pr.state !== 'open' || pr.merged || typeof pr.head?.sha !== 'string') return false;
+      head = pr.head.sha;
+    } catch (error) {
+      this.logger.error('could not read the head of #' + number + ', no escalation of ' + job.key + ':', error.message);
+      return false;
+    }
+    const key = this.issueKey(job.event) + ':' + job.label + ':' + head.slice(0, 8);
+    if (this.jobs.list().some((other) => other.key === key)) return false;
+    this.jobs.add({ key, label: job.label, event: { ...job.event, label: job.label }, status: 'queued', created: this.now(),
+      escalated: true, failure_escalation: true, escalated_after: state });
+    metrics.inc('forgehands_failure_escalations_total');
+    this.logger.error(job.key + ': ' + state + ', starting once more on ' + route.escalateTo + ' (head ' + head.slice(0, 8) + ')');
+    return true;
+  }
+
+  // A run that ran out of time (a continuation that never started counts the same): it is either escalated (stage B) or reported (stage C, as before).
+  async failed(job: Job, state: string, now: number): Promise<boolean> {
+    Object.assign(job, { status: 'failed', result: state, finished: now });
+    this.runEnded(job, state, now);
+    if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state);
+    return true;
   }
 
   // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (max_iterations,

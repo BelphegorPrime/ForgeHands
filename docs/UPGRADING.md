@@ -79,3 +79,35 @@ A comment of the operator (`HUMAN_LOGIN`) on an issue whose last run failed, or 
 - **Switches.** The feature needs `HUMAN_LOGIN`, which is off without it. `COMMENT_RESTARTS` (default `2`) caps the restarts per issue and label; `COMMENT_RESTARTS=0` switches the feature off. Any other value than an integer from 0 to 100 stops the start with `COMMENT_RESTARTS must be an integer between 0 and 100`.
 - **What changes without a switch.** Nothing else. A comment on a pull request, an edited or deleted comment, and a comment of anybody else are ignored as before. The ledger gains a `dedupe` section (the ids of comments that restarted a run, and the notices sent); 0.4.10 ignores it.
 - **Rollback.** Go back to 0.4.10: it ignores `issue_comment` events and the new ledger section, so comments no longer restart runs.
+
+# Upgrading to 0.5.2: a comment on the parent delivers a run
+
+A worker run on a ticket that blocks another ticket (its parent) now counts as delivered when the agent user comments on that parent, as it already did for a comment on the ticket itself. Before, such a run was run once more and then failed as `no_delivery`, and the parent waited for ever. README "A run that finishes without delivering is not done" has the rule.
+
+- **No switch.** Nothing to set. The forge is read with two more calls: `GET /user` (once) and `GET /issues/<n>/blocks`. A failed read counts as no delivery, as before.
+- **What you see.** The log says `<repo>#<n>: delivered as a comment on #<parent>` and the status page shows the run as done with that comment. ForgeHands does not close the ticket.
+
+# Upgrading to 0.6.0: a stuck or timed out run is continued before a human is asked
+
+**Behaviour change.** A run that ends `stuck` (OpenHands' stuck detection) or hits `MAX_RUN_MINUTES` used to hand its ticket or pull request to a human at once. From 0.6.0 ForgeHands first continues it, then escalates a round, and only then calls a human. README "Humans and failures" describes the three stages.
+
+- **Stage A, resume (`RESUME_ATTEMPTS`, default `1`).** One message goes into the same conversation (the run stopped as `stuck` or `timeout`, do not repeat what was done last, take another approach, finish with a summary) and the run starts again on that conversation. A timed out run is paused first. Set `RESUME_ATTEMPTS=0` to switch it off; at most `5`. Any other value stops the start with `RESUME_ATTEMPTS must be an integer between 1 and 5`.
+- **Stage B, escalate (`FAILURE_ESCALATE`, default `1`).** A round on a route with `escalate_to` that is still stuck, timed out or out of iterations starts once more on the profile of that route, once per head commit of the pull request, and not counted against `MAX_ROUNDS`. Set `FAILURE_ESCALATE=0` to switch it off. Any other value than `0` or `1` stops the start with `FAILURE_ESCALATE must be 0 or 1`.
+- **Stage C, the human.** Unchanged, once A and B are used up or do not apply.
+
+**What it costs and what it changes.**
+
+- Each stuck run now costs one more OpenHands run on its conversation, and a round that escalates runs on the escalation profile (the stronger model, possibly with a higher cost). Point `escalate_to` only at a profile you trust for that repository, as before.
+- An iteration limit (`max_iterations`) is not continued; a round that reaches it escalates at once, an issue run goes to `SPLIT_LABEL` as before.
+- Quota holds, `ERROR_RETRIES`, the `no_delivery` re-run, comment restarts and `DRY_RUN` are unchanged.
+- The ledger gains the fields `resumes`, `resumed_from`, `resumed_at`, `resume_pending`, `failure_escalation` and `escalated_after`. Version 0.5.1 ignores them.
+- The metrics `forgehands_resumes_total{kind,state}` and `forgehands_failure_escalations_total` and the status page ("resumed", "escalated after stuck") are new.
+
+**To keep the old behaviour** set both switches:
+
+```sh
+RESUME_ATTEMPTS=0
+FAILURE_ESCALATE=0
+```
+
+**Rollback.** Go back to 0.5.1. A job whose conversation was continued when it went back is polled as before: its conversation state decides, and a stuck conversation goes to the human as 0.5.1 did. The unanswered run call of such a job (`resume_pending`) is not repeated by 0.5.1.
