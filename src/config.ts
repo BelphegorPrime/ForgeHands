@@ -339,6 +339,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     humanLogin: parseHumanLogin(env.HUMAN_LOGIN),
     // A comment of HUMAN_LOGIN on an issue whose last run failed (or waits for him) starts that run again; this many times per issue and label.
     commentRestarts: commentRestartsOf(env.COMMENT_RESTARTS),
+    // HUMAN_REVIEW_ROUNDS: a request for changes of HUMAN_LOGIN on an agent pull request starts a round in comment mode too. Off without HUMAN_LOGIN.
+    humanReviewRounds: humanReviewRoundsOf(env.HUMAN_REVIEW_ROUNDS) && parseHumanLogin(env.HUMAN_LOGIN) !== null,
     // Notifications of ForgeHands' own (SMTP, webhook, digest) and whether the hand-over comments mention HUMAN_LOGIN, see src/notify.
     notify: parseNotify(env),
     // Whose security review comments count (comma separated logins, case-insensitive). Empty: the comment of anybody counts, which is fine for
@@ -379,6 +381,13 @@ function failureEscalateOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('FAILURE_ESCALATE must be 0 or 1');
+}
+
+// HUMAN_REVIEW_ROUNDS: 1 (default) or 0; any other value is a mistake worth a clear message.
+function humanReviewRoundsOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '1') return true;
+  if (value === '0') return false;
+  throw new Error('HUMAN_REVIEW_ROUNDS must be 0 or 1');
 }
 
 // COMMENT_RESTARTS: 0 to 100, default 2; 0 switches the comment restarts off.

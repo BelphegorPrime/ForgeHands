@@ -257,6 +257,10 @@ export function createApp(
             (route) => route.kind === "ci_success",
           ),
         reviews: direct && config.verdictSource !== "comment",
+        humanReviews:
+          direct && config.verdictSource === "comment" && config.humanReviewRounds && config.humanLogin
+            ? { human: config.humanLogin }
+            : undefined,
         bots: direct
           ? {
               authors: config.botAuthors,
@@ -308,7 +312,8 @@ export function createApp(
       try {
         const result =
           normalized.type === "pull_request.review_approved" ||
-          normalized.type === "pull_request.review_rejected"
+          normalized.type === "pull_request.review_rejected" ||
+          normalized.type === "pull_request.review_comment"
             ? {
                 status: await dispatcher!.onReview(
                   normalized as ForgeEvent,

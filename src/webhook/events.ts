@@ -15,6 +15,8 @@ export interface NormalizeOptions {
   bots?: BotRules & { fixRounds: number };
   /** COMMENT_RESTARTS and HUMAN_LOGIN: a comment of this login on an issue is an event (see normalizeComment). Absent: comments are ignored. */
   comments?: { human: string };
+  /** HUMAN_REVIEW_ROUNDS in comment mode: the native reviews of this login are events (approved, rejected and comment); nobody else's are. */
+  humanReviews?: { human: string };
 }
 
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
@@ -22,11 +24,14 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots, comments }: NormalizeOptions = {}): NormalizedEvent | null {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots, comments, humanReviews }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return (pushes ? normalizePush(payload, allowedRepos) : null) ?? (branchPushes ? normalizeBranchPush(payload, allowedRepos, bots) : null);
   if (event === 'issue_comment') return comments ? normalizeComment(payload, allowedRepos, comments.human) : null;
   if (event === 'pull_request' && branchPushes && HEAD_ACTIONS.has(String(payload?.action))) return normalizeBranchPull(payload, allowedRepos, bots);
-  if (reviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots);
+  // The review verdict is the forge's own (VERDICT_SOURCE review or both); a comment review is no verdict and is not an event there.
+  if (reviews && REVIEW_EVENTS[String(event)] && REVIEW_EVENTS[String(event)] !== 'comment') return normalizeReview(String(event), payload, allowedRepos, bots);
+  // Comment mode with HUMAN_REVIEW_ROUNDS: only the reviews of HUMAN_LOGIN are events, whatever their verdict (see the dispatcher).
+  if (humanReviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots, humanReviews.human);
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci, bots);
@@ -79,15 +84,18 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
 
 // Forgejo sends a review as an event of its own. Its code (modules/webhook/type.go) names the types pull_request_review_approved and
 // pull_request_review_rejected (what the payload's `review.type` carries); the delivery header may carry the mapped names
-// pull_request_approved / pull_request_rejected instead (HookEventType.Event()), so both spellings are accepted.
-const REVIEW_EVENTS: Record<string, 'approved' | 'rejected'> = {
+// pull_request_approved / pull_request_rejected instead (HookEventType.Event()), so both spellings are accepted. A review comment
+// (pull_request_review_comment) is read only for HUMAN_REVIEW_ROUNDS.
+const REVIEW_EVENTS: Record<string, 'approved' | 'rejected' | 'comment'> = {
   pull_request_review_approved: 'approved', pull_request_approved: 'approved',
-  pull_request_review_rejected: 'rejected', pull_request_rejected: 'rejected'
+  pull_request_review_rejected: 'rejected', pull_request_rejected: 'rejected',
+  pull_request_review_comment: 'comment'
 };
 
 // A native review of the pull request of an agent issue (or of a bot). The event is only a trigger: what it says is checked against the
-// reviews as Forgejo has them (Merger.reviewOf), never taken from the payload.
-function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots']): ForgeEvent | null {
+// reviews as Forgejo has them (Merger.reviewOf), never taken from the payload. With `human` (comment mode, HUMAN_REVIEW_ROUNDS) only a
+// review written by that login counts; its id and commit are kept so that one review starts one round (Dispatcher.onHumanReview).
+function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots'], human?: string): ForgeEvent | null {
   const pr = payload?.pull_request;
   if (!pr || typeof pr !== 'object') return null;
   const fullName = payload.repository?.full_name;
@@ -101,6 +109,10 @@ function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>
     ? pr.labels.map((entry: Json) => typeof entry === 'string' ? entry : entry?.name).filter((name: unknown): name is string => typeof name === 'string')
     : [];
   const verdict = REVIEW_EVENTS[event];
+  const reviewer = payload.sender?.login || null;
+  if (human !== undefined && String(reviewer || '').toLowerCase() !== human.toLowerCase()) return null;
+  // Forgejo's payload is not documented field by field for reviews: the id is taken when it is a number, else left out.
+  const reviewId = /^\d{1,18}$/.test(String(payload.review?.id ?? '')) ? String(payload.review.id) : undefined;
   return {
     type: 'pull_request.review_' + verdict,
     source: 'forgejo',
@@ -121,8 +133,8 @@ function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>
       labels: present
     },
     pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
-    review: { reviewer: payload.sender?.login || null },
-    sender: { login: payload.sender?.login || null }
+    review: { reviewer, ...(human !== undefined ? { human: true, ...(reviewId ? { id: reviewId } : {}), commit: String(pr.head.sha || '') } : {}) },
+    sender: { login: reviewer }
   };
 }
 
