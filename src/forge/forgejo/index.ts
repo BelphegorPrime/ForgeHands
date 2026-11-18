@@ -23,8 +23,8 @@ export async function forgejoCall(config: ForgejoConfig, send: Fetch, repository
     signal: AbortSignal.timeout(config.timeoutMs),
     redirect: 'error'
   }).catch((error) => { metrics.apiError('forgejo', null); throw error; });
-  // A missing workflow folder is an ordinary answer of the contents API, not an error worth counting.
-  if (!response.ok) { if (!(response.status === 404 && path.startsWith('/contents/'))) metrics.apiError('forgejo', response.status); throw new Error(method + ' ' + path + ' -> HTTP ' + response.status); }
+  // A missing workflow folder or branch is an ordinary answer of the contents and branches API, not an error worth counting.
+  if (!response.ok) { if (!(response.status === 404 && (path.startsWith('/contents/') || path.startsWith('/branches/')))) metrics.apiError('forgejo', response.status); throw new Error(method + ' ' + path + ' -> HTTP ' + response.status); }
   return response.json().catch(() => null);
 }
 

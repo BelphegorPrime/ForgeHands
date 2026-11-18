@@ -41,6 +41,9 @@ const RESUME_SETTLE_MS = 60000;
 // Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
 // `no_delivery` is not one of them: it is only ever reported for issue runs, which have no escalate_to.
 const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
+// Nudge (NUDGE_AT_PERCENT): a run's actions are counted at most once a minute, and not before the run is three minutes old.
+const NUDGE_CHECK_EVERY_MS = 60000;
+const NUDGE_MIN_RUN_MS = 180000;
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -79,6 +82,7 @@ export class Dispatcher {
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
+  nudgeChecks = new Map<string, number>(); // job id -> when the actions of its run were last counted (NUDGE_AT_PERCENT); in memory only
 
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
@@ -1429,6 +1433,8 @@ export class Dispatcher {
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
       // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
       delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
+      // The nudge is once per conversation too (see nudgeIfNoBranch).
+      delete job.nudged; delete job.nudge_settled; this.nudgeChecks.delete(job.id);
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
@@ -1528,6 +1534,8 @@ export class Dispatcher {
       else if (done === 'issue') await this.checkDelivery(job);
       return true;
     }
+    // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).
+    if (state === 'running' && await this.nudgeIfNoBranch(job, now)) return true;
     if (costChanged) return true;
     // Free the slot of a run that never ends; the conversation itself is left alone unless the run is continued (see resume).
     // A continued run counts its timeout from the continuation.
@@ -1578,8 +1586,7 @@ export class Dispatcher {
     // The message and the run are two calls: a run call that is not answered is repeated on its own (startResumed), never the message.
     const text = paused ? PAUSE_MESSAGE : 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
     try {
-      const response = await this.api('POST', conversation + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, repository);
-      if (!response.ok) throw new Error('HTTP ' + response.status);
+      await this.sendMessage(job, text);
     } catch (error) {
       this.logger.error(job.key + ': ' + state + ', the message to continue it was not sent (' + error.message + '), the next stage decides');
       return false;
@@ -1590,6 +1597,85 @@ export class Dispatcher {
     this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + (used + 1) + '/' + budget + ')');
     await this.startResumed(job);
     return true;
+  }
+
+  // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it; shared by resume and the nudge.
+  async sendMessage(job: Job, text: string): Promise<void> {
+    const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, job.event.repository.full_name);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+  }
+
+  // NUDGE_AT_PERCENT: a worker run on an issue that has used that share of its route's iteration limit, and whose forge shows no branch ai/issue-<n>,
+  // is told once (per conversation) to stop exploring and push. Only a running conversation is looked at. Every read is best effort: when the count,
+  // the forge or OpenHands fails, nothing is sent and the next look comes a minute later. Returns true when the job changed (to be persisted).
+  async nudgeIfNoBranch(job: Job, now: number): Promise<boolean> {
+    const route = this.config.routes.get(job.label);
+    // Planner, epic and split routes are not workers: they plan, they do not push a branch of their own.
+    const worker = !!route && route.kind === 'issue' && !job.event.pull_request && !job.event.bot && job.event.type !== 'epic.done'
+      && !this.config.epicLabels.has(job.label) && job.label !== this.config.splitLabel;
+    if (!this.config.nudgeAtPercent || !worker || !this.config.forgejo || !job.started || !job.conversation_id || job.nudged !== undefined || job.nudge_settled) return false;
+    if (now - job.started < NUDGE_MIN_RUN_MS) return false;
+    const last = this.nudgeChecks.get(job.id);
+    if (last !== undefined && now - last < NUDGE_CHECK_EVERY_MS) return false;
+    this.nudgeChecks.set(job.id, now);
+    const repository = job.event.repository.full_name;
+    const number = job.event.issue.number;
+    let used: number;
+    try {
+      used = await this.actionCount(job);
+    } catch (error) {
+      this.logger.error(job.key + ': actions not counted, no nudge yet (' + error.message + ')');
+      return false;
+    }
+    const max = route.maxIterations;
+    if (used < Math.ceil(max * this.config.nudgeAtPercent / 100)) return false;
+    let pushed: boolean;
+    try {
+      pushed = await this.branchExists(repository, 'ai/issue-' + number);
+    } catch (error) {
+      this.logger.error(job.key + ': the branch is not read, no nudge yet (' + error.message + ')');
+      return false;
+    }
+    if (pushed) { job.nudge_settled = true; return true; }
+    try {
+      await this.sendMessage(job, this.nudgeText(used, max, number));
+    } catch (error) {
+      this.logger.error(job.key + ': not nudged, the message was not sent (' + error.message + ')');
+      return false;
+    }
+    job.nudged = used;
+    metrics.inc('forgehands_nudges_total', { kind: route.kind });
+    this.logger.error(job.key + ': nudged at ' + used + '/' + max + ' actions, no branch yet');
+    return true;
+  }
+
+  // The agent actions of a conversation so far: OpenHands' event count, restricted to ActionEvent. Throws when the count cannot be read.
+  async actionCount(job: Job): Promise<number> {
+    const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/count?kind=ActionEvent', undefined, job.event.repository.full_name);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = (await response.json()) as Json;
+    const count = typeof data === 'number' ? data : Number(data?.count);
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('the answer carries no count');
+    return count;
+  }
+
+  // Whether a branch exists in the forge. A missing branch is HTTP 404 (false); any other failure throws, so that the caller treats it as unknown.
+  async branchExists(repository: string, branch: string): Promise<boolean> {
+    try {
+      return (await this.forge.branchTip(repository, branch)) !== null;
+    } catch (error) {
+      if (/HTTP 404\b/.test(error.message)) return false;
+      throw error;
+    }
+  }
+
+  // The nudge's text: the default, or NUDGE_MESSAGE with {used}, {max} and {branch} filled in.
+  nudgeText(used: number, max: number, number: number): string {
+    const branch = 'ai/issue-' + number;
+    if (this.config.nudgeMessage) return this.config.nudgeMessage.replaceAll('{used}', String(used)).replaceAll('{max}', String(max)).replaceAll('{branch}', branch);
+    return 'You have used ' + used + ' of ' + max + ' actions and have not pushed a branch yet. Stop exploring. Implement the smallest change that meets the acceptance check, '
+      + 'commit and push it to the branch ' + branch + ' and open the draft pull request; or, if something blocks you, write a comment on the issue that names the exact blocker '
+      + 'and finish. Do not start new investigations.';
   }
 
   // The run call of a continued conversation. 200 starts it, 409 says it runs already: both clear the pending call. 404 means the conversation is

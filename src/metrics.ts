@@ -29,6 +29,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
   forgehands_resumes_total: 'Runs that ended stuck, timed out or paused and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS, PAUSE_RESUMES).',
   forgehands_ledger_sync_closed_total: 'Tickets the ledger sync (LEDGER_SYNC_HOURS) found closed or merged in the forge and marked closed on the status page.',
+  forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
   forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
 const GAUGES: Record<string, string> = {
@@ -116,7 +117,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 

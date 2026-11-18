@@ -153,6 +153,10 @@ export interface DirectConfig extends BaseConfig {
   commentRestarts: number;
   /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
   humanReviewRounds: boolean;
+  /** NUDGE_AT_PERCENT: the share of a worker run's iteration limit after which, without a branch ai/issue-<n>, the run is nudged (0 = off). */
+  nudgeAtPercent: number;
+  /** NUDGE_MESSAGE: the text of the nudge instead of the default (null: the default). */
+  nudgeMessage: string | null;
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
@@ -298,6 +302,10 @@ export interface Job {
   delivery_retry?: number;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
   delivered_on?: number;
+  /** Nudge (NUDGE_AT_PERCENT): the actions the run had used when it was nudged, once per conversation; kept on the job so a restart does not repeat it. */
+  nudged?: number;
+  /** The branch ai/issue-<n> exists, so the run needs no nudge: no more counting for this conversation. */
+  nudge_settled?: boolean;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
   /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */
