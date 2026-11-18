@@ -44,6 +44,7 @@ export interface Issue {
   state: string;
   /** The blocked pull requests (their issue numbers) this ticket waits behind, directly or through other tickets. */
   blocked_by_stuck?: number[];
+  blocked_by_epic_gaps?: number[];
   closed?: true;
   runs: Run[];
 }
@@ -73,7 +74,7 @@ export interface DashboardStatus {
   waiting_for_human: {
     repository: string;
     issue: number;
-    pr: number;
+    pr: number | null;
     since: string;
     reason: string;
   }[];

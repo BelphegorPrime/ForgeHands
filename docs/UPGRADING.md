@@ -320,3 +320,12 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Metrics and state.** The counter `forgehands_handbacks_total{kind}` counts the steps (`retry`, `escalate`, `planner`, `blocked`). The ledger gains `handback_retry` and `handback_push` on a job; the previous version ignores both, and the result `handback` shows as a failed run there.
 - **Dry run.** Under `DRY_RUN` the steps are decided and logged, and nothing is written to the forge.
 - **Rollback.** Set `HANDBACK_HANDLING=0`, or go back to the previous version.
+# Upgrading to the version after 0.9.9: an epic that stays open goes back to the planner, then to a human
+
+**A behaviour change, on by default.** Before, an epic that the epic review left open (a criterion not met) was silent: no label, no mail, no status, and the tickets that waited for it waited for ever (two epics in the homegraf repository for hours on 2026-11-18). Now ForgeHands reads the epic after the review. Open means a gap: the first one sends the epic back to its planner once (`EPIC_GAP_REPLAN=1`, the default), and the human is called only when the epic is still open after that second review.
+
+- **What you see.** A comment on the epic with the reviewer's `Not met` lines quoted, and the planner label (`ai:plan`, or `SPLIT_LABEL`) taken off and on again, which starts the planner. Then, if the gap remains, a comment that mentions `HUMAN_LOGIN`, `BLOCKED_LABEL` on the epic, one `handover` notification, and "Waiting for a human" on `/status` with the reason. Tickets waiting for the epic show `waiting behind epic with gaps #n`.
+- **The reviewer no longer mentions the human.** The epic review's prompt used to tell the reviewer to start its comment with `@HUMAN_LOGIN` when a gap was found, which mailed the human at once. Now only ForgeHands does, and only when a human is needed.
+- **Epics that were already left open are not picked up.** The new decision is taken when an epic review run finishes. An epic whose review ran before the upgrade has no record and no run of its own, so nothing starts for it: a human has to close it, add its sub-issues or change its criteria.
+- **Rollback.** `EPIC_GAP_REPLAN=0` calls the human at once instead of trying the planner first. Running the previous version restores the former silence. The ledger gains `epic_gaps`, which the previous version ignores.
+- **Metric.** `forgehands_epic_gaps_total{action}` (`replanned`, `handed`) is new.

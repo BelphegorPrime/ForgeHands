@@ -14,6 +14,7 @@ import { LedgerSync } from './ledger-sync.ts';
 import { ReviewSweep } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
 import { HandbackRouter, handbackLine, handbackOf } from './handback.ts';
+import { EpicGaps } from './epic-gaps.ts';
 import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
@@ -130,6 +131,8 @@ export class Dispatcher {
   preflight: TicketPreflight;
   /** HANDBACK_HANDLING: a worker run that hands its ticket back by a comment is run again, escalated or sent to the planner. See src/agent/handback.ts. */
   handback: HandbackRouter;
+  /** The epic review found the epic open (EPIC_GAP_REPLAN): the planner again, then the human. See src/agent/epic-gaps.ts. */
+  epicGaps: EpicGaps;
   /** The reconciler of REVIEW_SWEEP_MINUTES: starts the review of a head that has none in the ledger. */
   sweep: ReviewSweep;
   /** RECURRING_REASON_MIN: counts the NOT OK points of the changes rounds and files a check ticket for a recurring one. See src/agent/recurring.ts. */
@@ -192,6 +195,7 @@ export class Dispatcher {
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
     this.handback = new HandbackRouter({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts),
       note: (event, patch) => this.noteTicket(this.issueKey(event), patch), secrets: () => this.secretValues() });
+    this.epicGaps = new EpicGaps(config, jobs, this.forge, logger, now, { hand: (event, text, reason, facts) => this.markForHuman(event, text, reason, facts) });
     this.recurring = new RecurringFindings(config, jobs, this.forge, logger, now);
   }
 
@@ -1213,18 +1217,20 @@ export class Dispatcher {
     await this.markForHuman(event, 'ForgeHands: ' + limit + ' follow-up rounds for ' + (event.bot ? 'this dependency update' : 'issue #' + event.issue.number) + ' are used up. A human has to look at this pull request now.', 'rounds_used_up');
   }
 
-  // Say why on the pull request and label it for a human. Best effort, a failure is only logged.
+  // Say why on the pull request (or, for an epic, on its issue) and label it for a human. Best effort, a failure is only logged.
   async markForHuman(event: ForgeEvent, text: string, reason = 'other', facts: Partial<Facts> = {}): Promise<void> {
     metrics.inc('forgehands_blocks_total', { reason });
     this.noteTicket(this.issueKey(event), { blocked_at: this.now() });
-    this.tell(reason === 'conflict' ? 'conflict' : reason === 'failed_run' ? 'failed' : 'blocked', event, { why: reason, ...facts });
+    this.tell(reason === 'conflict' ? 'conflict' : reason === 'failed_run' ? 'failed' : reason === 'epic_gaps' ? 'handover' : 'blocked', event, { why: reason, ...facts });
     if (!this.config.forgejo) return;
-    const { number } = event.pull_request!;
+    // An epic has no pull request: its issue gets the comment and the label (the same number on Forgejo).
+    const number = event.pull_request?.number ?? event.issue.number;
+    const on = event.pull_request ? undefined : 'issue';
     const repository = event.repository.full_name;
     try {
-      await this.forge.addComment(repository, number, mentionOf(this.config) + text);
+      await this.forge.addComment(repository, number, mentionOf(this.config) + text, on);
       const label = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
-      await this.forge.addLabels(repository, number, [label]);
+      await this.forge.addLabels(repository, number, [label], on);
     } catch (error) {
       this.logger.error('could not mark the pull request:', error.message);
     }
@@ -2266,6 +2272,7 @@ export class Dispatcher {
       else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
       else if (done === 'issue') await this.checkDelivery(job);
       else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
+      else if (done === 'epic_done') await this.epicGaps.review(job);
       return true;
     }
     // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).

@@ -1808,7 +1808,7 @@ test('a successful merge and a pull request that is not ready never mention him'
   assert.deepEqual(commentsOf(red.forgejo), []);
 });
 
-test('rounds used up, a review without verdict and an epic with gaps mention him; without HUMAN_LOGIN nobody is mentioned', async () => {
+test('rounds used up and a review without verdict mention him; an epic with gaps does not (ForgeHands calls him, see epic-gaps.test.ts); without HUMAN_LOGIN nobody is mentioned', async () => {
   const blocked = await buildVerdict(prWith([]), { HUMAN_LOGIN: 'marcel' });
   blocked.jobs.add({ ...reviewJob(), verdict_retry: 1 });
   states['conv-r'] = 'finished';
@@ -1820,8 +1820,10 @@ test('rounds used up, a review without verdict and an epic with gaps mention him
   await plain.dispatcher.tick();
   assert.match(commentsOf(plain.forgejo)[0], /^ForgeHands: the review of commit abcdef01 ended twice/);
   const epic = { type: 'epic.done', repository: { full_name: repo }, issue: { number: 10, title: 'Epic', body: 'B', labels: [] }, epic: { children: [] }, sender: { login: 'marcel' } };
-  assert.match(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /starts with @marcel/);
-  assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic()))), /@marcel|mention/);
+  // The reviewer of an epic mentions nobody: a gap goes back to the planner first, and ForgeHands calls the human when it is still open then.
+  assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /@marcel/);
+  assert.match(buildPrompt(epic, loadConfig(env(withEpic({ HUMAN_LOGIN: 'marcel' })))), /Do not mention anybody/);
+  assert.doesNotMatch(buildPrompt(epic, loadConfig(env(withEpic()))), /@marcel|mention him/);
 });
 
 // ---- the model is out of quota: hold the tier back and try again, instead of blocking the pull request
