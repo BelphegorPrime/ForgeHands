@@ -25,6 +25,7 @@ import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
 import { behindBlocked, blockedTickets } from './stuck.ts';
+import { markReverted, revertRate } from './revert-rate.ts';
 
 // `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
@@ -782,6 +783,7 @@ export class Dispatcher {
       for (const pr of Array.isArray(pulls) ? pulls : []) {
         const reverted = /^ai\/revert-(\d+)$/.exec(pullBranch(pr));
         if (reverted && pr.merged && (!event.repository.default_branch || !pr.base?.ref || pr.base.ref === event.repository.default_branch)) {
+          await this.markRevertedMerge(repository, Number(reverted[1]), Number(pr.number));
           closed += (await this.revertMerged(repository, pr, Number(reverted[1]))) ? 1 : 0;
           continue;
         }
@@ -813,6 +815,47 @@ export class Dispatcher {
       this.logger.error('could not close the tickets of merged pull requests:', error.message);
     }
     return closed;
+  }
+
+  // The merged revert pull request r (ai/revert-<n>) undid the merge of pull request n: that merge counts as reverted, once (REVERT_RATE_ALERT).
+  // Saved at once; a merge that is marked already, or one ForgeHands did not merge, changes nothing.
+  async markRevertedMerge(repository: string, number: number, revert: number): Promise<void> {
+    const merge = markReverted(this.jobs.merges, repository, number, revert);
+    if (!merge) return;
+    metrics.inc('forgehands_merges_reverted_total', { repository: repository.toLowerCase() });
+    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+  }
+
+  // A red default branch after the merge of pull request n that no revert of ForgeHands undid: no revert route, a revert that went red, or a
+  // ticket blocked after its revert. Counted once per merge (forgehands_reverts_needing_human_total), saved at once.
+  async markNeededHuman(repository: string, number: number): Promise<void> {
+    const name = repository.toLowerCase();
+    const merge = this.jobs.merges.find((entry) => entry.repository === name && entry.number === number);
+    if (!merge || merge.needed_human) return;
+    merge.needed_human = true;
+    metrics.inc('forgehands_reverts_needing_human_total', { repository: name });
+    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+  }
+
+  // REVERT_RATE_ALERT: a repository whose revert rate of the last 30 days is above the threshold gets one `failed` notice per day (UTC), once
+  // REVERT_RATE_MIN_MERGES merges are in the window, so that one revert of two merges does not alarm. Off at 0. Returns whether it noted one.
+  async checkRevertRate(now: number): Promise<boolean> {
+    const threshold = this.config.revertRateAlert;
+    if (!threshold || !this.notifier.wants('failed')) return false;
+    const day = new Date(now).toISOString().slice(0, 10);
+    let told = false;
+    for (const repository of this.config.allowedRepos) {
+      const rate = revertRate(this.jobs.merges, repository, now);
+      if (rate.ratio === null || rate.merges < this.config.revertRateMinMerges || rate.ratio * 100 <= threshold) continue;
+      const key = 'revert_rate:' + repository + '@' + day;
+      if (this.jobs.noted(key)) continue;
+      this.jobs.note(key, now);
+      told = true;
+      const percent = Math.round(rate.ratio * 1000) / 10;
+      this.notifier.notify(immediateMessage(this.config.notify.language, 'failed', { repository, number: 0, why: 'revert_rate',
+        rate: { percent, reverted: rate.reverted, merges: rate.merges, threshold } }), repository);
+    }
+    return told;
   }
 
   // The record of the revert of pull request n (REVERT_RETRIES), if any.
@@ -880,7 +923,7 @@ export class Dispatcher {
     if (!record.restarted && !record.blocked) {
       if (used < this.config.revertRetries) {
         const label = this.lastRunLabel(name, ticket);
-        if (!label) { this.logger.error(name + '#' + ticket + ': no run of the ticket to start again after its revert, nothing started'); }
+        if (!label) { this.logger.error(name + '#' + ticket + ': no run of the ticket to start again after its revert, nothing started'); await this.markNeededHuman(repository, record.number); }
         else {
           try {
             const issue = await this.forge.getIssue(repository, ticket);
@@ -907,6 +950,7 @@ export class Dispatcher {
           this.tell('blocked', { repository: { full_name: repository, clone_url: null, html_url: null, default_branch: branch }, type: 'ci.main_failure', source: this.forge.kind,
             sender: { login: null }, issue: { number: ticket, title: '', body: '', html_url: null, comments: 0, labels: [] } }, { why: 'revert_retries' });
           record.blocked = true;
+          await this.markNeededHuman(repository, record.number);
         } catch (error) {
           this.logger.error('could not block #' + ticket + ' after its revert:', error.message);
           return false;
@@ -979,6 +1023,8 @@ export class Dispatcher {
     // The pull request as the notice names it: the merged one, or the revert that went red (whose merge was a revert).
     const told = { ...event, issue: { ...event.issue, number, title: title.slice(0, 1000), html_url: null }, pull_request: { number, head_ref: head, html_url: null } };
     if (REVERT_BRANCH.test(head)) {
+      // The revert went red: the merge it undid stays undone by a human, not by ForgeHands.
+      await this.markNeededHuman(repository, Number(/\d+$/.exec(head)![0]));
       this.tell('failed', told, { why: 'revert_red' });
       return { status: 'revert_red_told' };
     }
@@ -990,7 +1036,10 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not comment on #' + number + ':', error.message);
     }
-    if (!route) return { status: 'handed_to_human' };
+    if (!route) {
+      await this.markNeededHuman(repository, number);
+      return { status: 'handed_to_human' };
+    }
     // REVERT_RETRIES: the revert of an agent's merge is recorded, so that its merged revert can reopen and restart the ticket (see revertMerged).
     const ticket = /^ai\/issue-(\d+)$/.exec(head);
     const record = this.config.revertRetries && ticket ? { repository: repository.toLowerCase(), number, issue: Number(ticket[1]), sha, state: 'started' as const, at: this.now() } : null;
@@ -1445,6 +1494,7 @@ export class Dispatcher {
     if (await this.sweepClosed(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
+    if (await this.checkRevertRate(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
   }
 

@@ -47,6 +47,8 @@ export interface Facts {
   why?: string;
   /** reminder: days waited, which reminder of how many. */
   days?: number;
+  /** failed with why `revert_rate`: the revert rate of 30 days in percent, the reverted merges, the merges and REVERT_RATE_ALERT. */
+  rate?: { percent: number; reverted: number; merges: number; threshold: number };
   nth?: number;
   of?: number;
 }
@@ -67,6 +69,9 @@ const T = {
     conflictSubject: 'has a conflict',
     conflict: 'It conflicts with the default branch and ForgeHands cannot resolve it.',
     failedSubject: 'a run failed',
+    revertRateSubject: (percent: number) => 'revert rate ' + percent + ' % of the last 30 days',
+    revertRate: (reverted: number, merges: number, percent: number, threshold: number) => 'Merges reverted in the last 30 days: ' + reverted + ' of ' + merges + ' (' + percent
+      + ' %), above REVERT_RATE_ALERT (' + threshold + ' %). Consider TWO_KEYS for this repository until it is lower.',
     failed: (why: string) => ({ merge_failed: 'The merge itself failed.', max_iterations: 'A run reached its iteration limit.', paused: 'A run was paused.', stuck: 'A run got stuck.',
       timeout: 'A run took too long.', no_delivery: 'A run finished without delivering anything.', error: 'A run ended with an error.',
       main_red: 'CI failed on the default branch after a merge of ForgeHands. A revert is started, unless no revert route exists.',
@@ -100,6 +105,9 @@ const T = {
     conflictSubject: 'hat einen Konflikt',
     conflict: 'Er kollidiert mit dem Standardbranch und ForgeHands kann das nicht lösen.',
     failedSubject: 'ein Lauf ist gescheitert',
+    revertRateSubject: (percent: number) => 'Revert-Rate ' + percent + ' % der letzten 30 Tage',
+    revertRate: (reverted: number, merges: number, percent: number, threshold: number) => 'Zurückgenommene Merges in den letzten 30 Tagen: ' + reverted + ' von ' + merges + ' ('
+      + percent + ' %), über REVERT_RATE_ALERT (' + threshold + ' %). Erwäge TWO_KEYS für dieses Repository, bis die Rate sinkt.',
     failed: (why: string) => ({ merge_failed: 'Der Merge selbst ist gescheitert.', max_iterations: 'Ein Lauf hat sein Iterationslimit erreicht.', paused: 'Ein Lauf wurde pausiert.', stuck: 'Ein Lauf hängt fest.',
       timeout: 'Ein Lauf hat zu lange gedauert.', no_delivery: 'Ein Lauf endete, ohne etwas zu liefern.', error: 'Ein Lauf endete mit einem Fehler.',
       main_red: 'CI ist auf dem Standardbranch nach einem Merge von ForgeHands gescheitert. Ein Revert wird gestartet, sofern es eine Revert-Route gibt.',
@@ -138,6 +146,10 @@ function immediatePlain(language: NotifyLanguage, kind: string, facts: Facts): N
     return { ...base, subject: head(facts) + ' ' + t.blockedSubject, text: lines(title, t.blockedWhy(why), t.needsHuman) };
   }
   if (kind === 'conflict') return { ...base, subject: head(facts) + ' ' + t.conflictSubject, text: lines(title, t.conflict, t.needsHuman) };
+  if (kind === 'failed' && facts.why === 'revert_rate' && facts.rate) {
+    const { percent, reverted, merges, threshold } = facts.rate;
+    return { ...base, subject: '[' + shortRepo(facts.repository) + '] ' + t.revertRateSubject(percent), text: lines(t.revertRate(reverted, merges, percent, threshold), t.needsHuman) };
+  }
   if (kind === 'failed') return { ...base, subject: head(facts) + ' ' + t.failedSubject, text: lines(title, t.failed(facts.why ?? ''), t.needsHuman) };
   if (kind === 'reminder') {
     const days = Math.max(0, Math.floor(facts.days ?? 0));

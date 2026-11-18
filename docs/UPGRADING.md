@@ -26,6 +26,7 @@ These apply from the first start on 0.4.0:
 - **The status page** gains a summary above the ticket table and refreshes itself every 30 seconds.
 - **The start logs a warning** when `STATUS_TOKEN` is not set: `/status`, `/status.json` and the new `/metrics` are then open to everybody who can reach the port.
 - **The code moved**: `src/forgejo/` is now `src/forge/`. This matters only if you patch or script against the source.
+- **The revert rate is measured** (`forgehands_merges_reverted_ratio`, the revert fields of the status summary). It needs no switch; the alert is off until you set `REVERT_RATE_ALERT`. The figure is built from the merge ledger from now on: a revert merged before the upgrade is found only when it is among the last 20 closed pull requests of a push to the default branch after the upgrade, so the figure for the first 30 days may read low.
 
 ## New features and their switches
 
@@ -40,6 +41,7 @@ These apply from the first start on 0.4.0:
 | Dry run | `DRY_RUN=1`, `DRY_RUN_REPOS` | off | README, Dry run |
 | Cleaning of the OpenHands workspace and a disk guard (0.7.0) | `WORKSPACE_CLEANUP_DIR`, `DISK_WARN_PERCENT`, `DISK_MIN_FREE_GB` | off | README, Cleaning the workspace |
 | Token for the status page, summary, Prometheus metrics | `STATUS_TOKEN`, `GET /metrics` | open | README, Status page and metrics |
+| Revert rate of the merges and an alert above a threshold (per repository, once a day) | `REVERT_RATE_ALERT` (percent), `REVERT_RATE_MIN_MERGES` | off (`0`), 10 | README, The revert rate |
 
 ## Setting up reviewer accounts (optional)
 
