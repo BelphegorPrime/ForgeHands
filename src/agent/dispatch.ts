@@ -376,7 +376,7 @@ export class Dispatcher {
   // restarts per issue and label; then one notice on the issue and nothing more. A comment starts at most one run (its id is kept in the ledger).
   async onComment(event: ForgeEvent): Promise<string> {
     const human = this.config.humanLogin?.toLowerCase();
-    if (!human || !this.config.commentRestarts || !event.comment) return 'comment_restarts_off';
+    if (!human || !event.comment || (!this.config.commentRestarts && !this.config.planAnswerRestarts)) return 'comment_restarts_off';
     if (String(event.comment.login || '').toLowerCase() !== human) return 'not_the_human';
     if (!this.config.forgejo) return 'no_forgejo_access';
     const repository = event.repository.full_name;
@@ -387,8 +387,9 @@ export class Dispatcher {
     const runs = this.jobs.list().filter((job) => job.key.startsWith(ticket + ':') && this.config.routes.get(job.label)?.kind === 'issue');
     if (runs.some((job) => ACTIVE_STATUSES.has(job.status))) return 'run_active';
     const latest = runs.at(-1);
-    // The run that ended last must have failed (any result) or been handed to the human; a run that is done says nothing to a comment.
-    if (!latest || (latest.status !== 'failed' && !latest.blocked_at)) return 'no_failed_run';
+    // The run that ended last must have failed (any result) or been handed to the human; otherwise the comment may answer a planner (see planAnswer).
+    if (!latest || (latest.status !== 'failed' && !latest.blocked_at)) return this.planAnswer(event, runs, commentKey);
+    if (!this.config.commentRestarts) return 'comment_restarts_off';
     // Only now the forge is asked: the issue must be open and still carry the label of that run.
     let issue: Json;
     try {
@@ -427,6 +428,77 @@ export class Dispatcher {
     return result.status;
   }
 
+  // A planner label: SPLIT_LABEL or an EPIC_LABEL with a route of kind issue (the planner's run). ai:close has no route, so it is none.
+  isPlannerLabel(label: string): boolean {
+    return this.config.routes.get(label)?.kind === 'issue' && (label === this.config.splitLabel || this.config.epicLabels.has(label));
+  }
+
+  // PLAN_ANSWER_RESTARTS: a planner that finished without sub-issues asked the operator questions (its prompt says so), and his comment answers
+  // them: the planner starts again. Only when the newest run of a planner label is done, the issue is open and still carries that label, and it
+  // has no sub-issues (its dependencies and the issues it blocks are both empty). A planner that is still running is not restarted (the active
+  // check in onComment); an unreadable forge or an unclear answer means nothing happens. Once per comment, and at most N times per ticket and label,
+  // then one notice on the issue.
+  async planAnswer(event: ForgeEvent, runs: Job[], commentKey: string): Promise<string> {
+    const limit = this.config.planAnswerRestarts;
+    if (!limit) return 'plan_answers_off';
+    const repository = event.repository.full_name;
+    const number = event.issue.number;
+    const ticket = this.issueKey(event);
+    const planner = runs.filter((job) => this.isPlannerLabel(job.label));
+    const label = planner.at(-1)?.label;
+    // No finished planner is the answer a comment has always got when nothing failed ('no_failed_run').
+    if (!label || planner.at(-1)!.status !== 'done') return 'no_failed_run';
+    let issue: Json; let dependencies: unknown; let blocks: unknown;
+    try {
+      issue = await this.forge.getIssue(repository, number);
+      dependencies = await this.forge.dependencies(repository, number);
+      blocks = await this.forge.blocks(repository, number);
+    } catch (error) {
+      this.logger.error('could not read #' + number + ' after a comment, not restarting its plan:', error.message);
+      return 'issue_unreadable';
+    }
+    if (!issue || issue.state !== 'open' || issue.pull_request) return 'not_open';
+    const labels: string[] = (Array.isArray(issue.labels) ? issue.labels : []).map((entry: Json) => entry?.name).filter((name: unknown): name is string => typeof name === 'string');
+    if (!labels.includes(label)) return 'label_gone';
+    // A read that does not give a list is unknown, and unknown means nothing happens.
+    if (!Array.isArray(dependencies) || !Array.isArray(blocks)) return 'links_unknown';
+    if (dependencies.length || blocks.length) return 'has_sub_issues';
+    const now = this.now();
+    const restarts = planner.filter((job) => job.label === label && job.event?.plan_answer).length;
+    if (restarts >= limit) {
+      const noticeKey = 'planlimit:' + ticket + ':' + label;
+      if (!this.jobs.noted(noticeKey)) {
+        try {
+          await this.planLimit(event, label, restarts);
+        } catch (error) {
+          this.logger.error('could not write the notice of ' + ticket + ':', error.message);
+          return 'notice_failed';
+        }
+        this.jobs.note(noticeKey, now);
+      }
+      this.jobs.note(commentKey, now);
+      await this.jobs.persist(now);
+      return 'plan_answers_used_up';
+    }
+    // The comment is the trigger, not part of the run: the COMMENT_RESTARTS line and its count do not apply to it.
+    const { comment: answer, ...rest } = event;
+    const result = await this.enqueueOne({ ...rest, type: 'issues.commented', label, plan_answer: true, issue: { ...event.issue, labels } });
+    if (result.status !== 'queued' && result.status !== 'waiting') return result.status;
+    this.jobs.note(commentKey, now);
+    await this.jobs.persist(now);
+    metrics.inc('forgehands_plan_answer_restarts_total');
+    this.logger.error(repository + '#' + number + ': ' + answer!.login + ' commented on a plan without sub-issues, running ' + label + ' again');
+    return result.status;
+  }
+
+  // The notice that PLAN_ANSWER_RESTARTS is used up: one comment on the issue and a notification, as COMMENT_RESTARTS does.
+  // It does not mark the ticket blocked: a blocked newest run is read as a failed one by onComment, and the answers would leave the plan path.
+  async planLimit(event: ForgeEvent, label: string, restarts: number): Promise<void> {
+    this.tell('blocked', event, { why: 'plan_answer_restarts' });
+    await this.forge.addComment(event.repository.full_name, event.issue.number, mentionOf(this.config) + 'ForgeHands: ' + label + ' was started again by answers '
+      + restarts + ' times already (PLAN_ANSWER_RESTARTS=' + this.config.planAnswerRestarts + '). Answers start no more runs of it; a human has to look at this issue.', 'issue');
+  }
+
   // The notice that COMMENT_RESTARTS is used up: one comment on the issue, with the hand-over mention rules (HUMAN_MENTION) and a notification.
   async commentLimit(event: ForgeEvent, label: string, restarts: number): Promise<void> {
     metrics.inc('forgehands_blocks_total', { reason: 'comment_restarts' });
@@ -445,7 +517,7 @@ export class Dispatcher {
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
     const kind = this.config.routes.get(label)!.kind;
-    if (this.config.epicLabels.has(label) && !event.pull_request && !event.ci && event.type.startsWith('issues.')) await this.endOriginalPull(event, label);
+    if (this.config.epicLabels.has(label) && !event.pull_request && !event.ci && !event.plan_answer && event.type.startsWith('issues.')) await this.endOriginalPull(event, label);
     if (event.ci) {
       // While an agent still works on the issue (it will push again) the outcome is not acted on, but kept: it is looked at again
       // when that run ends (see releaseDeferred), because CI often finishes seconds before the agent's last step.

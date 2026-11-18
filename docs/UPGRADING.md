@@ -182,6 +182,16 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - The log gains `nudge pending (timeout), checking the events` and `nudge confirmed in the events`. A nudge that never shows in the events is sent once more, then the run gets no further nudges (`the nudge was not delivered after 2 tries`).
 - Rollback: go back to 0.8.0. A pending nudge in the ledger (`nudge_pending`) is ignored there.
 
+# Upgrading to the next version: a comment answers a planner
+
+**Behaviour change.** A planner that asked its questions as comments and finished without sub-issues used to get no reaction to the operator's answers. Now a comment of `HUMAN_LOGIN` on such an issue starts the planner again (see README, "A comment answers a planner without sub-issues").
+
+- **On by default** (`PLAN_ANSWER_RESTARTS`, default `5`, `0` switches it off). Nothing to set if the planner's prompt does not ask questions; a planner that finishes with sub-issues is never restarted.
+- **Caveat.** A comment that arrives while the planner still runs starts nothing, as before. Answer once the run has finished.
+- **What you see.** The log says `<repo>#<n>: <login> commented on a plan without sub-issues, running <label> again`; the counter `forgehands_plan_answer_restarts_total` counts it. At the limit one notice comment on the issue says so.
+- **The webhook answer.** With `COMMENT_RESTARTS=0` a comment now reaches the dispatcher when `PLAN_ANSWER_RESTARTS` is on, so the webhook answers `comment_restarts_off` where it used to answer `ignored`. Nothing starts in either case.
+- **Rollback.** Set `PLAN_ANSWER_RESTARTS=0`, or go back to the previous version. The ledger gains `plan_answer` on a job; the previous version ignores it.
+
 # Upgrading to the version after 0.8.1: tickets deleted in the forge leave the queue
 
 **Fix.** A ticket deleted in Forgejo kept its waiting jobs in the ledger: the dependency read answered 404 on every look, the log repeated the same line, and when its dependencies resolved a run would have started for a ticket that no longer exists. From this version a 404 of the ticket itself (not of its dependency list) drops its waiting and queued jobs.

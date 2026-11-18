@@ -3714,7 +3714,8 @@ test('COMMENT_RESTARTS=0 switches the feature off', async () => {
   const t = await buildComments({ COMMENT_RESTARTS: '0' });
   await t.dispatcher.enqueue(event('ai:ready', 26));
   await endLast(t);
-  assert.equal(await postComment(t, { id: 711 }), 'ignored');
+  // The webhook hands the comment on (PLAN_ANSWER_RESTARTS may need it), and the dispatcher starts nothing.
+  assert.equal(await postComment(t, { id: 711 }), 'comment_restarts_off');
   assert.equal(starts().length, 1);
   assert.throws(() => loadConfig(env({ HUMAN_LOGIN: 'marcel', COMMENT_RESTARTS: '-1' })), /COMMENT_RESTARTS must be an integer between 0 and 100/);
 });

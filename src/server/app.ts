@@ -279,7 +279,7 @@ export function createApp(
             }
           : undefined,
         comments:
-          direct && config.humanLogin && config.commentRestarts
+          direct && config.humanLogin && (config.commentRestarts || config.planAnswerRestarts)
             ? { human: config.humanLogin }
             : undefined,
       },
