@@ -150,6 +150,8 @@ export interface DirectConfig extends BaseConfig {
   splitLabel: string | null;
   /** TICKET_PREFLIGHT (on by default, 0 = off): a worker's ticket that breaks a rule of src/agent/preflight.ts starts no run. */
   ticketPreflight: boolean;
+  /** HANDBACK_HANDLING (on by default, 0 = off): a worker run that ends with a comment instead of a pull request is a hand-back, not a delivery (src/agent/handback.ts). */
+  handbackHandling: boolean;
   archiveAfterDays: number;
   /** REVERT_RETRIES (0 = off, at most 5): how often a ticket whose change was reverted after a red default branch is started again. See Dispatcher.revertMerged. */
   revertRetries: number;
@@ -419,7 +421,7 @@ export interface Job {
   /** PAUSE_RESUMES: how often the run was continued after it was paused (its own budget, counted apart from `resumes`). */
   pause_resumes?: number;
   /** Stage B (FAILURE_ESCALATE): a fresh run of a round on the profile of its escalate_to route, started after `escalated_after` (the state the run stopped in,
-   * or `no_delivery` for an issue run that finished twice without a delivery). It is not a follow-up round: it does not count against MAX_ROUNDS. */
+   * `no_delivery` for an issue run that finished twice without a delivery, or `handback` for a worker that handed its ticket back by a comment). It is not a follow-up round: it does not count against MAX_ROUNDS. */
   failure_escalation?: boolean;
   escalated_after?: string;
   /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */
@@ -433,6 +435,9 @@ export interface Job {
   synced_at?: number;
   error_retry?: number;
   delivery_retry?: number;
+  /** HANDBACK_HANDLING: the run was made once more because it handed the ticket back with "done, but nothing pushed" (once per job); the next run is told to push. */
+  handback_retry?: boolean;
+  handback_push?: boolean;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
   delivered_on?: number;
   /** The tokens of the run's conversations so far, added up when each of them ended (see Dispatcher.countTokens). */
