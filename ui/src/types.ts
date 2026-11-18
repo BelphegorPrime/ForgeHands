@@ -46,14 +46,31 @@ export interface Issue {
 
 export interface DashboardStatus {
   generated: string;
-  limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
+  limits: {
+    running: number;
+    max_concurrent: number;
+    max_rounds: number;
+    max_runs_per_hour: number;
+  };
   notify: { channels: string[]; immediate: string[]; digest: string | null };
-  dry_run: { repositories: string[] | 'all'; would_write: unknown[] } | null;
-  summary: Record<string, {
-    last_7_days: Summary;
-    last_30_days: Summary;
-    tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats }>;
-  }>;
+  dry_run: { repositories: string[] | "all"; would_write: unknown[] } | null;
+  summary: Record<
+    string,
+    {
+      last_7_days: Summary;
+      last_30_days: Summary;
+      tiers: Record<
+        string,
+        { last_7_days: TierStats; last_30_days: TierStats }
+      >;
+    }
+  >;
   issues: Issue[];
-  waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
+  waiting_for_human: {
+    repository: string;
+    issue: number;
+    pr: number;
+    since: string;
+    reason: string;
+  }[];
 }
