@@ -159,6 +159,8 @@ export interface DirectConfig extends BaseConfig {
   reviewSweepMinutes: number;
   /** STUCK_PR_MINUTES (0 = off, at most 10080): how long an agent pull request may sit with a NOT OK verdict and nothing running before the watchdog blocks it. See stuck.ts. */
   stuckPrMinutes: number;
+  /** EPIC_GAP_REPLAN (default 1, 0 = off, at most 5): how often an epic that the review found open goes back to the planner before a human is called. See epic-gaps.ts. */
+  epicGapReplan: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
   deleteAfterDays: number;
   /** The days after which a failed (or deleted) run's conversation goes: DELETE_FAILED_AFTER_DAYS, or DELETE_AFTER_DAYS when that is 0. */
@@ -370,6 +372,19 @@ export interface Hold {
   merge_after: number | null;
   /** When the hold is looked at again (the timer in the dispatch tick, see Merger.recheckHolds). */
   check_at: number;
+}
+
+/** An epic (EPIC_LABEL) that the epic review found still open, kept in the ledger per epic ("repo#n", lower case) until it is closed (see epic-gaps.ts).
+ * `sha` is the default branch's head the last decision was taken at; `replans` counts the times the epic went back to the planner (EPIC_GAP_REPLAN);
+ * `human` is true once the human was called (at `sha`), so the epic waits for him. `reason` is the first lines of the reviewer's comment. */
+export interface EpicGapRecord {
+  repository: string;
+  issue: number;
+  sha: string | null;
+  at: number;
+  replans: number;
+  human: boolean;
+  reason: string;
 }
 
 /** A blocked agent pull request, kept in the ledger per pull request ("repo#pr<n>") while it is blocked or a human may unblock it (see stuck.ts).

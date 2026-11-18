@@ -9,7 +9,7 @@ import { holdKey } from '../agent/merge.ts';
 import { behindBlocked, blockedTickets } from '../agent/stuck.ts';
 import { revertRate } from '../agent/revert-rate.ts';
 import type { RevertRate } from '../agent/revert-rate.ts';
-import type { MergeRecord } from '../types.ts';
+import type { EpicGapRecord, MergeRecord } from '../types.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -40,11 +40,12 @@ export interface Status {
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats; tokens: TierTokens }> }>;
   // blocked_by_stuck: the issues of the blocked pull requests this ticket waits behind (directly or through other tickets); state says so too.
-  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  // blocked_by_epic_gaps: the same for the epics the epic review found open (see epic-gaps.ts).
+  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; blocked_by_epic_gaps: number[]; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
-  // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
-  waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
+  // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them; epics the review found open wait too (pr: null).
+  waiting_for_human: { repository: string; issue: number; pr: number | null; since: string; reason: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
   // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
@@ -254,6 +255,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const hideBefore = config.statusHideDays > 0 && !options.all ? now - config.statusHideDays * DAY_MS : null;
   // The chain of waits behind blocked pull requests (see stuck.ts): read from the ledger, once per request.
   const behind = behindBlocked(jobs.list(), blockedTickets(jobs.stuck));
+  // The same for the epics the review found open (EPIC_GAP_REPLAN): the tickets that wait behind one of them.
+  const behindGaps = behindBlocked(jobs.list(), new Set(jobs.epicGaps.keys()));
   let hidden = 0;
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
@@ -261,16 +264,18 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     const issueNumber = entry.key.includes('#') ? Number(entry.key.slice(entry.key.lastIndexOf('#') + 1)) : 0;
     const chain = closed.has(entry.key) ? [] : behind.get(entry.key) ?? [];
+    const gaps = closed.has(entry.key) ? [] : behindGaps.get(entry.key) ?? [];
     const base = deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
     // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
-    const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ') : base;
+    const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ')
+      : gaps.length && base.startsWith('waiting for') ? 'waiting behind epic with gaps ' + gaps.map((number) => '#' + number).join(', ') : base;
     return {
       issue: entry.key,
       issue_url: entry.issueUrl || (issueNumber ? forgeItemUrl(config, entry.key.slice(0, entry.key.lastIndexOf('#')), 'issue', issueNumber) : null),
       title: entry.title,
       pr,
       pr_url: entry.prUrl || (pr ? forgeItemUrl(config, entry.key.split(/[#!]/)[0], 'pr', pr) : null),
-      rounds, state, blocked_by_stuck: chain,
+      rounds, state, blocked_by_stuck: chain, blocked_by_epic_gaps: gaps,
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last
@@ -299,7 +304,9 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier], tokens: tokensWeek[repo]?.[tier] || emptyTokens() }])) }])),
     issues,
     hidden,
-    waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
+    waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
+      ...[...jobs.epicGaps.values()].filter((record: EpicGapRecord) => record.human && !closed.has(record.repository + '#' + record.issue))
+        .map((record: EpicGapRecord) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'epic stays open after its review: ' + record.reason }))],
     workspace,
     ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers, cycles: options.idle.cycles } } : {})
   };
@@ -365,7 +372,7 @@ export function renderStatus(status: Status): string {
   const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';
   const rows = status.issues.filter((issue) => !issue.closed).map(line).join('\n');
   const hiddenNote = status.hidden ? '<p><a href="?all=1">' + status.hidden + ' older closed ticket(s) hidden: show all</a></p>' : '';
-  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + ' #' + entry.pr
+  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + (entry.pr ? ' #' + entry.pr : '')
     + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
