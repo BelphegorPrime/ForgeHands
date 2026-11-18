@@ -807,6 +807,14 @@ test('a stuck run does not read the trigger label: it is continued as before whe
   assert.equal(job.status, 'running');
 });
 
+test('PAUSE_RESUMES is validated: the default is 3, 0 switches it off, at most 10', () => {
+  assert.throws(() => loadConfig(env({ PAUSE_RESUMES: '11' })), /PAUSE_RESUMES/);
+  assert.throws(() => loadConfig(env({ PAUSE_RESUMES: '-1' })), /PAUSE_RESUMES/);
+  assert.equal(loadConfig(env()).pauseResumes, 3);
+  assert.equal(loadConfig(env({ PAUSE_RESUMES: '0' })).pauseResumes, 0);
+  assert.equal(loadConfig(env({ PAUSE_RESUMES: '10' })).pauseResumes, 10);
+});
+
 test('RESUME_ATTEMPTS and FAILURE_ESCALATE are validated', () => {
   assert.throws(() => loadConfig(env({ RESUME_ATTEMPTS: '-1' })), /RESUME_ATTEMPTS/);
   assert.throws(() => loadConfig(env({ RESUME_ATTEMPTS: '9' })), /RESUME_ATTEMPTS/);
