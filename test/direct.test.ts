@@ -492,6 +492,8 @@ async function buildWatched(extra) {
     if (!String(url).startsWith('https://forge.example/')) return api(url, request);
     const path = new URL(url).pathname.replace('/api/v1/repos/owner/hello', '');
     forgejo.push({ method: request.method, path, body: request.body && JSON.parse(request.body) });
+    // The ticket itself, open and carrying its trigger label: a paused run is only resumed while that label is on it.
+    if (request.method === 'GET' && /^\/issues\/\d+$/.test(path)) return { ok: true, status: 200, json: async () => ({ number: Number(path.slice(8)), state: 'open', labels: [{ id: 3, name: 'ai:ready' }] }) };
     const labels = path.endsWith('/labels') && request.method === 'GET' && path !== '/labels' ? [{ id: 3, name: 'ai:ready' }] : request.method === 'GET' ? [{ id: 8, name: 'ai:plan' }, { id: 9, name: 'ai:blocked' }] : { id: 77 };
     return { ok: true, status: 200, json: async () => labels };
   };
@@ -634,17 +636,26 @@ test('a failed round on a pull request marks it for the human; a review run leav
   assert.ok(forgejo.some((c) => c.method === 'POST' && c.path === '/issues/34/labels'), 'blocked label set');
 });
 
-test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to the planner; without it a human is called', async () => {
+test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to the planner; without it a human is called; a paused run is resumed, never split', async () => {
   const split = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
   await split.dispatcher.enqueue(event('ai:ready', 57));
-  await split.finish('paused');
-  assert.match(split.comments()[0], /^ForgeHands: the run for ai:ready ended with "paused", so the ticket is probably too big/);
+  await split.finish('max_iterations');
+  assert.match(split.comments()[0], /^ForgeHands: the run for ai:ready ended with "max_iterations", so the ticket is probably too big/);
   assert.ok(split.forgejo.some((c) => c.method === 'DELETE' && c.path === '/issues/57/labels/3'), 'the worker label comes off');
   assert.ok(split.forgejo.some((c) => c.method === 'POST' && c.path === '/issues/57/labels' && c.body.labels[0] === 8), 'the planner label goes on');
+  // A pause is an interruption, not a too big ticket: the run goes on on its conversation and nothing is split.
+  const paused = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  await paused.dispatcher.enqueue(event('ai:ready', 61));
+  await paused.finish('paused');
+  // The newest job: buildWatched ledgers share one file, so the split run above is listed first.
+  assert.equal(paused.jobs.list().at(-1).status, 'running');
+  assert.equal(paused.jobs.list().at(-1).pause_resumes, 1);
+  assert.deepEqual(paused.comments(), []);
+  assert.ok(!paused.forgejo.some((c) => c.method === 'DELETE' || (c.method === 'POST' && c.path === '/issues/61/labels')), 'no label changes');
   const plain = await buildWatched();
   await plain.dispatcher.enqueue(event('ai:ready', 58));
-  await plain.finish('paused');
-  assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "paused"\. A human/);
+  await plain.finish('max_iterations');
+  assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "max_iterations"\. A human/);
   assert.ok(!plain.forgejo.some((c) => c.method === 'DELETE'));
   const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan', RESUME_ATTEMPTS: '0' });
   await planner.dispatcher.enqueue(event('ai:plan', 59));
@@ -1396,16 +1407,27 @@ test('a kept CI outcome does not hold the issue for ever', async () => {
   assert.ok(jobs.list().every((job) => job.status !== 'waiting' || !job.waiting_for_run));
 });
 
-test('a paused conversation frees its slot and the issue', async () => {
-  const { dispatcher, jobs } = await build(withChanges());
+test('a paused conversation is resumed on its conversation and keeps its slot until the run ends', async () => {
+  const config = loadConfig(env(withChanges()));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  // The forge answers the open ticket with its trigger label (the check a paused run goes through before it is resumed).
+  const send = async (url, request) => String(url).startsWith('https://forge.example/')
+    ? { ok: true, status: 200, json: async () => ({ number: 26, state: 'open', labels: [{ id: 3, name: 'ai:ready' }] }) } : api(url, request);
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
   assert.equal((await dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
   await dispatcher.tick();
   const job = jobs.list()[0];
   assert.equal(job.status, 'running');
   states[job.conversation_id] = 'paused';
   await dispatcher.tick();
-  assert.equal(job.status, 'failed');
-  assert.equal(job.result, 'paused');
+  assert.equal(job.status, 'running');
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(jobs.list(true).length, 1, 'the run goes on, so the slot stays taken');
+  states[job.conversation_id] = 'finished';
+  await dispatcher.tick();
+  assert.equal(job.status, 'done');
   assert.equal(jobs.list(true).length, 0);
 });
 

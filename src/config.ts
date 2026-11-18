@@ -376,6 +376,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // A run that ends stuck or timed out is continued on its own conversation this many times (a message, then the run) before the next
     // stage: a round escalates (FAILURE_ESCALATE), anything else goes to the human. 0 switches it off.
     resumeAttempts: env.RESUME_ATTEMPTS === '0' ? 0 : positiveInt(env.RESUME_ATTEMPTS, 1, 'RESUME_ATTEMPTS', 5),
+    // A paused run (an interruption, not a sign of a big ticket) continues on its conversation this many times, on a budget of its own.
+    pauseResumes: env.PAUSE_RESUMES === '0' ? 0 : positiveInt(env.PAUSE_RESUMES, 3, 'PAUSE_RESUMES', 10),
     // A round that is still stuck, timed out or out of iterations after that starts once more on the profile of its escalate_to route, once per
     // head commit of the pull request. 0 switches it off.
     failureEscalate: failureEscalateOf(env.FAILURE_ESCALATE),

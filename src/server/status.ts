@@ -167,7 +167,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
       retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created,
-      resumes: job.status === 'running' && job.resumes ? job.resumes : undefined, escalated_after: job.escalated_after
+      resumes: job.status === 'running' && (job.resumes || job.pause_resumes) ? (job.resumes || 0) + (job.pause_resumes || 0) : undefined, escalated_after: job.escalated_after
     };
     const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [], last: 0 };
     entry.runs.push(run);
