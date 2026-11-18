@@ -268,7 +268,8 @@ test('the default message names the actions, the branch and the way out', async 
   t.oh.counts[job.conversation_id] = 27;
   clock += 3 * MINUTE;
   await t.dispatcher.tick();
-  const text = nudges(t)[0].text;
+  // The marker of the delivery (a short id) is added after the text; it is what a timed out nudge is looked for by.
+  const text = nudges(t)[0].text.replace(/ \[forgehands-nudge [0-9a-f]{8}\]$/, '');
   assert.equal(text, 'You have used 27 of 40 actions and have not pushed a branch yet. Stop exploring. Implement the smallest change that meets the acceptance check, '
     + 'commit and push it to the branch ai/issue-57 and open the draft pull request; or, if something blocks you, write a comment on the issue that names the exact blocker '
     + 'and finish. Do not start new investigations.');
@@ -280,7 +281,7 @@ test('NUDGE_MESSAGE replaces the text, with {used}, {max} and {branch} filled in
   t.oh.counts[job.conversation_id] = 26;
   clock += 3 * MINUTE;
   await t.dispatcher.tick();
-  assert.equal(nudges(t)[0].text, 'Stop. 26 of 40 on ai/issue-57: push now.');
+  assert.match(nudges(t)[0].text, /^Stop\. 26 of 40 on ai\/issue-57: push now\. \[forgehands-nudge [0-9a-f]{8}\]$/);
 });
 
 test('the nudge flag survives a ledger round trip', async () => {
