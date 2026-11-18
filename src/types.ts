@@ -205,6 +205,8 @@ export interface DirectConfig extends BaseConfig {
   jobsFile: string;
   /** The end-to-end suite (E2E_*): off unless `e2e.repository` names a test repository. See src/e2e. */
   e2e: E2eConfig;
+  /** RECURRING_REASON_MIN (0 = off, at most 50): how many NOT OK points with the same normalized reason in 14 days file a ticket for a check. See src/agent/recurring.ts. */
+  recurringReasonMin: number;
 }
 
 /** E2E_REPO, E2E_ON_START, E2E_SCENARIOS, E2E_TIMEOUT_MINUTES. A null repository switches the suite off. */
@@ -448,3 +450,21 @@ export interface Job {
 }
 
 export type NewJob = Omit<Job, 'id' | 'attempts'> & { attempts?: number };
+
+/** A NOT OK point of a reviewer verdict on a pull request head, normalized (RECURRING_REASON_MIN); kept 30 days. `url` links the verdict comment or review. */
+export interface FindingRecord {
+  repository: string;
+  reason: string;
+  number: number;
+  sha: string;
+  at: number;
+  url?: string;
+}
+
+/** The ticket filed for a recurring reason ("repo|reason" in the ledger). Kept until it is needed no more: one per reason, see RecurringFindings. */
+export interface FiledFinding {
+  repository: string;
+  reason: string;
+  issue: number;
+  filed_at: number;
+}

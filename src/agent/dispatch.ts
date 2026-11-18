@@ -13,6 +13,7 @@ import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
 import { ReviewSweep } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
+import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
 import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '../notify/texts.ts';
@@ -127,6 +128,8 @@ export class Dispatcher {
   preflight: TicketPreflight;
   /** The reconciler of REVIEW_SWEEP_MINUTES: starts the review of a head that has none in the ledger. */
   sweep: ReviewSweep;
+  /** RECURRING_REASON_MIN: counts the NOT OK points of the changes rounds and files a check ticket for a recurring one. See src/agent/recurring.ts. */
+  recurring: RecurringFindings;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   lastArchive = 0;
@@ -183,6 +186,7 @@ export class Dispatcher {
     });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
+    this.recurring = new RecurringFindings(config, jobs, this.forge, logger, now);
   }
 
   // Facts for the summary on the status page (merged, handed to a human, split), kept on the ticket's newest job. Best effort.
@@ -358,6 +362,8 @@ export class Dispatcher {
       return 'handed_to_human';
     }
     if (!this.config.routes.get(this.config.changesLabel) || this.config.routes.get(this.config.changesLabel)!.kind !== 'pull_request') return 'no_round_route';
+    // The NOT OK points of this round count towards RECURRING_REASON_MIN (off by default; best effort, it never blocks the round).
+    if (!event.bot && event.pull_request) await this.recurring.observe(event.repository.full_name, event.pull_request.number);
     return (await this.enqueueOne({ ...event, label: this.config.changesLabel })).status;
   }
 

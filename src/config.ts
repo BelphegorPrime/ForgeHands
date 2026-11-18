@@ -411,6 +411,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     reviewSweepMinutes: wholeOf(env.REVIEW_SWEEP_MINUTES, 10, 'REVIEW_SWEEP_MINUTES', 1440),
     // STUCK_PR_MINUTES (default 90, 0 = off, at most 10080): the watchdog of the review sweep blocks an agent pull request that nothing moves on from.
     stuckPrMinutes: wholeOf(env.STUCK_PR_MINUTES, 90, 'STUCK_PR_MINUTES', 10080),
+    // RECURRING_REASON_MIN (default 0 = off, at most 50): the same NOT OK point this many times in 14 days files one ticket for a check (src/agent/recurring.ts).
+    recurringReasonMin: wholeOf(env.RECURRING_REASON_MIN, 0, 'RECURRING_REASON_MIN', 50),
     // DELETE_AFTER_DAYS (0 = off): the step after archiving, the OpenHands conversation of an archived run goes. A failed run may keep its
     // conversation longer (DELETE_FAILED_AFTER_DAYS), which is never shorter than DELETE_AFTER_DAYS when both are set.
     deleteAfterDays,
