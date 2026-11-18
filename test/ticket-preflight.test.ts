@@ -239,6 +239,30 @@ test('a ticket whose file is missing on the default branch starts no run', async
   assert.match(forge.comments[0].body, /rule 4: `src\/a\.ts` is listed in Files but does not exist/);
 });
 
+test('rule 4 reads the Forgejo contents API: a 404 breaks the ticket, a file that is there passes', async () => {
+  const send = async (url, request) => {
+    const path = new URL(url).pathname;
+    calls.push({ method: request.method, path, body: request.body && JSON.parse(request.body) });
+    if (path.endsWith('/contents/src/gone.ts')) return { ok: false, status: 404, json: async () => ({}) };
+    if (path.includes('/contents/')) return { ok: true, status: 200, json: async () => ({ type: 'file' }) };
+    if (request.method === 'POST') return { ok: true, status: 201, json: async () => ({ id: 1 }) };
+    if (path.endsWith('/labels')) return { ok: true, status: 200, json: async () => [] };
+    return { ok: true, status: 200, json: async () => ({ execution_status: 'running', metrics: null, stats: { usage_to_metrics: { default: { accumulated_cost: 0 } } } }) };
+  };
+  const config = loadConfig(env({ SPLIT_LABEL: 'ai:plan' }));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  const broken = ['## Files', '- `src/gone.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
+  const rejected = await dispatcher.enqueue(ticket('ai:ready', broken));
+  assert.equal(rejected.status, 'ticket_rejected');
+  assert.ok(calls.some((c) => c.method === 'GET' && c.path === '/api/v1/repos/owner/hello/contents/src/gone.ts'));
+  const passed = await dispatcher.enqueue(ticket('ai:ready', GOOD, 2));
+  await dispatcher.tick();
+  assert.equal(passed.status, 'queued');
+  assert.equal(starts().length, 1);
+});
+
 test('TICKET_PREFLIGHT=0 starts the broken ticket as before, without a look at the forge', async () => {
   const broken = ['## Steps', '1. Do it.'].join('\n');
   const { dispatcher, forge } = await build({ TICKET_PREFLIGHT: '0', SPLIT_LABEL: 'ai:plan' });
