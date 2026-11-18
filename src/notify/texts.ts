@@ -43,7 +43,7 @@ export interface Facts {
   files?: number;
   reason?: string | null;
   security?: Security;
-  /** blocked: rounds_used_up, no_verdict, bot_pull_request, approval_not_trusted; failed: a run state or merge_failed. Anything else reads as `other`. */
+  /** blocked: rounds_used_up, no_verdict, bot_pull_request, approval_not_trusted, stuck_rounds, stuck_verdict; failed: a run state or merge_failed. Anything else reads as `other`. */
   why?: string;
   /** reminder: days waited, which reminder of how many. */
   days?: number;
@@ -60,7 +60,8 @@ const T = {
     files: (count: number) => 'Files in protected paths: ' + count,
     blockedSubject: 'is blocked',
     blocked: { rounds_used_up: 'the follow-up rounds are used up', no_verdict: 'the review ended twice without a verdict', bot_pull_request: 'a review asks for changes to this dependency update and no worker fixes those',
-      approval_not_trusted: 'the approval has no valid review behind it', other: 'it needs a look' } as Record<string, string>,
+      approval_not_trusted: 'the approval has no valid review behind it', stuck_rounds: 'the follow-up rounds are used up and the pull request did not move on',
+      stuck_verdict: 'the latest review says NOT OK and nothing has changed since', other: 'it needs a look' } as Record<string, string>,
     blockedWhy: (why: string) => 'ForgeHands stopped: ' + why + '.',
     conflictSubject: 'has a conflict',
     conflict: 'It conflicts with the default branch and ForgeHands cannot resolve it.',
@@ -91,7 +92,8 @@ const T = {
     files: (count: number) => 'Dateien in geschützten Pfaden: ' + count,
     blockedSubject: 'ist blockiert',
     blocked: { rounds_used_up: 'die Folgerunden sind aufgebraucht', no_verdict: 'die Prüfung endete zweimal ohne Urteil', bot_pull_request: 'eine Prüfung verlangt Änderungen an diesem Abhängigkeits-Update und kein Worker behebt sie',
-      approval_not_trusted: 'hinter der Freigabe steht keine gültige Prüfung', other: 'er braucht einen Blick' } as Record<string, string>,
+      approval_not_trusted: 'hinter der Freigabe steht keine gültige Prüfung', stuck_rounds: 'die Folgerunden sind aufgebraucht und der Pull-Request hat sich nicht weiterbewegt',
+      stuck_verdict: 'die letzte Prüfung sagt NOT OK, und seitdem hat sich nichts geändert', other: 'er braucht einen Blick' } as Record<string, string>,
     blockedWhy: (why: string) => 'ForgeHands hat angehalten: ' + why + '.',
     conflictSubject: 'hat einen Konflikt',
     conflict: 'Er kollidiert mit dem Standardbranch und ForgeHands kann das nicht lösen.',

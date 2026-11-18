@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { Hold, Job, JobStatus, MergeRecord, NewJob, RevertRecord } from '../types.ts';
+import type { Hold, Job, JobStatus, MergeRecord, NewJob, RevertRecord, StuckRecord } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -20,6 +20,8 @@ export class JobStore {
   dedupe = new Map<string, number>();
   /** Two-key merges on hold (TWO_KEYS_HOLD_MINUTES), per pull request ("repo#pr<n>"). Held until merged, cleared or the pull request changes; never pruned by age. */
   holds = new Map<string, Hold>();
+  /** Blocked agent pull requests ("repo#pr<n>"), see StuckRecord and stuck.ts. Kept until the pull request is closed or unblocked. */
+  stuck = new Map<string, StuckRecord>();
   /** What ForgeHands merged, kept 30 days (see Merger.recordMerge): the daily limit and REVERT_ON_RED read it. */
   merges: MergeRecord[] = [];
   /** Reverts of merges that turned the default branch red (REVERT_RETRIES), kept 30 days. */
@@ -43,6 +45,9 @@ export class JobStore {
       if (Array.isArray(content?.merges)) this.merges = content.merges.filter((entry: MergeRecord) => entry && typeof entry.repository === 'string');
       for (const [key, value] of Object.entries((content?.holds || {}) as Record<string, Hold>)) {
         if (value && typeof value.sha === 'string') this.holds.set(key, value);
+      }
+      for (const [key, value] of Object.entries((content?.stuck || {}) as Record<string, StuckRecord>)) {
+        if (value && typeof value.sha === 'string' && typeof value.issue === 'number') this.stuck.set(key, value);
       }
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
@@ -118,7 +123,7 @@ export class JobStore {
       this.reverts = this.reverts.filter((entry) => entry.at >= now - KEEP_MS);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), merges: this.merges, reverts: this.reverts }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), merges: this.merges, reverts: this.reverts }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;

@@ -42,7 +42,7 @@ export type NotifyLanguage = 'en' | 'de';
 export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled'] as const;
 
 /** What holds the queued and waiting jobs back, counted per job (see Dispatcher.idleCounts). `could_start`: a job that could start and did not. */
-export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number; /** waiting jobs of a dependency cycle (no way out by itself) */ cycle: number }
+export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number; /** waiting jobs of a dependency cycle (no way out by itself) */ cycle: number; /** waiting jobs that wait, directly or transitively, behind a blocked pull request (see stuck.ts) */ stuck: number }
 /** The last pass in which something waited and nothing could start: since when, the counts, and the tiers whose quota holds the queued jobs. */
 export interface IdleState { since: number; reasons: IdleCounts; tiers: string[]; /** the dependency cycles of the ledger, as text (see cycleText) */ cycles: string[] }
 
@@ -150,6 +150,8 @@ export interface DirectConfig extends BaseConfig {
   revertRetries: number;
   /** REVIEW_SWEEP_MINUTES (0 = off): how often a head without a review in the ledger is looked for and reviewed. See ReviewSweep. */
   reviewSweepMinutes: number;
+  /** STUCK_PR_MINUTES (0 = off, at most 10080): how long an agent pull request may sit with a NOT OK verdict and nothing running before the watchdog blocks it. See stuck.ts. */
+  stuckPrMinutes: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
   deleteAfterDays: number;
   /** The days after which a failed (or deleted) run's conversation goes: DELETE_FAILED_AFTER_DAYS, or DELETE_AFTER_DAYS when that is 0. */
@@ -327,6 +329,20 @@ export interface Hold {
   merge_after: number | null;
   /** When the hold is looked at again (the timer in the dispatch tick, see Merger.recheckHolds). */
   check_at: number;
+}
+
+/** A blocked agent pull request, kept in the ledger per pull request ("repo#pr<n>") while it is blocked or a human may unblock it (see stuck.ts).
+ * `why`: `label` (BLOCKED_LABEL was there when ForgeHands looked), `stuck_rounds` (rounds used up) or `stuck_verdict` (NOT OK, nothing moved on).
+ * `blocked` is true while the label is on; `eligible_at` is when the watchdog may block it (for `stuck_*` reasons, after STUCK_PR_MINUTES). */
+export interface StuckRecord {
+  repository: string;
+  issue: number;
+  number: number;
+  sha: string;
+  why: string;
+  blocked: boolean;
+  eligible_at: number;
+  blocked_at: number | null;
 }
 
 export interface Job {

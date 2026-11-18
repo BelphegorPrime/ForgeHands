@@ -402,6 +402,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     revertRetries: wholeOf(env.REVERT_RETRIES, 1, 'REVERT_RETRIES', 5),
     // REVIEW_SWEEP_MINUTES (default 10, 0 = off, at most 1440): the reconciler that starts the review of a head that has none (lost or deferred events).
     reviewSweepMinutes: wholeOf(env.REVIEW_SWEEP_MINUTES, 10, 'REVIEW_SWEEP_MINUTES', 1440),
+    // STUCK_PR_MINUTES (default 90, 0 = off, at most 10080): the watchdog of the review sweep blocks an agent pull request that nothing moves on from.
+    stuckPrMinutes: wholeOf(env.STUCK_PR_MINUTES, 90, 'STUCK_PR_MINUTES', 10080),
     // DELETE_AFTER_DAYS (0 = off): the step after archiving, the OpenHands conversation of an archived run goes. A failed run may keep its
     // conversation longer (DELETE_FAILED_AFTER_DAYS), which is never shorter than DELETE_AFTER_DAYS when both are set.
     deleteAfterDays,

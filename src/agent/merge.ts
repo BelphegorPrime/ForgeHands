@@ -446,6 +446,29 @@ export class Merger {
     return /^not/i.test(last.match![1]) ? { ok: false, reason: 'not_ok' } : { ok: true };
   }
 
+  // The first lines of the verdict the reviewer gave on this commit, for the human (the review comment that starts with `Verdict:`, else the review
+  // that asks for changes). Empty when none is found; a read that fails throws, and the caller decides.
+  async verdictLines(repository: string, number: number, sha: string): Promise<string[]> {
+    const firstLines = (body: unknown): string[] => String(body || '').split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.slice(0, 200));
+    if (this.config.verdictSource !== 'review') {
+      const time = Date.parse((await this.forge.commitTime(repository, sha)) || '');
+      const since = Number.isFinite(time) ? time : 0;
+      const comments = await this.forge.listComments(repository, number, 100);
+      const last = (Array.isArray(comments) ? comments : [])
+        .filter((comment: Json) => Date.parse(comment.created_at) >= since && /verdict\s*:\s*(not\s+ok|ok)\b/i.test(String(comment.body || '').slice(0, 300)))
+        .sort((a: Json, b: Json) => Date.parse(a.created_at) - Date.parse(b.created_at)).at(-1);
+      if (last) return firstLines(last.body);
+    }
+    if (this.config.verdictSource !== 'comment') {
+      const reviews = await this.forge.listReviews(repository, number);
+      const last = (Array.isArray(reviews) ? reviews : [])
+        .filter((review: Json) => review.commit_id === sha && review.state === 'REQUEST_CHANGES' && !review.dismissed && !review.stale)
+        .sort((a: Json, b: Json) => (Date.parse(a.submitted_at || '') || 0) - (Date.parse(b.submitted_at || '') || 0)).at(-1);
+      if (last) return firstLines(last.body);
+    }
+    return [];
+  }
+
   // An approval without a review behind it: take it off, say so, hand the pull request to a human. Best effort.
   // The ledger's name of a ticket: "repo#issue" for an agent branch (ai/issue-<n>), "repo!pr<n>" for a bot's pull request (no branch given).
   ticketOf(repository: string, number: number, agentBranch: string | null): string {

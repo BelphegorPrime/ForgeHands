@@ -42,6 +42,8 @@ export interface Issue {
   pr_url: string | null;
   rounds: number;
   state: string;
+  /** The blocked pull requests (their issue numbers) this ticket waits behind, directly or through other tickets. */
+  blocked_by_stuck?: number[];
   closed?: true;
   runs: Run[];
 }
