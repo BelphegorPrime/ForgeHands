@@ -276,3 +276,14 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - **What happens to a broken ticket.** With `SPLIT_LABEL` set the ticket goes to the planner, with no mention. Without it the ticket gets `BLOCKED_LABEL` and the comment mentions `HUMAN_LOGIN`. Either way the trigger label comes off, and one comment names each violated rule. A ticket is commented once per revision: when you fix it, its title or body changes and it is checked and commented again; set the label again to start it.
 - **Not checked yet.** The acceptance command is not run on the default branch to see that it fails there (that needs a checkout and a runner ForgeHands does not have). Rule 4 is not checked on GitLab.
 - **Rollback.** Set `TICKET_PREFLIGHT=0`: tickets are not checked at all, as before. The ledger gains one `preflight:` mark per rejected revision, which the previous version ignores.
+
+# Upgrading to the version after 0.9.7: an end-to-end suite (off by default)
+
+**A new feature, nothing changes until you switch it on.** ForgeHands can run a suite of scenarios against a dedicated test repository: a ticket goes through its run, the pull request is reviewed and merged, a change that turns the default branch red is reverted and its ticket started again once. The scenarios clean up after themselves. The suite is described in [docs/e2e.md](e2e.md).
+
+- Nothing to set: without `E2E_REPO` the suite is off, no endpoint answers runs (`/e2e/run` is `404`), and no metric or notification changes. `/status.json` has `"e2e": null`.
+- To use it, prepare a dedicated test repository first (its own `ALLOWED_REPOS` entry, the worker label, the CI step of docs/e2e.md) and set `E2E_REPO`. Then `E2E_ON_START=1` runs the suite once per version after a start, and `POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>` runs it on demand. Never point it at a repository with real work in it.
+- The new gauge `forgehands_e2e_scenario_ok{scenario}` (1 held, 0 failed) appears after the first run. `failed` notifications need `failed` in `NOTIFY_IMMEDIATE`, as every other immediate kind.
+- The result of the last run is kept in the ledger (`meta.e2e` in `jobs.json`). A version the ledger has a run for does not run again at a start, so an upgrade with `E2E_ON_START=1` runs the suite once, after which a restart of the same version runs nothing.
+- The cleanup restores the default branch with commits (the forge's REST API cannot move a branch pointer): the test repository's history grows by a commit per changed file in each run, and CI runs on them. This is why the repository must be a test repository.
+- Rollback: unset `E2E_REPO` (or go back to the previous version). The ledger's `meta.e2e` is ignored by the previous version.

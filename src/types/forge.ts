@@ -83,6 +83,18 @@ export interface MergeOptions {
 
 export type UpdateBranchResult = 'updated' | 'conflict';
 
+/** A branch as the forge lists it: its name and the commit at its tip. */
+export interface BranchRef { name: string; sha: string }
+
+/** A file at a ref: `content` is base64 as the forge sends it, `sha` the id of the blob. */
+export interface FileAt { sha: string; content: string }
+
+/** A commit that writes one file of a branch. Without `sha` the file is created; with it (the blob id now) the file is updated. `content` is base64. */
+export interface FileWrite { message: string; branch: string; content: string; sha?: string }
+
+/** A commit that deletes one file of a branch (`sha` is the blob id now). */
+export interface FileDelete { message: string; branch: string; sha: string }
+
 /**
  * The API paths an agent calls itself (the prompts tell it where to read and write). Each method returns the full URL as the agent has
  * to write it, with the base taken from the agent's secrets, so the prompts contain no forge specific path.
@@ -206,6 +218,17 @@ export interface Forge {
   labelsOf(repository: string, number: number, on?: Subject): Promise<Label[]>;
   addLabels(repository: string, number: number, labels: Label[], on?: Subject): Promise<void>;
   removeLabel(repository: string, number: number, label: Label, on?: Subject): Promise<void>;
+
+  // Fixtures of the end-to-end suite (src/e2e). A test repository needs these beyond the core; the core never calls them. A forge without
+  // them cannot run the suite (GitLab), and the suite says so at start. Writes pass the transport like every other write.
+  getRepository?(repository: string): Promise<{ default_branch: string }>;
+  createIssue?(repository: string, title: string, body: string): Promise<Issue>;
+  listBranches?(repository: string): Promise<BranchRef[]>;
+  deleteBranch?(repository: string, branch: string): Promise<void>;
+  /** The file at a ref, or null when the ref has no such file. */
+  readFile?(repository: string, path: string, ref: string): Promise<FileAt | null>;
+  writeFile?(repository: string, path: string, change: FileWrite): Promise<void>;
+  deleteFile?(repository: string, path: string, change: FileDelete): Promise<void>;
 }
 
 /** One call to the forge's API: the lowest layer, where DRY_RUN stops writes and API errors are counted. */

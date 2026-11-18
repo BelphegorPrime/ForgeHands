@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { Hold, Job, JobStatus, MergeRecord, NewJob, RevertRecord, StuckRecord } from '../types.ts';
+import type { E2eRecord, Hold, Job, JobStatus, MergeRecord, NewJob, RevertRecord, StuckRecord } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -15,7 +15,7 @@ export class JobStore {
   jobs = new Map<string, Job>();
   labels = new Map<string, SeenLabels>(); // repo#issue -> { labels, seen }: the labels seen on the last event of an issue
   /** Small facts that must outlive a restart and belong to no job: the date of the last digest (`digest_sent`, YYYY-MM-DD in NOTIFY_TIMEZONE). */
-  meta: { digest_sent?: string } = {};
+  meta: { digest_sent?: string; e2e?: E2eRecord } = {};
   /** Keys of things already done, kept 30 days: a human comment that restarted a run (`comment:<repo>#<n>#<id>`), a notice sent once (`limit:<repo>#<n>:<label>`). */
   dedupe = new Map<string, number>();
   /** Two-key merges on hold (TWO_KEYS_HOLD_MINUTES), per pull request ("repo#pr<n>"). Held until merged, cleared or the pull request changes; never pruned by age. */
@@ -38,6 +38,7 @@ export class JobStore {
       if (!Array.isArray(jobs)) throw Error('Invalid job store');
       for (const job of jobs) if (job && job.id) this.jobs.set(job.id, job);
       if (typeof content?.meta?.digest_sent === 'string') this.meta.digest_sent = content.meta.digest_sent;
+      if (content?.meta?.e2e && typeof content.meta.e2e.version === 'string') this.meta.e2e = content.meta.e2e;
       for (const [key, value] of Object.entries((content?.dedupe || {}) as Record<string, number>)) {
         if (typeof value === 'number') this.dedupe.set(key, value);
       }

@@ -4,6 +4,7 @@ import type { DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
+import type { E2eState } from '../e2e/controller.ts';
 import { holdKey } from '../agent/merge.ts';
 import { behindBlocked, blockedTickets } from '../agent/stuck.ts';
 
@@ -43,6 +44,8 @@ export interface Status {
   workspace: WorkspaceState | null;
   // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
   idle?: { since: string; reasons: IdleCounts; quota_tiers: string[]; cycles: string[] };
+  // The end-to-end suite (E2E_REPO): null while it is off. Added by the server, which owns the controller (see app.ts).
+  e2e?: E2eState | null;
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -325,6 +328,18 @@ function renderTiers(status: Status): string {
     + '<th>Split</th><th>Fallback</th><th>Escalated</th><th>Workers merged</th></tr>\n' + rows.join('\n') + '</table>';
 }
 
+// The end-to-end suite, only when it is on: what it runs against, whether it runs now, and the result of each scenario in the last run.
+function renderE2e(status: Status): string {
+  const e = status.e2e;
+  if (!e) return '';
+  const running = e.running ? ' A run (' + escape(e.running.trigger) + ') is going since ' + escape(e.running.since) + '.' : '';
+  const last = e.last
+    ? '<ul>' + (e.last.error ? '<li>' + escape(e.last.error) + '</li>' : '') + e.last.results.map((result) => '<li>' + (result.ok ? 'ok' : '<strong>failed</strong>') + ': '
+      + escape(result.scenario) + (result.reason ? ' (' + escape(result.reason) + ')' : '') + (result.cleanup === 'failed' ? ' <strong>cleanup failed</strong>: ' + escape(result.cleanup_reason) : '') + '</li>').join('') + '</ul>'
+    : '<p>No run yet.</p>';
+  return '<h2>End-to-end</h2><p>Test repository ' + escape(e.repository) + ', version ' + escape(e.version) + ', scenarios ' + escape(e.scenarios.join(', ')) + '.' + running + '</p>' + last;
+}
+
 // One line on the workspace cleanup, only when it is on: the last pass, what it cleaned, the disk and a hold for low disk space.
 function renderWorkspace(status: Status): string {
   const w = status.workspace;
@@ -348,6 +363,6 @@ export function renderStatus(status: Status): string {
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
     + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + renderWorkspace(status) + waiting
-    + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
+    + renderE2e(status) + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
     + head + rows + '</table>' + closedSection + hiddenNote;
 }

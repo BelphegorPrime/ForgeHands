@@ -1,0 +1,118 @@
+# The end-to-end suite
+
+The suite runs scenarios against a **dedicated test repository** through the same forge client ForgeHands uses. Each scenario is a short list of steps (create a ticket with a label, wait for a condition, assert on the forge, settle) and is carried out by the real ForgeHands instance: the ticket gets its run, the agent opens a pull request, the reviewer and the merge do what they do in production. The suite only watches, and cleans up afterwards.
+
+It is **off by default**. Nothing runs until `E2E_REPO` names a repository, and a run needs the forge's API access (`FORGE_URL`, `FORGE_TOKEN`).
+
+> **Never point `E2E_REPO` at a repository with real work in it.** A run creates tickets, closes them, closes the open pull requests it finds above its first ticket, deletes the `ai/issue-<n>` and `ai/revert-<n>` branches of its own numbers, and puts the default branch back to the tree it had at the start. Use a repository that exists only for this.
+
+## Set up the test repository
+
+1. **A repository of its own**, for example `team/forgehands-e2e`, with a default branch `main`, and its name in `ALLOWED_REPOS` (the webhooks of the forge must reach ForgeHands for it, like any other repository).
+2. **Labels and routes** in `LABEL_ROUTES` as for any repository: the scenarios use the worker label `ai:ready`. The experimental scenarios also use `ai:escalate` (with `escalate_to` on `ai:ready`), `ai:blocked` and, for the conflict round, a route `ai:conflict` with `"on": "conflict"`.
+3. **The forge user of ForgeHands** must be allowed to push to `main` (the cleanup puts the tree back with commits; see below). Do not protect `main` against that user.
+4. **The CI step** (scenario `revert-on-red` needs it). The repository needs a workflow that fails on the default branch while the marker file `e2e/red.marker` exists. Put this in `.forgejo/workflows/e2e.yaml` (Gitea: `.gitea/workflows/`):
+
+   ```yaml
+   name: e2e-marker
+   on:
+     push:
+     pull_request:
+   jobs:
+     marker:
+       runs-on: docker
+       steps:
+         - name: Fail on the default branch while the red marker exists
+           run: |
+             # Only the default branch is judged: the pull request that adds the marker stays green, and its merge turns main red.
+             if [ "$GITHUB_REF" = "refs/heads/main" ] && [ -f e2e/red.marker ]; then
+               echo "e2e/red.marker exists on the default branch: failing on purpose"
+               exit 1
+             fi
+   ```
+
+   `runs-on` is the label of your runner; use the one your other workflows use. If your default branch is not `main`, change the `GITHUB_REF` comparison and the scenarios' `default` branch is still read from the repository. The workflow must run on every push, so that the merge commit of the marker gets a status.
+
+   A repository without this step still runs scenarios 1, 3, 4 and 5; scenario 2 then fails at its `mergeCommit` wait (the merge is green).
+
+5. **Nothing else** should write to the test repository while the suite runs. The cleanup assumes that the numbers above the first ticket of a run belong to the run.
+
+## Run it
+
+**After a version change (`E2E_ON_START=1`).** At each start ForgeHands compares its version with the version of the last e2e run in its ledger (`meta.e2e` in `jobs.json`). A different one, or none, runs the suite once in the background. A restart of the same version runs nothing. A run that ends with a failure is recorded too, so a broken scenario does not run again at every restart; run it on demand instead.
+
+**On demand.** `POST /e2e/run` starts a run and answers `202` at once; a run already going answers `409`. The endpoint changes a test repository, so it is protected more strictly than `/status.json`:
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $STATUS_TOKEN" http://forgehands.example:8080/e2e/run
+```
+
+- No `E2E_REPO`: `404` (there is no endpoint).
+- `E2E_REPO` set but no `STATUS_TOKEN`: `403`. A run is not allowed without a token.
+- Missing or wrong bearer token: `401`. The session cookie of the status page is **not** accepted here.
+
+Watch the progress on `/status` (an "End-to-end" section) or `/status.json` (`e2e.running`, `e2e.last`).
+
+## Scenarios
+
+| Name | Experimental | What it shows |
+| --- | --- | --- |
+| `normal-delivery` | no | A ticket with `ai:ready` gets a pull request from `ai/issue-<n>`; the review verdict is `Verdict: OK`; the pull request is merged and the ticket closed. |
+| `revert-on-red` | no | The ticket adds `e2e/red.marker`; the merge turns the default branch red; ForgeHands starts a revert (`ai/revert-<n>`); the revert is merged; the ticket is reopened with the cause comment (exactly one) and started again **once**; after a settle of three minutes it has no second restart. Ends with a green default branch. |
+| `empty-runs` | yes | A worker that delivers nothing twice escalates once (`ai:escalate`), and then a human is called (`ai:blocked`). |
+| `stuck-pull-request` | yes | A reviewer that keeps saying NOT OK on an unchanged head gets the pull request blocked (`ai:blocked`) by the stuck-PR watchdog, and it is not merged. |
+| `conflict-round` | yes | Two tickets change the same file; after the first merge the second gets a conflict round (`ai:conflict`), exactly once. |
+
+Scenarios 1 and 2 are deterministic on the repository above. Scenarios 3 to 5 depend on what the agents do; their `precondition` is in the definition (`src/e2e/scenarios.ts`) and says what the test ticket and the instance must look like. Their expectations (the names of the labels that mark the human hand-over and the conflict round) are **assumptions** that were not checked against a live instance: run them once by name (`E2E_SCENARIOS=empty-runs`) and adjust the definition if the label differs.
+
+`E2E_SCENARIOS` names the scenarios to run, in order. Unset, every non-experimental scenario runs.
+
+## Format
+
+Scenarios are data, in the format of `src/e2e/format.ts`. A new bug becomes a new scenario: a list of steps and a predicate per check. Steps:
+
+- `ticket`: creates an issue with a title and body, puts a label on it and names it (`as`). ForgeHands' route for the label starts a run.
+- `wait`: polls a predicate until it holds, or until its `timeoutMinutes` (default: the rest of the scenario's time). With `as` on a `findPull` wait it captures the number of the pull request it found.
+- `assert`: checks a predicate once.
+- `settle`: waits a number of seconds without asking anything, so that a late restart or merge shows up in the checks after it.
+
+Predicates name a resource by `$name` (`$ticket`, `$pr`) and check one thing: `issue` (state, label, comment), `pull` (state, label, comment), `findPull` (a pull request from a head branch), `mergeCommit` (the commit status of the commit that merged a pull request), `branch` (the commit status of a branch; `default` is the default branch) and `runs` (how many runs ForgeHands started for an issue with a label, from its ledger). A `comment` check counts the comments that contain a text (`min`, `max`). A scenario that refers to a name no earlier step sets is refused at start.
+
+## What the cleanup does
+
+The cleanup runs whatever the scenario did (it is in a `finally`, after a failure, a timeout or a read error). In this order:
+
+1. Pull requests **open** with a number above the first ticket of the run are closed.
+2. The run's tickets are closed (a closed ticket stops its runs).
+3. Branches `ai/issue-<n>` and `ai/revert-<n>` with `n` at or above the first ticket are deleted.
+4. The default branch is put back to the tree it had when the scenario started. The forge's REST API cannot move a branch pointer, so every file that differs is written back (or deleted) by a commit of its own. The history grows by one commit per changed file, and each commit runs CI. The run then checks that the default branch has the start's tree again and reports it as a failed cleanup if not.
+
+Each action is tried on its own: one that fails is listed in the result, and the scenario then counts as failed even when its steps held. Two runs in a row leave the repository as it was.
+
+## Results and reporting
+
+- **The gauge** `forgehands_e2e_scenario_ok{scenario="<name>"}`: `1` when the scenario held in the last run, `0` when it failed. Absent until a run. The last run is kept in the ledger (`meta.e2e`), so a restart keeps the gauge.
+- **The status section**: `/status` shows an "End-to-end" section; `/status.json` has `e2e` (`repository`, `on_start`, `scenarios`, `version`, `running`, and `last` with each scenario's `ok`, `reason`, `failed_step` and cleanup).
+- **A notification** of kind `failed` for each failed scenario (and when the suite cannot run at all), naming the scenario, the reason and whether the cleanup held. It is sent only when `NOTIFY_IMMEDIATE` contains `failed` and a channel is set (SMTP or a webhook); the default of `NOTIFY_IMMEDIATE` is empty, so set it, like every other immediate notification of ForgeHands.
+- The log names each scenario that failed, with its reason.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `E2E_REPO` | unset (off) | The test repository, `owner/name`, one of `ALLOWED_REPOS`. Needs direct mode and `FORGE_URL` / `FORGE_TOKEN`. |
+| `E2E_ON_START` | `0` | `1`: run the suite once after a start whose version has no e2e run in the ledger. Needs `E2E_REPO`. |
+| `E2E_SCENARIOS` | all non-experimental | Comma separated scenario names, run in the order given. Unknown names stop the start. |
+| `E2E_TIMEOUT_MINUTES` | `90` | The time one scenario may take, cleanup not included (1 to 1440). |
+
+## Forges
+
+Forgejo and Gitea: yes (the fixtures the suite needs are implemented in `src/forge/forgejo`, Gitea inherits them). GitLab: no. Where the forge lacks them, `POST /e2e/run` answers `409` with `unsupported`, and a start with `E2E_ON_START=1` logs why it did not run.
+
+## Limits and open points
+
+- The suite cannot see the notifications ForgeHands sends (scenario 4's "block notified once" is not checked): it checks the forge and the ledger.
+- Scenario 2's restart count comes from the ledger of the ForgeHands process the suite runs in, not from the forge. With a second ForgeHands instance on the same forge the count is not seen.
+- Experimental scenarios 3 to 5 are not verified against a live instance; see their preconditions.
+- A run of the suite is not a test of the agent's quality: the tickets are small, and a model that does not deliver fails scenario 1 for reasons that are not ForgeHands' bug. Read the reason before you blame the code.
+- The `main` restore commits trigger CI on the test repository each time: that is the price of the REST-only cleanup.

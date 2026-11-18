@@ -4,7 +4,8 @@ import { globToRegExp } from './utils/glob.ts';
 import { FORGES } from './forge/index.ts';
 import type { ForgeKind } from './types/forge.ts';
 import { parseNotify } from './notify/config.ts';
-import type { Config, DirectConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
+import { SCENARIO_NAMES } from './e2e/scenarios.ts';
+import type { Config, DirectConfig, E2eConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // owner/name; GitLab projects may sit in subgroups (group/sub/name).
@@ -225,6 +226,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const allowedRepos = new Set((env.ALLOWED_REPOS || '')
     .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
   const direct = Boolean(env.OPENHANDS_API_URL);
+  if (!direct && (env.E2E_REPO || '').trim()) throw new Error('E2E_REPO needs direct mode (OPENHANDS_API_URL): the suite runs through the ForgeHands dispatcher');
 
   if (forgejoSecret.length < 16) throw new Error('FORGEJO_WEBHOOK_SECRET must be at least 16 characters');
   if (allowedRepos.size === 0) throw new Error('ALLOWED_REPOS must contain at least one owner/repository');
@@ -290,6 +292,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     agentSecrets[name.replace(/^FORGE_/, 'FORGEJO_')] = value;
   }
   const routes = parseRoutes(env.LABEL_ROUTES || '');
+  const e2e = parseE2e(env, allowedRepos, Boolean(forgeUrl && forgeToken));
   // VERDICT_SOURCE: `comment` (default) is a "Verdict: OK" comment plus the approval label; `review` is Forgejo's own pull request review
   // (Approve / Request changes) on the head commit, which branch protection can enforce; `both` accepts either.
   const verdictSource = (env.VERDICT_SOURCE || 'comment').trim().toLowerCase();
@@ -467,8 +470,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     botFixRounds: env.BOT_FIX_ROUNDS === undefined || env.BOT_FIX_ROUNDS === '' || env.BOT_FIX_ROUNDS === '0' ? 0 : positiveInt(env.BOT_FIX_ROUNDS, 0, 'BOT_FIX_ROUNDS', 100) as number,
     epicLabels: new Set((env.EPIC_LABEL || 'ai:plan,ai:close').split(',').map((value) => value.trim()).filter(Boolean)),
     pollMs: 15000,
+    // The end-to-end suite: off unless E2E_REPO is set (see parseE2e).
+    e2e,
     jobsFile: env.JOBS_FILE || dataFile.replace(/[^/\\]*$/, 'jobs.json')
   };
+}
+
+// The end-to-end suite (src/e2e). E2E_REPO names the test repository; unset, the suite is off and nothing else is read. It needs the forge
+// (FORGE_URL, FORGE_TOKEN) to read and write the test repository, and it must be one of ALLOWED_REPOS, so that the forge's webhooks reach it.
+function parseE2e(env: NodeJS.ProcessEnv, allowed: Set<string>, forgeReady: boolean): E2eConfig {
+  const repository = (env.E2E_REPO || '').trim().toLowerCase() || null;
+  const onStart = switchOff(env.E2E_ON_START, 'E2E_ON_START');
+  const names = (env.E2E_SCENARIOS || '').split(',').map((value) => value.trim()).filter(Boolean);
+  for (const name of names) {
+    if (!SCENARIO_NAMES.includes(name)) throw new Error('E2E_SCENARIOS: ' + name + ' is no scenario (known: ' + SCENARIO_NAMES.join(', ') + ')');
+  }
+  // Minutes for one scenario (cleanup not included): a worker run takes long, so the default is generous.
+  const timeoutMinutes = positiveInt(env.E2E_TIMEOUT_MINUTES, 90, 'E2E_TIMEOUT_MINUTES', 1440) as number;
+  if (onStart && !repository) throw new Error('E2E_ON_START=1 needs E2E_REPO, the test repository the suite runs against');
+  if (repository) {
+    if (!REPO.test(repository)) throw new Error('E2E_REPO must be owner/repository, got ' + repository);
+    if (!allowed.has(repository)) throw new Error('E2E_REPO ' + repository + ' is not in ALLOWED_REPOS');
+    if (!forgeReady) throw new Error('E2E_REPO needs FORGE_URL and FORGE_TOKEN (or FORGEJO_URL and FORGEJO_TOKEN) to drive the test repository');
+  }
+  return { repository, onStart, scenarios: names.length ? names : null, timeoutMinutes };
 }
 
 // A 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.

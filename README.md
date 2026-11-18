@@ -19,6 +19,7 @@ In this document "pull request" also means a GitLab **merge request**, and "Forg
 - [Behaviour in detail](#behaviour-in-detail), including [Notifications](#notifications)
 - [Cleaning the workspace](#cleaning-the-workspace)
 - [Status page and metrics](#status-page-and-metrics)
+- [End-to-end suite](#end-to-end-suite)
 - [Dry run](#dry-run)
 - [Security and limitations](#security-and-limitations)
 - [Development](#development)
@@ -377,6 +378,17 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `LEDGER_SYNC_HOURS` | `6` | How often ForgeHands asks the forge about the tickets its ledger holds as open, and closes the ones the forge has closed (see [Housekeeping](#housekeeping)). At most 60 forge reads per pass. `0` = off. Needs `FORGEJO_URL` and `FORGEJO_TOKEN`. |
 | `STATUS_HIDE_DAYS` | `7` | Closed tickets whose last activity is older than this many days are left off the status page and `/status.json` (`?all=1` shows them). `0` = hide nothing. The counters are not affected. |
 
+### End-to-end suite
+
+Off unless `E2E_REPO` names a dedicated test repository. See [End-to-end suite](#end-to-end-suite).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `E2E_REPO` | unset (off) | The test repository (`owner/name`, one of `ALLOWED_REPOS`); its scenarios run against it through the forge. Needs direct mode and `FORGE_URL`, `FORGE_TOKEN`. |
+| `E2E_ON_START` | `0` | `1`: after a start whose version has no e2e run in the ledger, the suite runs once in the background. Needs `E2E_REPO`. |
+| `E2E_SCENARIOS` | all non-experimental | Comma separated scenario names, run in the order given (`normal-delivery`, `revert-on-red`, `empty-runs`, `stuck-pull-request`, `conflict-round`). |
+| `E2E_TIMEOUT_MINUTES` | `90` | The time one scenario may take, cleanup not included (1 to 1440). |
+
 ## Behaviour in detail
 
 ### Labels and re-labelling
@@ -725,6 +737,10 @@ scrape_configs:
     static_configs:
       - targets: ["forgehands:8080"]
 ```
+
+## End-to-end suite
+
+After each deploy (`E2E_ON_START=1`) or on demand (`POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>`; without `STATUS_TOKEN` the endpoint answers `403`), ForgeHands runs scenarios against a test repository: a ticket gets its run, the pull request is reviewed and merged, and a change that turns the default branch red is reverted, reopened and started again once. Each scenario cleans up after itself (tickets, pull requests, branches, the default branch). A failed scenario sends a notification of kind `failed` (`NOTIFY_IMMEDIATE`), and `forgehands_e2e_scenario_ok{scenario}` and the status page show the result. The test repository must be dedicated to this: see [docs/e2e.md](docs/e2e.md) for its setup, the CI step, the scenarios and their preconditions. Forgejo and Gitea only.
 
 ## Dry run
 
