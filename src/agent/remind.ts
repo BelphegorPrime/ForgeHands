@@ -39,6 +39,8 @@ export class Reminder {
   last = 0;
   // Tells the human by a message of ForgeHands' own (src/notify); the dispatcher sets it. Off by default.
   notifier: Notify = NO_NOTIFY;
+  /** Checks a ticket that a dependency read answered 404 for and drops its jobs when it is deleted (set by the dispatcher); true when it did. */
+  deleted: (repository: string, number: number) => Promise<boolean> = async () => false;
   waiting = new Map<string, Waiting>(); // repository#pr -> what waits for the human (shown by /status)
 
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch, logger: Logger, merger: Merger, dry: DryLog = new DryLog(logger)) {
@@ -84,6 +86,8 @@ export class Reminder {
         changed = true;
         this.logger.error(job.key + ' waited for dependencies that are all closed, starting it');
       } catch (error) {
+        // 404: the ticket may be deleted (then its job is dropped) or simply have no such list; no log line either way, it is looked at again tomorrow.
+        if (/HTTP 404\b/.test(error.message)) { await this.deleted(job.event.repository.full_name, job.event.issue.number); continue; }
         this.logger.error('could not read the dependencies of #' + job.event.issue.number + ':', error.message);
       }
     }

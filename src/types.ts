@@ -263,7 +263,8 @@ export const isBranchPush = (event: NormalizedEvent): event is BranchPushEvent =
 export interface TokenTotals { prompt: number; completion: number; cache_read: number; cache_write: number; reasoning: number }
 
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
-export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry';
+// `deleted`: the ticket (or pull request) was deleted in the forge; its waiting and queued jobs end here, without a hand-over (see dropDeleted).
+export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry' | 'deleted';
 
 export interface Job {
   id: string;

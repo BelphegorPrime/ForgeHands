@@ -1,7 +1,9 @@
 // Closes the tickets the ledger holds as open but the forge has closed (LEDGER_SYNC_HOURS). A close event can be lost (closed by a human, a merge
 // before this was kept, or while ForgeHands was down), and then the status page shows dead entries. Every LEDGER_SYNC_HOURS, and once about a
 // minute after the start, at most LEDGER_SYNC_BUDGET forge reads are made: one per ticket, the ones checked longest ago first. A ticket whose
-// read fails is left as it is. Reads go to the forge only, so a dry run reads, but marks nothing (markClosed does nothing in a dry run).
+// read fails is left as it is. Tickets with waiting or queued jobs are read too (running ones are not: their run decides when it ends); a 404 on
+// the ticket's own read means it was deleted in the forge, and its waiting and queued jobs are dropped (see the `deleted` callback). Reads go to
+// the forge only, so a dry run reads, but marks nothing (markClosed does nothing in a dry run).
 import { isDry } from '../dry.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { DirectConfig, Job, Logger } from '../types.ts';
@@ -27,17 +29,21 @@ export class LedgerSync {
   now: () => number;
   /** Marks a ticket closed (the dispatcher's markClosed); true when something changed. */
   close: (ticket: string) => Promise<boolean>;
+  /** Drops the waiting and queued jobs of a ticket that the forge reports deleted (404); true when something changed. */
+  deleted: (ticket: string) => Promise<boolean>;
   running: Promise<number> | null = null;
   timer: NodeJS.Timeout | undefined;
   firstTimer: NodeJS.Timeout | undefined;
 
-  constructor(config: DirectConfig, jobs: JobStore, forge: SyncReads, logger: Logger, close: (ticket: string) => Promise<boolean>, now: () => number = Date.now) {
+  constructor(config: DirectConfig, jobs: JobStore, forge: SyncReads, logger: Logger, close: (ticket: string) => Promise<boolean>, now: () => number = Date.now,
+    deleted: (ticket: string) => Promise<boolean> = async () => false) {
     this.config = config;
     this.jobs = jobs;
     this.forge = forge;
     this.logger = logger;
     this.close = close;
     this.now = now;
+    this.deleted = deleted;
   }
 
   // Needs the forge's access (FORGEJO_URL and FORGEJO_TOKEN): without it there is nothing to read.
@@ -80,8 +86,8 @@ export class LedgerSync {
       const repository = ticket.split(/[#!]/)[0];
       if (!this.config.allowedRepos.has(repository) || isDry(this.config, repository)) return false;
       if (list.every((job) => job.archived_view)) return false;
-      // Work that is running or queued is not marked by markClosed anyway: no read is spent on it.
-      return !list.some((job) => job.status === 'running' || job.status === 'queued');
+      // A running ticket is left to its run, which decides when it ends. Waiting and queued jobs are read: a deleted ticket must leave the queue.
+      return !list.some((job) => job.status === 'running');
     }).sort(([, a], [, b]) => lastSync(a) - lastSync(b));
   }
 
@@ -100,6 +106,12 @@ export class LedgerSync {
         const item = pull ? await this.forge.getPull(repository, number) : await this.forge.getIssue(repository, number);
         done = pull ? item.state === 'closed' || item.merged === true : item.state === 'closed';
       } catch (error) {
+        // A 404 on the ticket itself: it was deleted in the forge, so its waiting and queued jobs go (once; they are no longer waiting after that).
+        if (/HTTP 404\b/.test(errText(error))) {
+          if (await this.deleted(ticket)) changed = true;
+          this.jobs.noteChecked(ticket, now);
+          continue;
+        }
         // Unknown is not closed: the ticket stays as it is, and it goes to the back of the queue.
         this.logger.error('ledger sync could not read ' + repository + (pull ? ' pull request ' : ' #') + number + ':', errText(error));
         this.jobs.noteChecked(ticket, now);
@@ -108,6 +120,16 @@ export class LedgerSync {
       }
       this.jobs.noteChecked(ticket, now);
       changed = true;
+      // A pull request of an open ticket that its waiting or queued job names: a 404 on it means the pull request was deleted; its jobs are dropped.
+      if (!pull && !done) {
+        for (const number of pullsNamed(list)) {
+          try {
+            await this.forge.getPull(repository, number);
+          } catch (error) {
+            if (/HTTP 404\b/.test(errText(error)) && await this.deleted(match[1] + '!pr' + number)) changed = true;
+          }
+        }
+      }
       if (done && await this.close(ticket)) {
         closed += 1;
         metrics.inc('forgehands_ledger_sync_closed_total');
@@ -117,6 +139,12 @@ export class LedgerSync {
     if (closed) this.logger.error('ledger sync: ' + closed + ' ticket(s) closed in the forge are marked closed on the status page');
     return closed;
   }
+}
+
+// The pull requests that waiting or queued jobs of a ticket name (their rounds, reviews and fixes), each once.
+function pullsNamed(list: Job[]): number[] {
+  return [...new Set(list.filter((job) => (job.status === 'waiting' || job.status === 'queued') && job.event?.pull_request?.number)
+    .map((job) => job.event.pull_request!.number as number))];
 }
 
 // When a ticket was last asked about by the sync (0 = never).

@@ -89,11 +89,11 @@ test('the ledger sync reads at most 60 tickets per pass, the ones checked longes
   } finally { await rm(t.base, { recursive: true, force: true }); }
 });
 
-test('the ledger sync skips running and queued tickets, other repositories and dry runs; LEDGER_SYNC_HOURS=0 is off', async () => {
-  const t = await setup([[repo + '#1', 'running'], [repo + '#2', 'queued'], ['other/repo#3']]);
+test('the ledger sync skips running tickets, other repositories and dry runs, and reads waiting and queued ones; LEDGER_SYNC_HOURS=0 is off', async () => {
+  const t = await setup([[repo + '#1', 'running'], [repo + '#2', 'queued'], [repo + '#4', 'waiting'], ['other/repo#3']]);
   try {
     await t.sync.run();
-    assert.deepEqual(t.reads, []);
+    assert.deepEqual(t.reads.sort(), ['#2', '#4']);
     const off = await setup([[repo + '#1']], { '#1': { state: 'closed' } }, { LEDGER_SYNC_HOURS: '0' });
     try {
       assert.equal(off.sync.enabled, false);

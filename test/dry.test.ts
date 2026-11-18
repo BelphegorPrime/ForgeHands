@@ -50,7 +50,8 @@ function double({ strict }) {
     if (request.method !== 'GET' && strict) throw new Error('WRITE REACHED THE CLIENT: ' + request.method + ' ' + u.pathname);
     if (request.method !== 'GET') return { ok: true, status: 201, json: async () => ({ id: 'conv-1' }) };
     if (u.hostname === 'openhands') return { ok: true, status: 200, json: async () => ({}) };
-    const value = reads['GET ' + u.pathname];
+    // An unrouted ticket exists and is open (a 404 of the ticket itself would mean it was deleted).
+    const value = reads['GET ' + u.pathname] ?? (/\/issues\/\d+$/.test(u.pathname) ? { number: Number(u.pathname.split('/').pop()), state: 'open', labels: [] } : undefined);
     if (value === undefined) return { ok: false, status: 404 };
     return { ok: true, status: 200, json: async () => value };
   };
