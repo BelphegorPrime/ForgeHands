@@ -122,6 +122,14 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
 - **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
 
+# Upgrading to the next version: the review sweep starts the missing reviews
+
+**New, on by default.** A pull request whose head never got a review (a lost or deferred event, or a round that ended without a new commit) used to wait for ever. Now every `REVIEW_SWEEP_MINUTES` (default `10`) ForgeHands starts the review of such a head, when its CI is green or absent.
+
+- **What changes.** Some open pull requests get a review they did not get before. They go through the usual verdict, and an approved one merges as it always would. The first pass runs about 90 seconds after start, then every interval; at most 5 reviews a pass.
+- **What to check.** The first pass logs one line per start (`<repo>#<n>: head <sha7> has no review, starting it`). A pull request you parked without a label, and that has no review on purpose, will now get one: set `BLOCKED_LABEL` or `ai:hold` on it, or set `REVIEW_SWEEP_MINUTES=0`.
+- **Rollback.** Set `REVIEW_SWEEP_MINUTES=0`. Nothing else is written.
+
 # Upgrading to the next version: the ledger is closed up, the status page hides old tickets
 
 This is a feature release on top of 0.7.0 and nothing needs a change. Three things are new; each one is on by default and can be switched off.
