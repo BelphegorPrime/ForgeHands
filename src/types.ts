@@ -257,6 +257,9 @@ export type NormalizedEvent = ForgeEvent | PushEvent | BranchPushEvent;
 export const isPushEvent = (event: NormalizedEvent): event is PushEvent => event.type === 'push.default';
 export const isBranchPush = (event: NormalizedEvent): event is BranchPushEvent => event.type === 'push.branch';
 
+/** Tokens of an LLM conversation, summed over its usage ids (default, condenser) and every LLM call (OpenHands' token_usages). */
+export interface TokenTotals { prompt: number; completion: number; cache_read: number; cache_write: number; reasoning: number }
+
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
 export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry';
 
@@ -309,6 +312,10 @@ export interface Job {
   delivery_retry?: number;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
   delivered_on?: number;
+  /** The tokens of the run's conversations so far, added up when each of them ended (see Dispatcher.countTokens). */
+  tokens?: TokenTotals;
+  /** The tokens of the current conversation that are in `tokens` already: a continued run adds only what came after. */
+  tokens_seen?: TokenTotals;
   /** Nudge (NUDGE_AT_PERCENT): the actions the run had used when it was nudged, once per conversation; kept on the job so a restart does not repeat it. */
   nudged?: number;
   /** The branch ai/issue-<n> exists, so the run needs no nudge: no more counting for this conversation. */

@@ -13,7 +13,7 @@ import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '..
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
+import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 
@@ -48,6 +48,28 @@ const NUDGE_MIN_RUN_MS = 180000;
 const IDLE_LOG_EVERY_MS = 15 * 60000;
 // After a stall alert no other one for this long, unless nothing waits any more (see checkStall).
 const STALL_REPEAT_MS = 6 * 3600000;
+
+// The route kinds, as the token counter labels them (a known set, see metrics.known).
+const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
+const TOKEN_TYPES = ['prompt', 'completion', 'cache_read', 'reasoning'] as const;
+
+// Tokens of a conversation (stats.usage_to_metrics: one entry per usage id, each with its LLM calls in token_usages), summed. Null when the
+// conversation carries no usage at all.
+export function tokenUsage(data: Json): TokenTotals | null {
+  const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
+  if (!usage || typeof usage !== 'object') return null;
+  const totals: TokenTotals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
+  for (const entry of Object.values(usage) as Json[]) {
+    for (const call of Array.isArray(entry?.token_usages) ? entry.token_usages as Json[] : []) {
+      totals.prompt += Number(call?.prompt_tokens) || 0;
+      totals.completion += Number(call?.completion_tokens) || 0;
+      totals.cache_read += Number(call?.cache_read_tokens) || 0;
+      totals.cache_write += Number(call?.cache_write_tokens) || 0;
+      totals.reasoning += Number(call?.reasoning_tokens) || 0;
+    }
+  }
+  return totals;
+}
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -1524,6 +1546,7 @@ export class Dispatcher {
       delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
       // The nudge is once per conversation too (see nudgeIfNoBranch).
       delete job.nudged; delete job.nudge_settled; this.nudgeChecks.delete(job.id);
+      delete job.tokens_seen;
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
@@ -1549,6 +1572,7 @@ export class Dispatcher {
     }
     let state: string | null = null;
     let costChanged = false;
+    let usage: TokenTotals | null = null; // the tokens of the conversation as this read sees them (null: the read failed)
     try {
       const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!));
       if (response.status === 404) state = 'deleted';
@@ -1557,6 +1581,7 @@ export class Dispatcher {
         state = data.execution_status || data.status;
         const cost = conversationCost(data);
         if (cost !== null && cost !== job.cost) { job.cost = cost; costChanged = true; }
+        usage = tokenUsage(data);
       }
     } catch (error) {
       this.logger.error('polling ' + job.key + ' failed:', error.message);
@@ -1574,6 +1599,7 @@ export class Dispatcher {
           const fallback = error.unavailable ? Math.min(60000 * 2 ** Math.min(job.rate_limited || 0, 5), 30 * 60000) : 15 * 60000;
           const wait = Math.min(Math.max(error.waitMs ?? fallback, 60000), this.config.quotaHoldMaxMs);
           const until = now + wait;
+          this.countTokens(job, usage);
           this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
           // The job may start again as soon as one of the routes it can run on is free: its own (or escalated) route, or that route's fallback.
@@ -1588,6 +1614,7 @@ export class Dispatcher {
     }
     // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
     if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
+      this.countTokens(job, usage);
       this.logger.error(job.key + ' ended with an error, running it once more');
       metrics.inc('forgehands_error_retries_total');
       Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,
@@ -1597,6 +1624,7 @@ export class Dispatcher {
     if (state !== null && TERMINAL.has(state)) {
       // A run continued a moment ago may still be reported in the state it stopped in: that is not news yet.
       if (job.resumed_from === state && now - job.resumed_at! < RESUME_SETTLE_MS) return false;
+      this.countTokens(job, usage);
       // A pause the operator wants is not resumed: the ticket is closed or its trigger label is gone (see pauseStop). Such a run ends as it is
       // (no split, no hand-over, no new branch update), and the operator's stop is the one thing ForgeHands does not fight.
       let stopped: string | null = null;
@@ -1629,6 +1657,7 @@ export class Dispatcher {
     // Free the slot of a run that never ends; the conversation itself is left alone unless the run is continued (see resume).
     // A continued run counts its timeout from the continuation.
     if (job.started && (job.resumed_at ?? job.started) + this.config.maxRunMs < now) {
+      this.countTokens(job, usage);
       if (await this.resume(job, 'timeout', now)) return true;
       return this.failed(job, 'timeout', now);
     }
@@ -1686,6 +1715,28 @@ export class Dispatcher {
     this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + (used + 1) + '/' + budget + ')');
     await this.startResumed(job);
     return true;
+  }
+
+  // The tokens of a conversation are added to the job's totals and to the counter forgehands_tokens_total when its run ends: at a terminal state,
+  // when the conversation is dropped for a retry or a quota hold, or when a run times out. `tokens_seen` is what of the current conversation is
+  // counted already, so a continued run adds only what came after. A read that failed (no usage) adds nothing.
+  countTokens(job: Job, usage: TokenTotals | null): void {
+    if (!usage) return;
+    const seen = job.tokens_seen;
+    const totals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0, ...job.tokens };
+    const delta = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
+    for (const field of Object.keys(delta) as (keyof TokenTotals)[]) {
+      delta[field] = Math.max(0, usage[field] - (seen?.[field] ?? 0));
+      totals[field] += delta[field];
+    }
+    job.tokens = totals;
+    job.tokens_seen = usage;
+    const tiers = new Set([...this.config.routes.values()].map((route) => route.tier));
+    const labels = {
+      repository: known(String(job.event?.repository?.full_name).toLowerCase(), this.config.allowedRepos), tier: known(this.tierOf(job), tiers),
+      kind: known(this.config.routes.get(job.label)?.kind || 'issue', ROUTE_KINDS)
+    };
+    for (const type of TOKEN_TYPES) if (delta[type] > 0) metrics.inc('forgehands_tokens_total', { ...labels, type }, delta[type]);
   }
 
   // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it; shared by resume and the nudge.
