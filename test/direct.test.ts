@@ -492,6 +492,8 @@ async function buildWatched(extra) {
     if (!String(url).startsWith('https://forge.example/')) return api(url, request);
     const path = new URL(url).pathname.replace('/api/v1/repos/owner/hello', '');
     forgejo.push({ method: request.method, path, body: request.body && JSON.parse(request.body) });
+    // The ticket itself, open and carrying its trigger label: a paused run is only resumed while that label is on it.
+    if (request.method === 'GET' && /^\/issues\/\d+$/.test(path)) return { ok: true, status: 200, json: async () => ({ number: Number(path.slice(8)), state: 'open', labels: [{ id: 3, name: 'ai:ready' }] }) };
     const labels = path.endsWith('/labels') && request.method === 'GET' && path !== '/labels' ? [{ id: 3, name: 'ai:ready' }] : request.method === 'GET' ? [{ id: 8, name: 'ai:plan' }, { id: 9, name: 'ai:blocked' }] : { id: 77 };
     return { ok: true, status: 200, json: async () => labels };
   };
@@ -1406,7 +1408,14 @@ test('a kept CI outcome does not hold the issue for ever', async () => {
 });
 
 test('a paused conversation is resumed on its conversation and keeps its slot until the run ends', async () => {
-  const { dispatcher, jobs } = await build(withChanges());
+  const config = loadConfig(env(withChanges()));
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  await jobs.load();
+  const api = fakeApi();
+  // The forge answers the open ticket with its trigger label (the check a paused run goes through before it is resumed).
+  const send = async (url, request) => String(url).startsWith('https://forge.example/')
+    ? { ok: true, status: 200, json: async () => ({ number: 26, state: 'open', labels: [{ id: 3, name: 'ai:ready' }] }) } : api(url, request);
+  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
   assert.equal((await dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
   await dispatcher.tick();
   const job = jobs.list()[0];

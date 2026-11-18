@@ -1502,6 +1502,20 @@ export class Dispatcher {
     if (state !== null && TERMINAL.has(state)) {
       // A run continued a moment ago may still be reported in the state it stopped in: that is not news yet.
       if (job.resumed_from === state && now - job.resumed_at! < RESUME_SETTLE_MS) return false;
+      // A pause the operator wants is not resumed: the ticket is closed or its trigger label is gone (see pauseStop). Such a run ends as it is
+      // (no split, no hand-over, no new branch update), and the operator's stop is the one thing ForgeHands does not fight.
+      let stopped: string | null = null;
+      if (state === 'paused' && (job.pause_resumes || 0) < this.config.pauseResumes) {
+        try { stopped = await this.pauseStop(job); }
+        catch (error) { this.logger.error('could not read ' + job.key + ' to see whether it was stopped, trying again:', error.message); return false; }
+      }
+      if (stopped) {
+        Object.assign(job, { status: 'failed', result: state, finished: now });
+        this.logger.error(job.key + ': paused, ' + stopped + ': not resumed');
+        this.runEnded(job, state, now);
+        await this.releaseFileWaits();
+        return true;
+      }
       if (await this.resume(job, state, now)) return true;
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       this.runEnded(job, state, now);
@@ -1522,6 +1536,26 @@ export class Dispatcher {
       return this.failed(job, 'timeout', now);
     }
     return false;
+  }
+
+  // Why a paused run stays stopped, or null when it may be resumed. The operator stops a run by removing its trigger label (or closing the ticket):
+  // the label of an issue route is on the issue, that of a round route on the pull request; routes that start on a CI result, a conflict or a
+  // closed epic have no label to look at, so only a closed ticket stops them. One read of the forge. Without forge access nothing can be
+  // read, so the run is resumed as it always was.
+  async pauseStop(job: Job): Promise<string | null> {
+    if (!this.config.forgejo) return null;
+    const event = job.event;
+    const repository = event.repository.full_name;
+    const kind = this.config.routes.get(job.label)?.kind;
+    const labelled = kind === 'issue' || kind === 'pull_request';
+    if (event.pull_request) {
+      const pull = await this.forge.getPull(repository, event.pull_request.number);
+      if (pull.state === 'closed' || pull.merged) return 'the pull request is closed';
+      return !labelled || (pull.labels || []).some((label) => label.name === job.label) ? null : 'the trigger label is gone';
+    }
+    const issue = await this.forge.getIssue(repository, event.issue.number);
+    if (issue.state === 'closed') return 'the issue is closed';
+    return !labelled || (issue.labels || []).some((label) => label.name === job.label) ? null : 'the trigger label is gone';
   }
 
   // Stage A (RESUME_ATTEMPTS): a run that ended stuck or timed out goes on in its own conversation, which keeps its context. One message says

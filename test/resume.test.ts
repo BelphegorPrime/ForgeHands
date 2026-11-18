@@ -46,7 +46,7 @@ const env = (extra = {}) => ({
 
 // OpenHands: conversations, their state, the message, run, pause and error calls. `runAnswers` and `eventAnswers` give the next answers.
 function openhands() {
-  const world = { states: {}, errors: {}, eventAnswers: [], runAnswers: [], calls: [], started: 0 };
+  const world = { states: {}, errors: {}, eventAnswers: [], runAnswers: [], calls: [], started: 0, deleted: new Set() };
   world.send = async (url, request) => {
     const path = new URL(url).pathname;
     const body = request.body ? JSON.parse(request.body) : undefined;
@@ -63,22 +63,30 @@ function openhands() {
     if (action === 'run' && request.method === 'POST') { world.calls.push({ method: 'run', id }); return reply(world.runAnswers.shift() ?? 200, {}); }
     if (action === 'pause' && request.method === 'POST') { world.calls.push({ method: 'pause', id }); return reply(200, {}); }
     if (action === 'events/search') return reply(200, { items: world.errors[id] || [] });
-    if (request.method === 'GET' && !action) return reply(200, { execution_status: world.states[id] || 'running', stats: { usage_to_metrics: {} } });
+    if (request.method === 'GET' && !action) {
+      if (world.deleted.has(id)) return reply(404, {});
+      return reply(200, { execution_status: world.states[id] || 'running', stats: { usage_to_metrics: {} } });
+    }
     return reply(404, {});
   };
   return world;
 }
 
 // Forgejo: the pull request 34 of issue 26 with its head commit (move `head` to simulate a push), the labels, comments and writes.
+// `labels` says which labels a ticket carries (the trigger label of a run is on it unless a test takes it off), `closed` the closed tickets,
+// `unreadable` makes every read fail.
 function forgejo() {
-  const world = { head: SHA, calls: [] };
+  const world = { head: SHA, calls: [], labels: { 34: ['ai:changes'], 57: ['ai:ready'], 58: ['ai:ready'], 60: ['ai:plan'], 61: ['ai:ready'] }, closed: new Set(), unreadable: false };
+  const labelsOf = (number) => (world.labels[number] || []).map((name, index) => ({ id: index + 1, name }));
   world.send = async (url, request) => {
     const path = new URL(url).pathname.replace(API, '');
     const body = request.body ? JSON.parse(request.body) : undefined;
     world.calls.push({ method: request.method, path, body });
     const reply = (value) => ({ ok: true, status: 200, json: async () => value });
-    if (request.method === 'GET' && path === '/pulls/34') return reply({ number: 34, state: 'open', merged: false, title: 'Fix it', body: 'Closes #26', head: { ref: 'ai/issue-26', sha: world.head }, labels: [], mergeable: true, merge_base: 'base0', html_url: 'https://forge.example/owner/hello/pulls/34' });
-    if (request.method === 'GET' && path === '/issues/26') return reply({ number: 26, state: 'open', labels: [] });
+    if (request.method === 'GET' && world.unreadable) return { ok: false, status: 503, json: async () => ({}) };
+    if (request.method === 'GET' && path === '/pulls/34') return reply({ number: 34, state: world.closed.has(34) ? 'closed' : 'open', merged: false, title: 'Fix it', body: 'Closes #26', head: { ref: 'ai/issue-26', sha: world.head }, labels: labelsOf(34), mergeable: true, merge_base: 'base0', html_url: 'https://forge.example/owner/hello/pulls/34' });
+    const issue = /^\/issues\/(\d+)$/.exec(path);
+    if (request.method === 'GET' && issue) return reply({ number: Number(issue[1]), state: world.closed.has(Number(issue[1])) ? 'closed' : 'open', labels: labelsOf(Number(issue[1])) });
     if (request.method === 'GET') return reply([]);
     if (request.method === 'POST' && path === '/labels') return reply({ id: 9, name: body.name });
     return reply({ id: 77 });
@@ -368,6 +376,8 @@ test('a paused issue run is resumed on its conversation with the neutral message
   // The paused state may still be reported for a moment after the run call: that is not news yet.
   await t.dispatcher.tick();
   assert.equal(messages(t).length, 1);
+  // The run delivers by closing the issue (the one delivery an issue run needs without a pull request).
+  t.forge.closed.add(57);
   t.oh.states[job.conversation_id] = 'finished';
   await t.dispatcher.tick();
   assert.equal(job.status, 'done');
@@ -671,6 +681,130 @@ test('the metrics count the resume and the escalation, and the status page says 
   assert.match(text, /^forgehands_resumes_total\{kind="pull_request",state="stuck"\} 1$/m);
   assert.match(text, /^forgehands_failure_escalations_total 1$/m);
   assert.equal(job.status, 'failed');
+});
+
+// A human stops a run by removing its trigger label (or closing the ticket): a paused run of such a ticket is not resumed, is not split and is not
+// handed over. It ends as paused, with one log line, and nothing is written to the ticket.
+test('a paused round whose trigger label is gone is not resumed: no split, no hand-over, one log line', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.forge.labels[34] = [];
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(job.pause_resumes, undefined);
+  assert.equal(messages(t).length, 0, 'no message');
+  assert.equal(runs(t).length, 0, 'no run call');
+  assert.equal(t.jobs.list().length, 1, 'no escalation');
+  assert.deepEqual(t.forge.comments(), [], 'nobody is called');
+  assert.equal(t.forge.labelled(), 0, 'no label is set');
+  assert.equal(logs.filter((line) => line.includes('not resumed')).length, 1);
+  assert.ok(logged('owner/hello#26:ai:changes: paused, the trigger label is gone: not resumed'));
+  assert.equal(t.jobs.list(true).length, 0, 'the slot is free');
+});
+
+test('a paused issue run whose trigger label is gone is not resumed and not split either', async () => {
+  const t = await setup({ SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.forge.labels[57] = ['ai:plan'];
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(messages(t).length, 0);
+  assert.equal(t.jobs.list().length, 1);
+  assert.equal(t.forge.labelled(), 0, 'the planner label is not set on a ticket the operator took off the run');
+  assert.deepEqual(t.forge.comments(), []);
+  assert.ok(logged('owner/hello#57:ai:ready: paused, the trigger label is gone: not resumed'));
+});
+
+test('a paused issue run of a closed issue is not resumed: one log line, no comment', async () => {
+  const t = await setup({ SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.forge.closed.add(57);
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(messages(t).length, 0);
+  assert.deepEqual(t.forge.comments(), []);
+  assert.equal(t.forge.labelled(), 0);
+  assert.equal(logs.filter((line) => line.includes('not resumed')).length, 1);
+  assert.ok(logged('owner/hello#57:ai:ready: paused, the issue is closed: not resumed'));
+});
+
+test('a paused round on a closed pull request is not resumed', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.forge.closed.add(34);
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(messages(t).length, 0);
+  assert.deepEqual(t.forge.comments(), []);
+  assert.ok(logged('owner/hello#26:ai:changes: paused, the pull request is closed: not resumed'));
+});
+
+test('a paused review run has no trigger label to look at: it is resumed even without the label, and stops only when closed', async () => {
+  const routes = { ...ROUTES, 'ci:success': { profile: CHANGES, tier: 'strong', on: 'ci_success' } };
+  const t = await setup({ LABEL_ROUTES: JSON.stringify(routes) });
+  const event = { type: 'pull_request.ci_success', repository: { full_name: repo, clone_url: 'https://forge.example/owner/hello.git', default_branch: 'main' },
+    pull_request: { number: 34, title: 'Fix it', body: 'Closes #26', state: 'open', head: { ref: 'ai/issue-26' }, html_url: null }, ci: { commit_sha: SHA }, sender: { login: 'marcel' } };
+  const job = t.jobs.add({ key: 'owner/hello#26:ci:success:' + SHA.slice(0, 8), label: 'ci:success', event, status: 'running', created: clock, started: clock, conversation_id: 'conv-9' });
+  t.forge.labels[34] = [];
+  t.oh.states['conv-9'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.pause_resumes, 1, 'resumed');
+  t.forge.closed.add(34);
+  clock += 61000;
+  t.oh.states['conv-9'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed', 'a closed pull request is a stop');
+  assert.equal(job.result, 'paused');
+  assert.equal(messages(t).length, 1, 'the second pause was not resumed');
+});
+
+test('a deleted conversation is not resumed: it ends as deleted, as before', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.oh.deleted.add('conv-1');
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'deleted');
+  assert.equal(messages(t).length, 0);
+  assert.deepEqual(t.forge.comments(), [], 'a deleted run is not reported, as before');
+});
+
+test('a paused run whose ticket cannot be read is left as it is and tried again on the next pass', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.forge.unreadable = true;
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running', 'not ended while the forge cannot say');
+  assert.equal(messages(t).length, 0);
+  assert.deepEqual(t.forge.comments(), []);
+  t.forge.unreadable = false;
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.pause_resumes, 1, 'resumed once the forge answers');
+  assert.equal(messages(t).length, 1);
+});
+
+test('a stuck run does not read the trigger label: it is continued as before when the label is gone', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.forge.labels[34] = [];
+  t.oh.states['conv-1'] = 'stuck';
+  await t.dispatcher.tick();
+  assert.equal(job.resumes, 1, 'a stuck run is continued as before, the label is not read for it');
+  assert.equal(job.status, 'running');
 });
 
 test('RESUME_ATTEMPTS and FAILURE_ESCALATE are validated', () => {
