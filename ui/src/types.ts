@@ -36,8 +36,10 @@ export interface Run {
 
 export interface Issue {
   issue: string;
+  issue_url: string | null;
   title: string;
   pr: number | null;
+  pr_url: string | null;
   rounds: number;
   state: string;
   closed?: true;

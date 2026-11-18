@@ -32,7 +32,7 @@ export interface Status {
   notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats; tokens: TierTokens }> }>;
-  issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
@@ -45,6 +45,24 @@ export interface Status {
 
 const DAY_MS = 24 * 3600 * 1000;
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
+
+function webUrl(value: unknown): string | null {
+  try {
+    const url = new URL(String(value ?? ''));
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function forgeItemUrl(config: DirectConfig, repository: string, type: 'issue' | 'pr', number: number): string | null {
+  if (!config.forgejo) return null;
+  const path = repository.split('/').map(encodeURIComponent).join('/');
+  const suffix = config.forge === 'gitlab'
+    ? type === 'issue' ? '/-/issues/' : '/-/merge_requests/'
+    : type === 'issue' ? '/issues/' : '/pulls/';
+  return config.forgejo.url.replace(/\/$/, '') + '/' + path + suffix + number;
+}
 
 // Nearest rank percentile of a sorted list; null for an empty one.
 const percentile = (sorted: number[], p: number): number | null => sorted.length ? sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)] : null;
@@ -191,7 +209,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
 
 export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
   options: { all?: boolean; idle?: IdleState | null } = {}): Status {
-  const byIssue = new Map<string, { key: string; title: string; runs: Run[]; last: number }>();
+  const byIssue = new Map<string, { key: string; title: string; issueUrl: string | null; prUrl: string | null; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
     const route = config.routes.get(job.label);
@@ -204,7 +222,17 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created,
       resumes: job.status === 'running' && (job.resumes || job.pause_resumes) ? (job.resumes || 0) + (job.pause_resumes || 0) : undefined, escalated_after: job.escalated_after
     };
-    const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [], last: 0 };
+    const pullTicket = base.includes('!pr');
+    const entry = byIssue.get(base) || {
+      key: base,
+      title: String(job.event?.issue?.title || '').slice(0, 80),
+      issueUrl: null,
+      prUrl: null,
+      runs: [],
+      last: 0
+    };
+    if (!pullTicket) entry.issueUrl ||= webUrl(job.event?.issue?.html_url);
+    entry.prUrl ||= webUrl(job.event?.pull_request?.html_url) || (pullTicket ? webUrl(job.event?.issue?.html_url) : null);
     entry.runs.push(run);
     entry.last = Math.max(entry.last, job.finished || job.started || job.created);
     byIssue.set(base, entry);
@@ -218,8 +246,14 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     entry.runs.sort((a, b) => b.created - a.created);
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
+    const issueNumber = entry.key.includes('#') ? Number(entry.key.slice(entry.key.lastIndexOf('#') + 1)) : 0;
     return {
-      issue: entry.key, title: entry.title, pr, rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
+      issue: entry.key,
+      issue_url: entry.issueUrl || (issueNumber ? forgeItemUrl(config, entry.key.slice(0, entry.key.lastIndexOf('#')), 'issue', issueNumber) : null),
+      title: entry.title,
+      pr,
+      pr_url: entry.prUrl || (pr ? forgeItemUrl(config, entry.key.split(/[#!]/)[0], 'pr', pr) : null),
+      rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last

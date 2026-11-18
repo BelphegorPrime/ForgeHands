@@ -472,6 +472,16 @@ h1 {
   color: #a34a46;
   font-size: 11px;
 }
+.ticket-link {
+  text-decoration: underline;
+  text-decoration-color: #d8b2ae;
+  text-underline-offset: 2px;
+}
+.ticket-link:hover,
+.pr-tag:hover {
+  color: #7d302e;
+  text-decoration-color: currentColor;
+}
 .ticket-title > span:last-child {
   overflow: hidden;
   grid-column: 1 / -1;
@@ -482,6 +492,9 @@ h1 {
 .pr-tag {
   color: #8c7c78;
   font-size: 9px;
+  text-decoration: underline;
+  text-decoration-color: #d8cdca;
+  text-underline-offset: 2px;
 }
 .run-labels {
   display: flex;

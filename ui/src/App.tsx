@@ -31,10 +31,11 @@ import {
   TableRow,
 } from "./components/ui/table.tsx";
 import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs.tsx";
+import { matchesFilter } from "./ticket-filter.ts";
+import type { IssueFilter } from "./ticket-filter.ts";
 import type { DashboardStatus, Issue, Summary } from "./types.ts";
 
 type WindowKey = "last_7_days" | "last_30_days";
-type IssueFilter = "all" | "active" | "waiting" | "closed";
 type Connection = "connecting" | "live" | "reconnecting";
 
 const money = (amount: number) =>
@@ -80,24 +81,6 @@ function issueVariant(
   if (state.includes("waiting") || state.includes("queued")) return "warning";
   if (issue.closed || state.includes("done")) return "secondary";
   return "success";
-}
-
-function matchesFilter(issue: Issue, filter: IssueFilter): boolean {
-  if (filter === "closed") return !!issue.closed;
-  if (filter === "active")
-    return (
-      !issue.closed &&
-      issue.runs.some(
-        (run) => run.status === "running" || run.status === "queued",
-      )
-    );
-  if (filter === "waiting")
-    return (
-      !issue.closed &&
-      (issue.state.toLowerCase().includes("waiting") ||
-        issue.state.toLowerCase().includes("human"))
-    );
-  return !issue.closed;
 }
 
 function Metric({
@@ -212,6 +195,11 @@ function App() {
   }, []);
 
   const entries = status ? Object.entries(status.summary) : [];
+  const waitingForHuman = new Set(
+    status?.waiting_for_human.map(
+      (entry) => entry.repository.toLowerCase() + "#" + entry.issue,
+    ),
+  );
   const totals = entries.reduce(
     (result, [, repository]) => {
       const summary: Summary = repository[windowKey];
@@ -225,7 +213,7 @@ function App() {
   const visibleIssues =
     status?.issues.filter(
       (issue) =>
-        matchesFilter(issue, filter) &&
+        matchesFilter(issue, filter, waitingForHuman) &&
         (
           issue.issue +
           " " +
@@ -239,13 +227,16 @@ function App() {
           .includes(query.toLowerCase()),
     ) || [];
   const activeTickets =
-    status?.issues.filter((issue) => matchesFilter(issue, "active")).length ||
+    status?.issues.filter((issue) =>
+      matchesFilter(issue, "active", waitingForHuman),
+    ).length ||
     0;
   const updatedAt = status ? timeLabel(status.generated) : "—";
-  const filterTabs: { value: IssueFilter; label: string }[] = [
-    { value: "all", label: "Open tickets" },
+  const filterTabs: { value: IssueFilter; label: string; title?: string }[] = [
+    { value: "all", label: "Open" },
     { value: "active", label: "Active" },
     { value: "waiting", label: "Waiting" },
+    { value: "human", label: "For human", title: "Waiting for a human" },
     { value: "closed", label: "Closed" },
   ];
 
@@ -547,7 +538,11 @@ function App() {
               >
                 <TabsList>
                   {filterTabs.map((tab) => (
-                    <TabsTrigger key={tab.value} value={tab.value}>
+                    <TabsTrigger
+                      key={tab.value}
+                      value={tab.value}
+                      title={tab.title}
+                    >
                       {tab.label}
                     </TabsTrigger>
                   ))}
@@ -572,9 +567,35 @@ function App() {
                         <TableRow key={issue.issue}>
                           <TableCell>
                             <div className="ticket-title">
-                              <strong>{issue.issue}</strong>
+                              <strong>
+                                {issue.issue_url ? (
+                                  <a
+                                    className="ticket-link"
+                                    href={issue.issue_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                  >
+                                    {issue.issue}
+                                  </a>
+                                ) : (
+                                  issue.issue
+                                )}
+                              </strong>
                               {issue.pr && (
-                                <span className="pr-tag">PR #{issue.pr}</span>
+                                issue.pr_url ? (
+                                  <a
+                                    className="pr-tag"
+                                    href={issue.pr_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                  >
+                                    PR #{issue.pr}
+                                  </a>
+                                ) : (
+                                  <span className="pr-tag">
+                                    PR #{issue.pr}
+                                  </span>
+                                )
                               )}
                               <span>{issue.title || "Untitled ticket"}</span>
                             </div>

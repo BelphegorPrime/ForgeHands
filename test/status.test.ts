@@ -152,6 +152,32 @@ test("a repository without work shows zeros and no times", () => {
   });
 });
 
+test("dashboard tickets link to issues and pull requests using safe forge URLs", () => {
+  const config = loadConfig({
+    ...env({ FORGE_URL: "https://forge.example", FORGE_TOKEN: "forge-token" }),
+  });
+  const jobs = new JobStore(join(dir, "links.json"));
+  jobs.add({
+    key: repo + "#7:ai:ready",
+    label: "ai:ready",
+    status: "done",
+    created: NOW,
+    event: {
+      repository: { full_name: repo },
+      issue: {
+        number: 7,
+        title: "Ticket 7",
+        html_url: "javascript:alert(1)",
+      },
+      pull_request: { number: 77, html_url: "javascript:alert(1)" },
+    },
+  });
+
+  const ticket = buildStatus(config, jobs, NOW).issues[0];
+  assert.equal(ticket.issue_url, "https://forge.example/owner/hello/issues/7");
+  assert.equal(ticket.pr_url, "https://forge.example/owner/hello/pulls/77");
+});
+
 test("the page refreshes itself, shows the summary and escapes titles", () => {
   const jobs = ledger();
   jobs.add({
