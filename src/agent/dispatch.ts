@@ -141,6 +141,9 @@ export class Dispatcher {
     this.transport = createTransport(config, send, this.dry);
     this.forge = createForge(config, (repository, method, path, body) => this.forgejoCall({ repository: { full_name: repository } }, method, path, body));
     this.merger = new Merger(config, send, logger, undefined, this.dry);
+    // The holds of two-key merges live in the ledger and are timed by the dispatch tick (see pass).
+    this.merger.ledger = jobs;
+    this.merger.now = now;
     this.merger.securityPending = (repository, number, sha) => this.jobs.list(true).some((job) => this.config.routes.get(job.label)?.kind === 'sensitive_review'
       && job.event.repository.full_name.toLowerCase() === repository.toLowerCase() && job.event.pull_request?.number === number && job.event.ci?.commit_sha === sha);
     this.notifier = notifier ?? Notifier.fromConfig(config, send, logger);
@@ -1105,6 +1108,8 @@ export class Dispatcher {
     this.reportIdle(now, started);
     this.checkStall(now);
     if (await this.refreshMoved(now)) changed = true;
+    // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
+    if (await this.merger.recheckHolds()) changed = true;
     if (await this.archiveOld(now)) changed = true;
     if (await this.sweepClosed(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;

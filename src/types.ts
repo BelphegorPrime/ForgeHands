@@ -169,6 +169,10 @@ export interface DirectConfig extends BaseConfig {
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
+  /** TWO_KEYS_HOLD_MINUTES: a two-key merge waits this long after both keys approved (0: merges at once). See Merger.holdGate. */
+  twoKeysHoldMinutes: number;
+  /** HOLD_LABEL: while this label is on a pull request, its two-key merge waits. */
+  holdLabel: string;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
   botRepos: Set<string>;
@@ -265,6 +269,17 @@ export interface TokenTotals { prompt: number; completion: number; cache_read: n
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
 // `deleted`: the ticket (or pull request) was deleted in the forge; its waiting and queued jobs end here, without a hand-over (see dropDeleted).
 export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry' | 'deleted';
+
+/** A two-key merge on hold (TWO_KEYS_HOLD_MINUTES), kept in the ledger per pull request ("repo#pr<n>"). `merge_after` is null while HOLD_LABEL is on. */
+export interface Hold {
+  repository: string;
+  number: number;
+  sha: string;
+  since: number;
+  merge_after: number | null;
+  /** When the hold is looked at again (the timer in the dispatch tick, see Merger.recheckHolds). */
+  check_at: number;
+}
 
 export interface Job {
   id: string;
