@@ -323,6 +323,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     quotaHoldMaxMs: positiveInt(env.QUOTA_HOLD_MAX_HOURS, 8, 'QUOTA_HOLD_MAX_HOURS', 48) * 3600000,
     quotaGiveUpMs: positiveInt(env.QUOTA_GIVE_UP_HOURS, 24, 'QUOTA_GIVE_UP_HOURS', 168) * 3600000,
     errorRetries: env.ERROR_RETRIES === '0' ? 0 : positiveInt(env.ERROR_RETRIES, 1, 'ERROR_RETRIES', 5),
+    // A run that ends stuck or timed out is continued on its own conversation this many times (a message, then the run) before the next
+    // stage: a round escalates (FAILURE_ESCALATE), anything else goes to the human. 0 switches it off.
+    resumeAttempts: env.RESUME_ATTEMPTS === '0' ? 0 : positiveInt(env.RESUME_ATTEMPTS, 1, 'RESUME_ATTEMPTS', 5),
+    // A round that is still stuck, timed out or out of iterations after that starts once more on the profile of its escalate_to route, once per
+    // head commit of the pull request. 0 switches it off.
+    failureEscalate: failureEscalateOf(env.FAILURE_ESCALATE),
     // When a worker run on an issue ends without finishing (paused at its iteration limit, stuck, timed out) the issue is probably too big:
     // this label (the planner route, e.g. ai:plan) is added so that the planner splits it into slices. Empty: off, a human is called.
     splitLabel: env.SPLIT_LABEL?.trim() || null,
@@ -366,6 +372,13 @@ function reviewSwitch(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('REVIEW_WITHOUT_CI must be 0 or 1');
+}
+
+// FAILURE_ESCALATE: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.
+function failureEscalateOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '1') return true;
+  if (value === '0') return false;
+  throw new Error('FAILURE_ESCALATE must be 0 or 1');
 }
 
 // COMMENT_RESTARTS: 0 to 100, default 2; 0 switches the comment restarts off.

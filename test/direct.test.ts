@@ -190,8 +190,9 @@ test('failed starts are retried with backoff, then marked failed', async () => {
   assert.equal(jobs.list()[0].status, 'failed');
 });
 
+// RESUME_ATTEMPTS=0 in the tests below that predate resuming: they pin what a stuck or timed out run did before it was continued (test/resume.test.ts).
 test('a run that never ends frees its slot after the timeout', async () => {
-  const { dispatcher, jobs } = await build({ MAX_RUN_MINUTES: '1' });
+  const { dispatcher, jobs } = await build({ MAX_RUN_MINUTES: '1', RESUME_ATTEMPTS: '0' });
   await dispatcher.enqueue(event('ai:ready', 1));
   await dispatcher.tick();
   clock += 61_000; await dispatcher.tick();
@@ -645,7 +646,7 @@ test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to t
   await plain.finish('paused');
   assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "paused"\. A human/);
   assert.ok(!plain.forgejo.some((c) => c.method === 'DELETE'));
-  const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan', RESUME_ATTEMPTS: '0' });
   await planner.dispatcher.enqueue(event('ai:plan', 59));
   await planner.finish('stuck');
   assert.match(planner.comments()[0], /^@marcel/, 'the planner itself is never sent to the planner');
@@ -3580,7 +3581,8 @@ test('BOT_REPOS limits the bot pull requests to some repositories; it must name 
 let commentRuns = 0;
 // The forge's view of issue 26 (state and labels) can be changed by a test; every other call of the forge is answered as fakeForgejo does.
 async function buildComments(extra = {}) {
-  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', ...extra }));
+  // Runs that end stuck are not continued here (RESUME_ATTEMPTS=0): these tests are about the comments that restart a failed run.
+  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', RESUME_ATTEMPTS: '0', ...extra }));
   const jobs = new JobStore(join(dir, 'comments-' + (commentRuns++) + '.json'));
   await jobs.load();
   const issue = { state: 'open', labels: ['ai:ready'], dependencies: [] };
