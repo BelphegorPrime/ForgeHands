@@ -155,7 +155,7 @@ export function immediateMessage(language: NotifyLanguage, kind: string, facts: 
   return { ...plain, html };
 }
 
-export interface StallFacts { minutes: number; reasons: IdleCounts; tiers: string[] }
+export interface StallFacts { minutes: number; reasons: IdleCounts; tiers: string[]; cycles?: string[] }
 // The stall alert (STALL_ALERT_MINUTES): how long nothing started and what the queued work waits for, in words. Numbers and tier names only.
 export function stallMessage(language: NotifyLanguage, facts: StallFacts): Notification {
   const de = language === 'de';
@@ -164,10 +164,12 @@ export function stallMessage(language: NotifyLanguage, facts: StallFacts): Notif
   const parts = de
     ? [r.quota ? r.quota + ' zurückgehalten wegen Kontingent (' + tiers + ')' : '', r.disk ? r.disk + ' zurückgehalten, wenig Platz auf der Platte' : '',
       r.hourly ? r.hourly + ' über dem Stundenlimit' : '', r.concurrency ? r.concurrency + ' über einem Parallelitätslimit' : '',
-      r.could_start ? r.could_start + ' könnten starten und tun es nicht' : '']
+      r.could_start ? r.could_start + ' könnten starten und tun es nicht' : '', r.cycle ? r.cycle + ' in einem Abhängigkeitszyklus, keiner kann starten' : '',
+      ...(facts.cycles ?? []).map((text) => 'Zyklus: ' + text)]
     : [r.quota ? r.quota + ' held by a quota (' + tiers + ')' : '', r.disk ? r.disk + ' held by low disk space' : '',
       r.hourly ? r.hourly + ' over the hourly limit' : '', r.concurrency ? r.concurrency + ' over a concurrency limit' : '',
-      r.could_start ? r.could_start + ' could start and do not' : ''];
+      r.could_start ? r.could_start + ' could start and do not' : '', r.cycle ? r.cycle + ' in a dependency cycle, none of them can start' : '',
+      ...(facts.cycles ?? []).map((text) => 'Cycle: ' + text)];
   const first = de ? 'Seit ' + facts.minutes + ' Minuten ist kein Lauf gestartet, und keiner läuft.' : 'No run has started for ' + facts.minutes + ' minutes and none is running.';
   const subject = de ? 'ForgeHands: seit ' + facts.minutes + ' Minuten kein Lauf' : 'ForgeHands: nothing has started for ' + facts.minutes + ' min';
   const lines = [first, ...parts.filter(Boolean), de ? 'Abhängigkeiten zwischen Tickets zählen nicht: eine Kette ist normal. Siehe /status.' : 'Waits on dependencies do not count: a chain of tickets is normal. See /status.'];

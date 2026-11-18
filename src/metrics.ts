@@ -32,6 +32,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_resumes_total: 'Runs that ended stuck, timed out or paused and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS, PAUSE_RESUMES).',
   forgehands_ledger_sync_closed_total: 'Tickets the ledger sync (LEDGER_SYNC_HOURS) found closed or merged in the forge and marked closed on the status page.',
   forgehands_tokens_total: 'Tokens of the agent runs, added up when the run ended, by repository, the tier it really ran on, route kind and type (prompt, completion, cache_read, reasoning).',
+  forgehands_wait_cycles_broken_total: 'Same-files waits not taken, or dropped, because the older ticket already waits for this one (a cycle of waits).',
   forgehands_deleted_tickets_total: 'Tickets or pull requests found deleted in the forge (a 404 on their own read); their waiting and queued jobs are dropped.',
   forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
   forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
@@ -43,10 +44,10 @@ const GAUGES: Record<string, string> = {
   forgehands_workspace_disk_used_percent: 'Used share of the filesystem of WORKSPACE_CLEANUP_DIR, in percent (absent while the cleanup is off).',
   forgehands_workspace_disk_free_bytes: 'Bytes available to ForgeHands on the filesystem of WORKSPACE_CLEANUP_DIR (absent while the cleanup is off).',
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
-  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency); 0 while nothing waits.'
+  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle); 0 while nothing waits.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
-const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency'] as const;
+const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle'] as const;
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
@@ -124,7 +125,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
