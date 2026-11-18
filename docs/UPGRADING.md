@@ -237,3 +237,12 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - An explicit dependency cycle (A depends on B, B on A) is never broken automatically. It is logged once (`dependency cycle: ...`), counted as the idle reason `cycle` (`/status.json` `idle.reasons.cycle` and `cycles`, gauge `forgehands_idle_jobs{reason="cycle"}`), and it now raises the stall notification (`STALL_ALERT_MINUTES`, sent when `NOTIFY_IMMEDIATE` names `stalled`), which names the tickets. Break it by removing one of the dependencies in the forge.
 - Rollback: go back to 0.9.1. The same-files waits of the loop come back, and so do the deadlocks.
 - The same-files check also reads the open dependencies of an epic whose job is done (its children are only in the forge): at most 40 such reads a pass, each ticket once per 10 minutes, so a pass costs a few reads at most. A failed read is taken as no dependencies.
+
+# Upgrading to the version after 0.9.5: an issue run that delivers nothing is escalated once
+
+**Fix.** A worker run on an issue that finished twice without a pull request or a comment went straight to the human, even when a stronger model was at hand. A route with `escalate_to` now gets one more try: after the second empty run a fresh run starts on the profile and tier of that route, on the same ticket. Only if that run is empty as well is the human called (`no_delivery`). A cheap model that claims a file cannot be read no longer costs a human a ticket.
+
+- Nothing to set. The switch is `FAILURE_ESCALATE` (default 1; `0` restores the former behaviour). Routes without `escalate_to` behave as before.
+- To use it, add `escalate_to` to an issue route in `LABEL_ROUTES`, for example `"ai:ready": {"profile": "<uuid>", "tier": "free", "escalate_to": "ai:escalate"}`. An issue route may now name `escalate_to`; the validation no longer refuses it (other route kinds still need a round route).
+- The escalated run is shown on the status page as "escalated after no_delivery" and counted in the tier statistics under the target's tier (`escalated`); `forgehands_failure_escalations_total` counts it too. The second empty run is still counted as `finished` and, when it is the last one, as `no_delivery` (as before).
+- Rollback: go back to the previous version, or set `FAILURE_ESCALATE=0`.
