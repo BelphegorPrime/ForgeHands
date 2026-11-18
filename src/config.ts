@@ -403,6 +403,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     splitLabel: env.SPLIT_LABEL?.trim() || null,
     // TICKET_PREFLIGHT (1 by default, 0 = off): a worker's ticket with a broken Steps, Files or Acceptance section starts no run (src/agent/preflight.ts).
     ticketPreflight: ticketPreflightOf(env.TICKET_PREFLIGHT),
+    // HANDBACK_HANDLING (1 by default, 0 = off): a worker run that ends with a comment and no pull request is handed back (src/agent/handback.ts).
+    handbackHandling: handbackHandlingOf(env.HANDBACK_HANDLING),
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // REVERT_RETRIES (default 1, 0 = off, at most 5): after a revert of a ticket's merge is merged, the ticket is reopened and started again this many times.
@@ -528,6 +530,13 @@ function failureEscalateOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('FAILURE_ESCALATE must be 0 or 1');
+}
+
+// HANDBACK_HANDLING: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.
+function handbackHandlingOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '1') return true;
+  if (value === '0') return false;
+  throw new Error('HANDBACK_HANDLING must be 0 or 1');
 }
 
 // HUMAN_REVIEW_ROUNDS: 1 (default) or 0; any other value is a mistake worth a clear message.

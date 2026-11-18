@@ -13,6 +13,7 @@ import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
 import { ReviewSweep } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
+import { HandbackRouter, handbackLine, handbackOf } from './handback.ts';
 import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
@@ -127,6 +128,8 @@ export class Dispatcher {
   ledgerSync: LedgerSync;
   /** The ticket pre-flight (TICKET_PREFLIGHT): a worker's ticket that breaks a rule starts no run. See src/agent/preflight.ts. */
   preflight: TicketPreflight;
+  /** HANDBACK_HANDLING: a worker run that hands its ticket back by a comment is run again, escalated or sent to the planner. See src/agent/handback.ts. */
+  handback: HandbackRouter;
   /** The reconciler of REVIEW_SWEEP_MINUTES: starts the review of a head that has none in the ledger. */
   sweep: ReviewSweep;
   /** RECURRING_REASON_MIN: counts the NOT OK points of the changes rounds and files a check ticket for a recurring one. See src/agent/recurring.ts. */
@@ -187,6 +190,8 @@ export class Dispatcher {
     });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
+    this.handback = new HandbackRouter({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts),
+      note: (event, patch) => this.noteTicket(this.issueKey(event), patch), secrets: () => this.secretValues() });
     this.recurring = new RecurringFindings(config, jobs, this.forge, logger, now);
   }
 
@@ -1309,11 +1314,18 @@ export class Dispatcher {
       const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
       if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
       const comments = await this.forge.listComments(repository, event.issue.number, 50);
-      if (comments.some((comment) => Date.parse(comment.created_at) >= since)) return;
+      // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
+      const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
+      const handback = this.config.handbackHandling && written.length ? handbackOf(written) : null;
+      if (written.length && !handback) return;
       const parent = await this.parentDelivery(event, since);
       if (parent) {
         Object.assign(job, { delivered_on: parent });
         this.logger.error(repository + '#' + event.issue.number + ': delivered as a comment on #' + parent);
+        return;
+      }
+      if (handback) {
+        await this.handback.handle(job, handback.kind, handback.text);
         return;
       }
       if (!job.delivery_retry) {
@@ -2121,7 +2133,7 @@ export class Dispatcher {
       agent_profile_id: effective.profile,
       max_iterations: route.maxIterations,
       tags: { source: 'forgehands', ...(job.event.bot ? { bot: 'dependency' } : { issue: String(job.event.issue.number) }), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
-      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks) }] }
+      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks) + handbackLine(job) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
     // Built per start from the environment; never stored in the ledger.
