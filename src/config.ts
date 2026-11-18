@@ -108,6 +108,14 @@ function parseMergePolicy(text: string | undefined): Map<string, MergeRule> {
   return policy;
 }
 
+// DELETE_AFTER_DAYS and DELETE_FAILED_AFTER_DAYS: whole days, 0 = off (DELETE_FAILED_AFTER_DAYS: 0 means the DELETE_AFTER_DAYS value).
+function deleteDays(value: string | undefined, name: string): number {
+  if (value === undefined || value === '') return 0;
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 0 || days > 3650) throw new Error(name + ' must be an integer between 0 and 3650');
+  return days;
+}
+
 function archiveDays(value: string | undefined): number {
   if (value === undefined || value === '') return 7;
   const days = Number(value);
@@ -309,6 +317,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const maxRounds = positiveInt(env.MAX_ROUNDS, 3, 'MAX_ROUNDS', 100) as number;
   if (positiveInt(env.ESCALATE_FROM_ROUND, maxRounds, 'ESCALATE_FROM_ROUND', 100) as number > maxRounds) throw new Error('ESCALATE_FROM_ROUND must not be larger than MAX_ROUNDS');
   const mergePolicy = parseMergePolicy(env.MERGE_POLICY);
+  const deleteAfterDays = deleteDays(env.DELETE_AFTER_DAYS, 'DELETE_AFTER_DAYS');
+  const deleteFailedDays = deleteDays(env.DELETE_FAILED_AFTER_DAYS, 'DELETE_FAILED_AFTER_DAYS');
+  if (deleteAfterDays && deleteFailedDays && deleteFailedDays < deleteAfterDays) throw new Error('DELETE_FAILED_AFTER_DAYS must not be lower than DELETE_AFTER_DAYS');
   const mergeMethod = env.MERGE_METHOD || 'merge';
   if (!['merge', 'squash', 'rebase', 'rebase-merge', 'fast-forward-only'].includes(mergeMethod)) throw new Error('MERGE_METHOD must be merge, squash, rebase, rebase-merge or fast-forward-only');
   if (mergePolicy.size && !(forgeUrl && forgeToken)) throw new Error('MERGE_POLICY needs FORGEJO_URL and FORGEJO_TOKEN (or FORGE_URL and FORGE_TOKEN)');
@@ -386,6 +397,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     splitLabel: env.SPLIT_LABEL?.trim() || null,
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
+    // DELETE_AFTER_DAYS (0 = off): the step after archiving, the OpenHands conversation of an archived run goes. A failed run may keep its
+    // conversation longer (DELETE_FAILED_AFTER_DAYS), which is never shorter than DELETE_AFTER_DAYS when both are set.
+    deleteAfterDays,
+    deleteFailedAfterDays: deleteFailedDays || deleteAfterDays,
     // The ledger sync (src/agent/ledger-sync.ts) asks the forge about the open tickets of the ledger this often; 0 switches it off.
     ledgerSyncHours: wholeOf(env.LEDGER_SYNC_HOURS, 6, 'LEDGER_SYNC_HOURS', 720),
     // The status page and /status.json leave out closed tickets whose last activity is older than this many days (?all=1 shows them).

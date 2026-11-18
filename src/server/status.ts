@@ -197,7 +197,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const route = config.routes.get(job.label);
     const run: Run = {
       label: job.label, kind: route?.kind || 'issue', status: job.status, result: job.result,
-      conversation: job.conversation_id || null, pr: job.event?.pull_request?.number || null,
+      conversation: job.conversation_deleted ? null : job.conversation_id || null, pr: job.event?.pull_request?.number || null,
       started: job.started ? new Date(job.started).toISOString() : null,
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
