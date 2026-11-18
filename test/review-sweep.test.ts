@@ -181,6 +181,17 @@ test('a fork, a pull request older than 30 days, and a draft are not swept', asy
   assert.equal(await t.dispatcher.sweep.run(), 0);
 });
 
+test('a WIP-titled agent pull request that Forgejo reports as a draft is swept; the author\'s own draft is not', async () => {
+  const wip = await build();
+  world = freshWorld();
+  world.pulls = [pull(34, NEW, { title: 'WIP: Fix it', draft: true })];
+  assert.equal(await wip.dispatcher.sweep.run(), 1, 'the WIP marker is the agent\'s normal state');
+  const own = await build();
+  world = freshWorld();
+  world.pulls = [pull(34, NEW, { title: 'Fix it', draft: true })];
+  assert.equal(await own.dispatcher.sweep.run(), 0, 'a draft by the author is left alone');
+});
+
 test('at most 5 reviews per pass; the rest follows on the next pass', async () => {
   const t = await build();
   world = freshWorld();

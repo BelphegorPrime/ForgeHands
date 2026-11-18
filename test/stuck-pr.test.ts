@@ -373,3 +373,109 @@ test('a blocked pull request that is closed leaves the chain', async () => {
   await t.dispatcher.sweep.run();
   assert.deepEqual(buildStatus(t.config, t.jobs, clock).issues.find((entry) => entry.issue === repo + '#60').blocked_by_stuck, []);
 });
+
+// ---- 4. the gaps of the watchdog: WIP titles that Forgejo reports as drafts, revert pull requests, merge conflicts
+
+// A job of a bot or revert pull request (its own ledger key "repo!pr<n>"), a round of the reviewer or the worker.
+function addRevertJob(jobs, { label, index, status = 'done', number = 34 }) {
+  return jobs.add({
+    key: repo + '!pr' + number + ':' + label + ':' + index, label, status, created: clock - (6 - index) * HOUR,
+    started: clock - (5 - index) * HOUR, finished: status === 'done' ? clock - (4 - index) * HOUR : undefined, conversation_id: 'conv-r' + index, attempts: 0,
+    event: { type: 'ci.success', label, bot: true, repository: { full_name: repo, default_branch: 'main' }, issue: { number, title: 'Revert', body: '', labels: [] },
+      sender: { login: 'marcel' }, pull_request: { number, head_ref: 'ai/revert-' + (number - 20) } }
+  });
+}
+
+test('a WIP-titled agent pull request that Forgejo reports as a draft is watched: blocked after the grace with a NOT OK verdict', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, ['ai:changes'], { title: 'WIP: Fix it', draft: true })];
+  world.comments[34] = [verdict(NOT_OK, clock - 2 * HOUR)];
+  reviewed(t.jobs, NEW);
+  addJob(t.jobs, { label: 'ai:changes', index: 1 });
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(names(34).includes('ai:blocked'), 'the WIP marker is the agent\'s normal state, not a reason to skip the pull request');
+  assert.match(comments()[0], /NOT OK/);
+});
+
+test('a draft without the WIP marker (the author\'s own draft) is still left alone by the watchdog', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, ['ai:changes'], { title: 'Fix it', draft: true })];
+  world.comments[34] = [verdict(NOT_OK, clock - 2 * HOUR)];
+  reviewed(t.jobs, NEW);
+  addJob(t.jobs, { label: 'ai:changes', index: 1 });
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(!names(34).includes('ai:blocked'));
+  assert.equal(t.jobs.stuck.size, 0);
+});
+
+test('a revert pull request (ai/revert-<n>) with a NOT OK verdict is watched; its ticket is the original one from the revert ledger', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, ['ai:changes'], { title: 'WIP: Revert: Fix it', head: { ref: 'ai/revert-14', sha: NEW, repo: { full_name: repo } } })];
+  world.comments[34] = [verdict(NOT_OK, clock - 2 * HOUR)];
+  t.jobs.reverts.push({ repository: repo, number: 34, issue: 56, sha: NEW, state: 'merged', at: clock - DAY });
+  addRevertJob(t.jobs, { label: 'ai:changes', index: 1 });
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(names(34).includes('ai:blocked'), 'a revert pull request is blocked like an agent one');
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').issue, 56, 'the record names the original ticket: it marks that ticket on the status page');
+  assert.match(comments()[0], /issue #56|NOT OK/);
+  assert.equal(reviews().length, 0, 'the watchdog starts nothing');
+});
+
+test('a revert pull request with no record in the revert ledger has no ticket: blocked, and it marks no ticket', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, ['ai:changes'], { title: 'WIP: Revert: Fix it', head: { ref: 'ai/revert-14', sha: NEW, repo: { full_name: repo } } })];
+  world.comments[34] = [verdict(NOT_OK, clock - 2 * HOUR)];
+  addRevertJob(t.jobs, { label: 'ai:changes', index: 1 });
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(names(34).includes('ai:blocked'));
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').issue, 0, 'no ticket');
+  assert.match(comments()[0], /this pull request/);
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').blocked, true);
+});
+
+test('a pull request with a merge conflict and no run queued or running is stuck (stuck_conflict) after the grace', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, [], { mergeable: false })];
+  reviewed(t.jobs, NEW);
+  await t.dispatcher.sweep.run();
+  assert.ok(!names(34).includes('ai:blocked'), 'the first sighting only starts the clock');
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(names(34).includes('ai:blocked'));
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').why, 'stuck_conflict');
+  assert.match(comments()[0], /conflicts with main/);
+  assert.match(metrics.render(), /forgehands_stuck_pr_blocks_total\{reason="stuck_conflict"\} [1-9]/);
+});
+
+test('a merge conflict with a conflict round queued or running is not stuck', async () => {
+  for (const status of ['queued', 'running']) {
+    const t = await build();
+    world = freshWorld();
+    world.pulls = [agentPull(NEW, [], { mergeable: false })];
+    reviewed(t.jobs, NEW);
+    addJob(t.jobs, { label: 'pr:conflict', index: 1, status });
+    for (let i = 0; i < 3; i++) { await t.dispatcher.sweep.run(); clock += HOUR; }
+    assert.ok(!names(34).includes('ai:blocked'), status);
+    assert.equal(t.jobs.stuck.size, 0, status);
+    clock -= 3 * HOUR;
+  }
+});
+
+test('a conflict on a pull request whose verdict is OK is stuck too: the merger cannot merge it', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, [], { mergeable: false })];
+  world.comments[34] = [verdict(OK, clock - 2 * HOUR)];
+  reviewed(t.jobs, NEW);
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').why, 'stuck_conflict');
+});
