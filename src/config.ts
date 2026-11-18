@@ -421,6 +421,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // stop it. HOLD_LABEL on the pull request stops it for as long as it is there; taking it off starts a full hold again.
     twoKeysHoldMinutes: wholeOf(env.TWO_KEYS_HOLD_MINUTES, 0, 'TWO_KEYS_HOLD_MINUTES', 1440),
     holdLabel: env.HOLD_LABEL?.trim() || 'ai:hold',
+    // TWO_KEYS_DAILY_LIMIT (0 = off, at most 100): merges through two keys per repository in the last 24 hours; the next one is handed to a human.
+    twoKeysDailyLimit: wholeOf(env.TWO_KEYS_DAILY_LIMIT, 0, 'TWO_KEYS_DAILY_LIMIT', 100),
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
     // Pull requests of dependency bots (Renovate): Forgejo logins and, optionally, head branch prefixes (comma separated). They get the same

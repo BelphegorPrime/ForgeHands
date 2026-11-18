@@ -50,7 +50,7 @@ const env = (extra = {}) => ({
 function forge(state) {
   const calls = [];
   const routes = {
-    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: 'ai/issue-26', sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })) }),
+    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: 'ai/issue-26', sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })), merge_commit_sha: state.mergeSha || null }),
     ['GET ' + API + '/commits/cafe0000cafe/status']: () => state.ci,
     ['GET ' + API + '/commits/beef0000beef/status']: { state: 'success', total_count: 2 },
     ['GET ' + API + '/pulls/34/files']: state.files.map((filename) => ({ filename })),
@@ -79,6 +79,7 @@ function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security 
     pr: { head: { sha: 'cafe0000cafe' }, labels },
     files,
     ci: { state: 'success', total_count: 2 },
+    mergeSha: null,
     comments: [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...(security ? [SECURITY_OK()] : [])]
   };
   const fake = forge(state);
@@ -193,4 +194,70 @@ test('hold: a protected path that is not covered by two keys is handed to the hu
   const h = harness({ TWO_KEYS_HOLD_MINUTES: '30' }, { files: ['compose.yaml'], security: true });
   assert.equal(await h.dispatcher.merger.handle(approved()), 'protected_paths');
   assert.equal(h.jobs.holds.size, 0);
+});
+
+// ---- daily limit: TWO_KEYS_DAILY_LIMIT, merges through two keys per repository in the last 24 hours
+const earlier = (h, hoursAgo, { two = true, repository = repo } = {}) => h.jobs.merges.push({ repository: repository.toLowerCase(), number: 90, branch: 'ai/issue-9', sha: null, merged_at: clock - hoursAgo * HOUR, two_keys: two });
+
+test('daily limit: the merge over the limit of 24 hours is handed to the human with the reason; older merges fall out of the window', async () => {
+  const h = harness({ TWO_KEYS_DAILY_LIMIT: '2' });
+  earlier(h, 23);
+  earlier(h, 1);
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'daily_limit');
+  assert.equal(merged(h), false);
+  const text = h.comments().at(-1);
+  assert.match(text, /daily limit of 2 merges through two keys reached/);
+  assert.match(text, /ready for a human to merge|A human has to merge it/);
+  assert.match(text, /^@marcel /, 'the human is called as for any protected path');
+  clock += 2 * HOUR;
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged', 'the merge 25 hours ago no longer counts');
+  assert.equal(merged(h), true);
+});
+
+test('daily limit: only merges through two keys count, and 0 switches the limit off', async () => {
+  const plain = harness({ TWO_KEYS_DAILY_LIMIT: '1' }, { files: ['src/a.mjs'], security: false });
+  earlier(plain, 1, { two: false });
+  assert.equal(await plain.dispatcher.merger.handle(approved()), 'merged', 'a merge without two keys does not count');
+  const off = harness({ TWO_KEYS_DAILY_LIMIT: '0' });
+  for (let i = 0; i < 5; i++) earlier(off, 1);
+  assert.equal(await off.dispatcher.merger.handle(approved()), 'merged');
+});
+
+test('daily limit: a merge of another repository does not count', async () => {
+  const h = harness({ TWO_KEYS_DAILY_LIMIT: '1' });
+  earlier(h, 1, { repository: 'other/repo' });
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged');
+});
+
+test('daily limit: reached during a hold, the hold ends with a hand-over and no merge', async () => {
+  const h = harness({ TWO_KEYS_DAILY_LIMIT: '1', TWO_KEYS_HOLD_MINUTES: '30' });
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'held');
+  earlier(h, 0.5);
+  clock += 31 * MINUTE;
+  await h.dispatcher.tick();
+  assert.equal(merged(h), false);
+  assert.match(h.comments().at(-1), /daily limit of 1 merges through two keys reached/);
+  assert.equal(h.jobs.holds.size, 0);
+});
+
+test('daily limit: a merge is recorded with its commit (read after the merge) and survives a restart', async () => {
+  const h = harness({ TWO_KEYS_DAILY_LIMIT: '5' });
+  h.state.mergeSha = 'feed0000feed';
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged');
+  const [record] = h.jobs.merges;
+  assert.deepEqual({ ...record, merged_at: 0 }, { repository: repo.toLowerCase(), number: 34, branch: 'ai/issue-26', sha: 'feed0000feed', merged_at: 0, two_keys: true });
+  await h.jobs.persist(clock);
+  const reloaded = new JobStore(join(dir, 'jobs.json'));
+  await reloaded.load();
+  assert.equal(reloaded.merges.length, 1);
+  const dispatcher = new Dispatcher(h.config, reloaded, h.send, quiet, () => clock);
+  assert.equal(dispatcher.merger.twoKeysToday(repo), 1);
+});
+
+test('daily limit: merges older than 30 days are pruned from the ledger', async () => {
+  const h = harness({});
+  earlier(h, 24 * 31);
+  earlier(h, 2);
+  await h.jobs.persist(clock);
+  assert.equal(h.jobs.merges.length, 1);
 });

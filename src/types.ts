@@ -173,6 +173,8 @@ export interface DirectConfig extends BaseConfig {
   twoKeysHoldMinutes: number;
   /** HOLD_LABEL: while this label is on a pull request, its two-key merge waits. */
   holdLabel: string;
+  /** TWO_KEYS_DAILY_LIMIT: merges through two keys per repository in 24 hours (0: no limit). See Merger.twoKeysToday. */
+  twoKeysDailyLimit: number;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
   botRepos: Set<string>;
@@ -269,6 +271,16 @@ export interface TokenTotals { prompt: number; completion: number; cache_read: n
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
 // `deleted`: the ticket (or pull request) was deleted in the forge; its waiting and queued jobs end here, without a hand-over (see dropDeleted).
 export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry' | 'deleted';
+
+/** A merge ForgeHands made (the ledger, kept 30 days): the merge commit when Forgejo reports it (REVERT_ON_RED), and whether two keys merged it. */
+export interface MergeRecord {
+  repository: string;
+  number: number;
+  branch: string;
+  sha: string | null;
+  merged_at: number;
+  two_keys: boolean;
+}
 
 /** A two-key merge on hold (TWO_KEYS_HOLD_MINUTES), kept in the ledger per pull request ("repo#pr<n>"). `merge_after` is null while HOLD_LABEL is on. */
 export interface Hold {

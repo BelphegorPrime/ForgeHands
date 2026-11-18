@@ -9,11 +9,13 @@ import type { Notify } from '../notify/index.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 import type { Forge } from '../types/forge.ts';
 import type { JobStore } from '../store/jobs.ts';
+import { isDry } from '../dry.ts';
 
 const PAGE = 50;
 const MAX_FILES = 1000;
 // A held two-key merge is looked at again this often (the timer in the dispatch tick), so that a lifted HOLD_LABEL or a new commit is noticed.
 const HOLD_RECHECK_MS = 5 * 60000;
+const DAY_MS = 24 * 60 * 60000;
 
 // The ledger key of a pull request's hold: "repo#pr<n>" (lower case), the same form as the ledger keys of bot pull requests.
 export const holdKey = (repository: string, number: number): string => repository.toLowerCase() + '#pr' + number;
@@ -168,13 +170,21 @@ export class Merger {
         this.tell('conflict', repository, number, { title: current?.title }, current?.html_url);
         return metrics.refused('not_mergeable');
       }
-      // The two keys have agreed and everything else holds: a hold (TWO_KEYS_HOLD_MINUTES) comes before the merge.
+      // The two keys have agreed and everything else holds: the daily limit (TWO_KEYS_DAILY_LIMIT) and a hold (TWO_KEYS_HOLD_MINUTES) come before the merge.
       if (twoKeys) {
+        if (this.config.twoKeysDailyLimit && this.twoKeysToday(repository) >= this.config.twoKeysDailyLimit) {
+          const limit = 'daily limit of ' + this.config.twoKeysDailyLimit + ' merges through two keys reached';
+          await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, false)
+            + '\n\nNot merged: ' + limit + ' (TWO_KEYS_DAILY_LIMIT). A human has to merge it.', true);
+          await this.tellHandOver(repository, number, sha, policy, protectedFiles, current);
+          return metrics.refused('daily_limit');
+        }
         const gate = await this.holdGate(repository, number, sha, labels);
         if (gate !== 'go') return gate;
       }
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
+      await this.recordMerge(repository, number, pr.head.ref, twoKeys);
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
       const checks = ci === 'no_ci' ? 'there is no CI in this repository' : 'CI green';
       await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, ' + checks + '; the protected paths it touches are configured for two keys.'
@@ -193,6 +203,28 @@ export class Merger {
     }
   }
 
+  // What ForgeHands merged goes to the ledger: the merge commit, read from the pull request after the merge (Forgejo's merge call does not return
+  // it), and whether two keys merged it. A dry run merged nothing; a failed read keeps the record without the commit. Best effort.
+  async recordMerge(repository: string, number: number, branch: string, twoKeys: boolean): Promise<void> {
+    if (!this.ledger || isDry(this.config, repository)) return;
+    let sha: string | null = null;
+    try {
+      const pr = await this.forge.getPull(repository, number);
+      sha = pr?.merge_commit_sha || null;
+    } catch (error) {
+      this.logger.error('could not read the merge commit of #' + number + ':', error.message);
+    }
+    this.ledger.merges.push({ repository: repository.toLowerCase(), number, branch, sha, merged_at: this.now(), two_keys: twoKeys });
+    await this.saveLedger();
+  }
+
+  // The merges through two keys of this repository in the last 24 hours (TWO_KEYS_DAILY_LIMIT). Without a ledger, none.
+  twoKeysToday(repository: string): number {
+    if (!this.ledger) return 0;
+    const since = this.now() - DAY_MS;
+    return this.ledger.merges.filter((entry) => entry.two_keys && entry.repository === repository.toLowerCase() && entry.merged_at > since).length;
+  }
+
   // The hold of a two-key merge (TWO_KEYS_HOLD_MINUTES): 'go' when the merge may happen now; otherwise 'held' (the hold runs; it is started here, and
   // commented once per hold period) or 'held_label' (HOLD_LABEL is on). A hold belongs to one commit: a new commit clears it. Taking the label off
   // starts a full hold period again, so the operator always gets the whole time. Off (0) or without a ledger: 'go'.
@@ -205,7 +237,7 @@ export class Merger {
     if (hold && hold.sha !== sha) { store.holds.delete(key); hold = undefined; }
     if (labels.includes(this.config.holdLabel)) {
       store.holds.set(key, { repository, number, sha, since: hold?.since ?? now, merge_after: null, check_at: now + HOLD_RECHECK_MS });
-      await this.saveHolds();
+      await this.saveLedger();
       return 'held_label';
     }
     if (hold && hold.merge_after !== null) {
@@ -219,7 +251,7 @@ export class Merger {
     // No hold yet, or HOLD_LABEL came off: a full hold period starts now.
     const until = now + this.config.twoKeysHoldMinutes * 60000;
     store.holds.set(key, { repository, number, sha, since: now, merge_after: until, check_at: Math.min(until, now + HOLD_RECHECK_MS) });
-    await this.saveHolds();
+    await this.saveLedger();
     try { await this.forge.findOrCreateLabel(repository, this.config.holdLabel, '#fbca04'); }
     catch (error) { this.logger.error('could not create the label ' + this.config.holdLabel + ':', error.message); }
     await this.remark(repository, number, 'approved by both keys. It merges at ' + new Date(until).toISOString().slice(11, 16) + ' UTC unless the label `'
@@ -249,11 +281,11 @@ export class Merger {
       if (left && left.merge_after !== null && left.merge_after <= this.now()) store.holds.delete(key);
       else if (left) left.check_at = Math.min(left.merge_after ?? Infinity, this.now() + HOLD_RECHECK_MS);
     }
-    if (looked) await this.saveHolds();
+    if (looked) await this.saveLedger();
     return looked;
   }
 
-  async saveHolds(): Promise<void> {
+  async saveLedger(): Promise<void> {
     try { await this.ledger!.persist(this.now()); }
     catch (error) { this.logger.error('could not persist the holds:', error.message); }
   }
