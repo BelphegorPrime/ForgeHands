@@ -147,6 +147,20 @@ export function immediateMessage(language: NotifyLanguage, kind: string, facts: 
   return { ...plain, html };
 }
 
+export interface DiskFacts { usedPercent: number; freeGb: number; warnPercent: number; minFreeGb: number }
+// The disk warning (DISK_WARN_PERCENT): how full the workspace disk is and which settings act on it. Numbers and fixed strings only.
+export function diskMessage(language: NotifyLanguage, facts: DiskFacts): Notification {
+  const de = language === 'de';
+  const subject = de ? 'ForgeHands: Platte des Arbeitsbereichs ist zu ' + facts.usedPercent + ' % belegt' : 'ForgeHands: workspace disk is ' + facts.usedPercent + ' % full';
+  const lines = de
+    ? [facts.usedPercent + ' % belegt, ' + facts.freeGb + ' GB frei (Warnung ab DISK_WARN_PERCENT ' + facts.warnPercent + ').',
+      'Klone beendeter Läufe entfernt ForgeHands selbst (WORKSPACE_KEEP_HOURS, WORKSPACE_KEEP_FAILED_HOURS, WORKSPACE_ORPHAN_HOURS). Unter DISK_MIN_FREE_GB (' + facts.minFreeGb + ' GB) startet kein neuer Lauf.']
+    : [facts.usedPercent + ' % used, ' + facts.freeGb + ' GB free (warning from DISK_WARN_PERCENT ' + facts.warnPercent + ').',
+      'ForgeHands removes the clone directories of ended runs itself (WORKSPACE_KEEP_HOURS, WORKSPACE_KEEP_FAILED_HOURS, WORKSPACE_ORPHAN_HOURS). Below DISK_MIN_FREE_GB (' + facts.minFreeGb + ' GB) no new run starts.'];
+  const html = page('<p style="margin:0 0 4px;font-size:16px;font-weight:600">' + esc(subject) + '</p><p style="margin:0">' + lines.map(esc).join('<br>') + '</p>');
+  return { kind: 'disk_full', subject, text: lines.join('\n'), html };
+}
+
 export interface DigestItem { repository: string; number: number; title: string; days?: number; result?: string; /** Where to look: the pull request or, without one, the issue. */ url?: string }
 export interface DigestData {
   waiting: DigestItem[];

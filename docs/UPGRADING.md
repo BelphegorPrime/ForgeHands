@@ -38,6 +38,7 @@ These apply from the first start on 0.4.0:
 | Reminders for pull requests that wait for a human | `REMIND_AFTER_DAYS`, `REMIND_MAX`, `STALE_LABEL` | off | README, Reminders |
 | Notifications of ForgeHands' own (SMTP, webhook, daily digest) instead of the forge's mail | `SMTP_*`, `NOTIFY_WEBHOOK_URL`, `NOTIFY_IMMEDIATE`, `NOTIFY_DIGEST`, `HUMAN_MENTION` | off | README, Notifications |
 | Dry run | `DRY_RUN=1`, `DRY_RUN_REPOS` | off | README, Dry run |
+| Cleaning of the OpenHands workspace and a disk guard (0.7.0) | `WORKSPACE_CLEANUP_DIR`, `DISK_WARN_PERCENT`, `DISK_MIN_FREE_GB` | off | README, Cleaning the workspace |
 | Token for the status page, summary, Prometheus metrics | `STATUS_TOKEN`, `GET /metrics` | open | README, Status page and metrics |
 
 ## Setting up reviewer accounts (optional)
@@ -120,3 +121,15 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **ALLOWED_SENDERS.** The request is checked against `ALLOWED_SENDERS` like any rejection. If that is set, `HUMAN_LOGIN` has to be on it, or his review starts nothing.
 - **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
 - **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
+
+## Also in 0.7.0: the workspace is cleaned up
+
+Every OpenHands run clones the repository into its own directory below the workspace, and nothing removed them. On one host 35 GB sat in about 60 of them (mostly `node_modules`), the disk filled up, and the next deploy and the runs failed. From 0.7.0 ForgeHands can remove them itself and keep new runs from starting while the disk is nearly full.
+
+- **The version.** This is a feature release, not a fix: it adds settings, a notification kind (`disk_full`), a field of the status JSON and a new behaviour (queued runs wait on low disk space). So it takes the minor number. The release commit sets it; the feature branch does not.
+- **Off until you set it.** Nothing changes without `WORKSPACE_CLEANUP_DIR`. Mount the host directory of the OpenHands workspace into the ForgeHands container and set the variable to the mount point (README: Cleaning the workspace). The path must be absolute and not `/`; otherwise the start fails with a message that names the variable.
+- **Check the permissions first.** OpenHands writes its clones as root; the ForgeHands image runs as `node`. A delete that the user may not make fails, is logged and is tried again every pass, so the disk keeps filling. Give the ForgeHands container a `user:` that may delete them, or check that the clones are owned by it.
+- **Try it in a dry run.** Set `WORKSPACE_CLEANUP_DRY=1` first: the log then says `would be cleaned` for each directory and deletes nothing. Remove the variable when the list looks right.
+- **Settings and their defaults.** `WORKSPACE_KEEP_HOURS` 12 (a finished run's clone), `WORKSPACE_KEEP_FAILED_HOURS` 72 (a failed run's, to look at it), `WORKSPACE_ORPHAN_HOURS` 48 (a clone no ledger job names), `DISK_WARN_PERCENT` 85 (one `disk_full` notification a day), `DISK_MIN_FREE_GB` 3 (no new run below it). `0` switches the two disk settings off.
+- **What changes without a switch.** Nothing. The `disk_full` notification is sent whenever a channel is configured, without `NOTIFY_IMMEDIATE`, but only once the feature is on.
+- **Rollback.** Unset `WORKSPACE_CLEANUP_DIR`. Directories already removed stay removed; nothing else is written.

@@ -23,7 +23,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_escalated_rounds_total: 'Follow-up rounds sent to the stronger profile of an escalate_to route.',
   forgehands_tier_runs_total: 'Agent runs that ended, by repository, the tier they really ran on (after fallback and escalation) and result (finished, max_iterations, error, stuck, timeout, no_delivery, other).',
   forgehands_reminders_total: 'Reminders to the human about a pull request that waits for him.',
-  forgehands_notifications_total: 'Notifications to the human by channel, kind (handover, blocked, conflict, failed, reminder, digest) and result (sent, failed, dry).',
+  forgehands_workspace_cleaned_total: 'Clone directories of the workspace deleted by the cleanup (WORKSPACE_CLEANUP_DIR).',
+  forgehands_notifications_total: 'Notifications to the human by channel, kind (handover, blocked, conflict, failed, reminder, digest, disk_full) and result (sent, failed, dry).',
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
   forgehands_resumes_total: 'Runs that ended stuck or timed out and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS).',
@@ -33,6 +34,8 @@ const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
   forgehands_jobs_waiting: 'Jobs that wait for a dependency or for a running agent to finish.',
   forgehands_queued_jobs: 'Jobs waiting for a free slot, by repository.',
+  forgehands_workspace_disk_used_percent: 'Used share of the filesystem of WORKSPACE_CLEANUP_DIR, in percent (absent while the cleanup is off).',
+  forgehands_workspace_disk_free_bytes: 'Bytes available to ForgeHands on the filesystem of WORKSPACE_CLEANUP_DIR (absent while the cleanup is off).',
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.'
 };
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
@@ -116,9 +119,12 @@ const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_d
 
 export const metrics = new Metrics();
 
-// The gauges, read from the ledger and the dispatcher's quota holds at the moment of the scrape.
-export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Map<string, number>, now: number): Sample[] {
+// The gauges, read from the ledger and the dispatcher's quota holds at the moment of the scrape. `disk` is the workspace's last reading
+// (null while the cleanup is off, then no disk gauge is written).
+export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Map<string, number>, now: number, disk: { usedPercent: number | null; freeBytes: number | null } | null = null): Sample[] {
   const samples: Sample[] = [];
+  if (disk && disk.usedPercent !== null) samples.push({ name: 'forgehands_workspace_disk_used_percent', labels: {}, value: disk.usedPercent });
+  if (disk && disk.freeBytes !== null) samples.push({ name: 'forgehands_workspace_disk_free_bytes', labels: {}, value: disk.freeBytes });
   const all = jobs.list();
   const kindOf = (label: string): string => config.routes.get(label)?.kind || 'issue';
   for (const status of STATUSES) {

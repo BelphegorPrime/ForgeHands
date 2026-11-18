@@ -3,6 +3,7 @@ import type { DryLog, DryWrite } from '../dry.ts';
 import type { DirectConfig, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
+import type { WorkspaceState } from '../agent/workspace.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -31,6 +32,8 @@ export interface Status {
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
   waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
+  // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
+  workspace: WorkspaceState | null;
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -131,8 +134,10 @@ const KIND_TEXT: Record<string, string> = {
 };
 
 // One line for the current state of an issue, from its newest relevant run.
-function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
+function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | null = null): string {
   const active = runs.find((run) => run.status === 'running' || run.status === 'queued');
+  // A queued run waits for the disk (DISK_MIN_FREE_GB); a running one is not touched by the hold.
+  if (active && active.status === 'queued' && hold) return 'queued: ' + hold;
   if (active && active.retry_at && active.status === 'queued') return 'model quota used up, ' + KIND_TEXT[active.kind] + ' tries again after ' + new Date(active.retry_at).toISOString().slice(11, 16) + ' UTC';
   if (active) return (active.status === 'queued' ? 'queued: ' : '') + KIND_TEXT[active.kind] + ' running' + (active.resumes ? ' (resumed)' : '')
     + (active.escalated_after ? ' (escalated after ' + active.escalated_after + ')' : active.escalated ? ' (escalated to ' + active.escalated + ')' : '') + (active.fell_back ? ' (fallback to ' + active.fell_back + ')' : '');
@@ -148,7 +153,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = []): Status {
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null): Status {
   const byIssue = new Map<string, { key: string; title: string; runs: Run[] }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -173,7 +178,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
-      issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds),
+      issue: entry.key, title: entry.title, pr, rounds, state: closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run)
     };
@@ -195,7 +200,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier] }])) }])),
     issues,
-    waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason }))
+    waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
+    workspace
   };
 }
 
@@ -228,6 +234,15 @@ function renderTiers(status: Status): string {
     + '<th>Split</th><th>Fallback</th><th>Escalated</th><th>Workers merged</th></tr>\n' + rows.join('\n') + '</table>';
 }
 
+// One line on the workspace cleanup, only when it is on: the last pass, what it cleaned, the disk and a hold for low disk space.
+function renderWorkspace(status: Status): string {
+  const w = status.workspace;
+  if (!w) return '';
+  const disk = w.used_percent === null ? 'disk usage unknown' : w.used_percent + ' % used, ' + w.free_gb + ' GB free';
+  return '<p>Workspace' + (w.dry ? ' (cleanup dry run)' : '') + ': last cleanup ' + escape(w.last_pass || 'not yet') + ', ' + w.cleaned_last_pass + ' directories cleaned in it, '
+    + escape(disk) + (w.hold ? '. <strong>' + escape(w.hold) + ': no new run starts</strong>' : '') + '.</p>';
+}
+
 export function renderStatus(status: Status): string {
   const line = (issue: Status['issues'][number]) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
     + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
@@ -240,7 +255,7 @@ export function renderStatus(status: Status): string {
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
-    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + waiting
+    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + renderWorkspace(status) + waiting
     + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
     + head + rows + '</table>' + closedSection;
 }

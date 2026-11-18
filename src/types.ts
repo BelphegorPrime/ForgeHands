@@ -95,6 +95,18 @@ export interface DirectConfig extends BaseConfig {
   changesLabel: string;
   agentSecrets: Record<string, string>;
   workspaceDir: string;
+  /** WORKSPACE_CLEANUP_DIR: where the workspace is mounted in this container; null switches the cleanup and the disk guard off. */
+  workspaceCleanupDir: string | null;
+  /** WORKSPACE_CLEANUP_DRY: the cleanup logs what it would delete and deletes nothing. */
+  workspaceCleanupDry: boolean;
+  /** WORKSPACE_KEEP_HOURS / WORKSPACE_KEEP_FAILED_HOURS: how long after its end a finished (failed) run keeps its directory. */
+  workspaceKeepHours: number;
+  workspaceKeepFailedHours: number;
+  /** WORKSPACE_ORPHAN_HOURS: a directory that no ledger job names is deleted once its modification time is this old. */
+  workspaceOrphanHours: number;
+  /** DISK_WARN_PERCENT (0 = off) and DISK_MIN_FREE_GB (0 = off): the disk guard. */
+  diskWarnPercent: number;
+  diskMinFreeGb: number;
   maxConcurrent: number;
   maxConcurrentPerTier: number;
   maxRunsPerHour: number;
