@@ -9,13 +9,14 @@ export interface ForgejoConfig { forgejo?: ForgejoAccess | null; timeoutMs: numb
 
 // One call to the Forgejo API of a repository, as the Forgejo user whose token ForgeHands holds. Every Forgejo write of ForgeHands passes
 // here, so this is where a dry run (DRY_RUN) stops it: the call is logged and answered with a stand-in, never sent. Reads are real.
+// An empty repository name calls the API outside any repository (GET /user): only reads use it.
 export async function forgejoCall(config: ForgejoConfig, send: Fetch, repository: string, method: string, path: string, body?: unknown, dry: DryLog = new DryLog()): Promise<Json> {
   if (isWrite(method) && isDry(config, repository)) {
     dry.record(repository, method, path, body);
     return { id: 0, dry_run: true };
   }
   const { url, token } = config.forgejo as ForgejoAccess;
-  const response = await send(url + '/api/v1/repos/' + repository + path, {
+  const response = await send(url + '/api/v1' + (repository ? '/repos/' + repository : '') + path, {
     method,
     headers: { authorization: 'token ' + token, 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -142,6 +143,14 @@ export class ForgejoForge implements Forge {
   }
 
   getIssue(repository: string, number: number): Promise<Issue> { return this.call(repository, 'GET', '/issues/' + number); }
+  // The user of the token, read once. A failed read is not remembered, so the next check asks again.
+  private login: string | null = null;
+  async agentLogin(): Promise<string | null> {
+    if (this.login) return this.login;
+    const user = await this.call('', 'GET', '/user');
+    this.login = String(user?.login || '').toLowerCase() || null;
+    return this.login;
+  }
   async closeIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PATCH', '/issues/' + number, { state: 'closed' }); }
   dependencies(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/dependencies'); }
   blocks(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/blocks'); }

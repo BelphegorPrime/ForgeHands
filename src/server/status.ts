@@ -7,7 +7,7 @@ import { notifyChannels } from '../notify/config.ts';
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
   started: string | null; finished: string | null; cost: number | null; retry_at: number | undefined; waiting_for: number[] | undefined; waiting_for_files: number[] | undefined;
-  waiting_for_run: true | undefined; escalated: string | undefined; fell_back: string | undefined; created: number;
+  waiting_for_run: true | undefined; escalated: string | undefined; fell_back: string | undefined; delivered_on: number | undefined; created: number;
 }
 export interface Summary {
   merged: number; merged_without_human: number; blocked: number; split: number;
@@ -141,6 +141,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number): string {
   if (!last) return 'idle';
   if (last.status === 'dry') return KIND_TEXT[last.kind] + ' would start (dry run)';
   if (last.status === 'failed') return KIND_TEXT[last.kind] + ' failed' + (last.result ? ' (' + last.result + ')' : '');
+  if (last.delivered_on) return KIND_TEXT[last.kind] + ' done, delivered as a comment on #' + last.delivered_on;
   if (rounds >= maxRounds) return 'rounds used up (' + rounds + '/' + maxRounds + ')';
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
@@ -156,7 +157,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       started: job.started ? new Date(job.started).toISOString() : null,
       finished: job.finished ? new Date(job.finished).toISOString() : null,
       cost: typeof job.cost === 'number' ? Math.round(job.cost * 1000) / 1000 : null,
-      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, created: job.created
+      retry_at: job.retry_at, waiting_for: job.waiting_for, waiting_for_files: job.waiting_for_files, waiting_for_run: job.waiting_for_run || undefined, escalated: job.escalated ? route?.escalateTo || undefined : undefined, fell_back: job.status === 'running' ? job.fell_back : undefined, delivered_on: job.delivered_on, created: job.created
     };
     const entry = byIssue.get(base) || { key: base, title: String(job.event?.issue?.title || '').slice(0, 80), runs: [] };
     entry.runs.push(run);

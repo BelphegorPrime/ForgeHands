@@ -762,6 +762,12 @@ export class Dispatcher {
       if (pulls.some((pr) => pr.head?.ref === branch && Date.parse(pr.updated_at) >= since)) return;
       const comments = await this.forge.listComments(repository, event.issue.number, 50);
       if (comments.some((comment) => Date.parse(comment.created_at) >= since)) return;
+      const parent = await this.parentDelivery(event, since);
+      if (parent) {
+        Object.assign(job, { delivered_on: parent });
+        this.logger.error(repository + '#' + event.issue.number + ': delivered as a comment on #' + parent);
+        return;
+      }
       if (!job.delivery_retry) {
         Object.assign(job, { status: 'queued', delivery_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
         this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
@@ -773,6 +779,30 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
     }
+  }
+
+  // A worker on a ticket that blocks another (the parent, where its report belongs) may deliver by a comment of the agent on that parent. Returns
+  // the number of the parent, or null. A read that fails counts as no comment: an unknown answer never reads as delivered.
+  async parentDelivery(event: ForgeEvent, since: number): Promise<number | null> {
+    let login: string | null;
+    let parents: Json;
+    try {
+      login = (await this.forge.agentLogin?.()) ?? null;
+      if (!login) return null;
+      parents = await this.forge.blocks(event.repository.full_name, event.issue.number);
+    } catch (error) {
+      this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message);
+      return null;
+    }
+    for (const parent of Array.isArray(parents) ? parents : []) {
+      try {
+        const comments = await this.forge.listComments(event.repository.full_name, parent.number, 50);
+        if (comments.some((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since)) return parent.number;
+      } catch (error) {
+        this.logger.error('could not read the comments of #' + parent.number + ':', error.message);
+      }
+    }
+    return null;
   }
 
   // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing

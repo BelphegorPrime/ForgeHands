@@ -171,6 +171,8 @@ export interface Forge {
    * ForgeHands cannot tell: there a pull request is only ever reviewed after a CI run (REVIEW_WITHOUT_CI has no effect).
    */
   hasWorkflows?(repository: string, sha: string): Promise<boolean>;
+  /** The login (lower case) of the user the forge token belongs to, the agent. Absent where ForgeHands cannot tell; throws when the forge cannot say. */
+  agentLogin?(): Promise<string | null>;
   /** The sha of the tip of a branch, or null. */
   branchTip(repository: string, branch: string): Promise<string | null>;
 

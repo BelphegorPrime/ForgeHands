@@ -257,6 +257,8 @@ export interface Job {
   archived_view?: boolean;
   error_retry?: number;
   delivery_retry?: number;
+  /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
+  delivered_on?: number;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
   /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */
