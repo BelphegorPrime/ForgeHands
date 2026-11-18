@@ -146,6 +146,10 @@ export interface DirectConfig extends BaseConfig {
   quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
+  /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
+  deleteAfterDays: number;
+  /** The days after which a failed (or deleted) run's conversation goes: DELETE_FAILED_AFTER_DAYS, or DELETE_AFTER_DAYS when that is 0. */
+  deleteFailedAfterDays: number;
   /** LEDGER_SYNC_HOURS: how often the ledger sync asks the forge about tickets it holds as open; 0 = off. */
   ledgerSyncHours: number;
   /** STATUS_HIDE_DAYS: closed tickets whose last activity is older than this many days are not on the status page (0 = hide nothing). */
@@ -342,6 +346,8 @@ export interface Job {
   /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */
   fell_back?: string;
   archived?: boolean;
+  /** DELETE_AFTER_DAYS: the conversation was deleted in OpenHands; the job and its numbers stay in the ledger. */
+  conversation_deleted?: boolean;
   /** The issue of this job is closed in the forge: the status page lists it as closed, never as waiting or failed. */
   archived_view?: boolean;
   /** When the ledger sync (LEDGER_SYNC_HOURS) last asked the forge about this ticket; kept on every job of it, so the oldest-checked ticket goes first. */

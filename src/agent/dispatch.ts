@@ -1236,6 +1236,7 @@ export class Dispatcher {
     // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
     if (await this.merger.recheckHolds()) changed = true;
     if (await this.archiveOld(now)) changed = true;
+    if (await this.deleteOld(now)) changed = true;
     if (await this.sweepClosed(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
@@ -1546,6 +1547,53 @@ export class Dispatcher {
         this.logger.error('could not archive the run of ' + job.key + ':', error.message);
       }
     }
+    return changed;
+  }
+
+  // DELETE_AFTER_DAYS: the step after archiving. The OpenHands conversation of an archived run that ended long enough ago is deleted (its
+  // trajectory goes); the ledger keeps the run, its result, cost and tokens, and the status page shows no conversation link for it. Kept: a run
+  // that is not terminal, a conversation another job still uses (any job of that conversation must be terminal, archived and old enough), and a
+  // ticket that is open with a nudge or a resume pending. At most DELETE_PER_PASS deletions per pass, once an hour; a failed delete is tried again on
+  // the next pass. A dry run deletes nothing. 404 means the conversation is gone already, which counts as deleted.
+  lastDelete = 0;
+  async deleteOld(now: number): Promise<boolean> {
+    const days = this.config.deleteAfterDays;
+    if (!days || (this.lastDelete && now - this.lastDelete < 3600000)) return false;
+    this.lastDelete = now;
+    const perPass = 40;
+    const cutoff = (status: string) => now - (status === 'done' ? days : this.config.deleteFailedAfterDays) * 86400000;
+    const all = this.jobs.list();
+    // The tickets with a nudge or a resume pending, and the tickets that are closed (every job of them marked archived_view).
+    const pending = new Set(all.filter((job) => job.nudge_pending || job.resume_pending).map((job) => job.key.split(':')[0]));
+    const closed = new Set(all.filter((job) => job.archived_view).map((job) => job.key.split(':')[0]));
+    const byConversation = new Map<string, Job[]>();
+    for (const job of all) if (job.conversation_id) byConversation.set(job.conversation_id, [...(byConversation.get(job.conversation_id) || []), job]);
+    let deleted = 0;
+    let kept = 0;
+    let changed = false;
+    for (const [conversation, jobs] of byConversation) {
+      if (jobs.every((job) => job.conversation_deleted)) continue;
+      // Every job of the conversation must be finished with it (terminal, archived, old enough), else a run still needs it.
+      const aged = (job: Job) => !!job.archived && !!job.finished && (job.status === 'done' || job.status === 'failed' || job.status === 'deleted') && job.finished <= cutoff(job.status);
+      if (!jobs.every((job) => job.conversation_deleted || aged(job))) continue;
+      const ticket = jobs[0].key.split(':')[0];
+      if (pending.has(ticket) && !closed.has(ticket)) { kept += 1; continue; }
+      if (deleted >= perPass) { kept += 1; continue; }
+      if (isDry(this.config, jobs[0].event.repository.full_name)) continue; // a dry run deletes nothing, and marks nothing
+      try {
+        const response = await this.api('DELETE', '/api/conversations/' + encodeURIComponent(conversation), undefined, jobs[0].event.repository.full_name);
+        if (response.status !== 404 && !response.ok) throw new Error('HTTP ' + response.status);
+        for (const job of jobs) job.conversation_deleted = true;
+        deleted += 1;
+        changed = true;
+        metrics.inc('forgehands_conversations_deleted_total');
+        this.logger.log?.(jobs[0].key + ': conversation deleted');
+      } catch (error) {
+        kept += 1;
+        this.logger.error('could not delete the conversation of ' + jobs[0].key + ', trying again on the next pass:', error.message);
+      }
+    }
+    this.logger.error('conversations: ' + deleted + ' deleted, ' + kept + ' kept');
     return changed;
   }
 
