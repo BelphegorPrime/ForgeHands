@@ -252,6 +252,8 @@ export function createApp(
           ? {
               failure: routeLabels("ci_failure")[0],
               success: routeLabels("ci_success")[0],
+              mainRed: routeLabels("main_red")[0],
+              revertOnRed: config.revertOnRed,
             }
           : {},
         approved: direct && config.mergePolicy.size ? config.approvedLabel : "",
@@ -294,6 +296,8 @@ export function createApp(
       config.allowedSenders &&
       normalized.type !== "pull_request.review_approved" &&
       !((normalized as ForgeEvent).bot && normalized.type.startsWith("ci.")) &&
+      // A failed default branch is judged by the ledger of ForgeHands' own merges, not by who triggered the run.
+      normalized.type !== "ci.main_failure" &&
       !isBranchPush(normalized) &&
       !config.allowedSenders.has(
         String(normalized.sender.login || "").toLowerCase(),

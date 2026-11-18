@@ -4,6 +4,7 @@ import type { DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
+import { holdKey } from '../agent/merge.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -155,11 +156,18 @@ function tierStats(config: DirectConfig, jobs: Job[], days: number, now: number)
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
 // Read only, no event text beyond the issue title; it says nothing about Forgejo's side (the pull request itself).
 const KIND_TEXT: Record<string, string> = {
-  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review'
+  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review', main_red: 'revert after red CI'
 };
 
 // A ticket the forge reports deleted: some of its jobs were dropped for that, and none of its jobs is waiting, queued or running any more.
 const deletedTicket = (runs: Run[]): boolean => runs.some((run) => run.status === 'deleted') && !runs.some((run) => run.status === 'waiting' || run.status === 'queued' || run.status === 'running');
+
+// A two-key merge on hold shows as the state of its pull request (TWO_KEYS_HOLD_MINUTES, HOLD_LABEL); null when none is held.
+function holdState(config: DirectConfig, jobs: JobStore, key: string, pr: number | null): string | null {
+  const hold = pr ? jobs.holds.get(holdKey(key.split(/[#!]/)[0], pr)) : undefined;
+  if (!hold) return null;
+  return hold.merge_after === null ? 'held: label ' + config.holdLabel + ' is on' : 'held until ' + new Date(hold.merge_after).toISOString().slice(11, 16) + ' UTC';
+}
 
 // One line for the current state of an issue, from its newest relevant run.
 function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | null = null): string {
@@ -211,7 +219,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     return {
-      issue: entry.key, title: entry.title, pr, rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
+      issue: entry.key, title: entry.title, pr, rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last

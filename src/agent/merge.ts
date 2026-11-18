@@ -1,6 +1,6 @@
 import { createForge, createTransport } from '../forge/index.ts';
 import { DryLog } from '../dry.ts';
-import { isBotPull } from './bot.ts';
+import { isBotPull, REVERT_BRANCH } from './bot.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
 import { immediateMessage } from '../notify/texts.ts';
@@ -8,9 +8,17 @@ import type { Facts } from '../notify/texts.ts';
 import type { Notify } from '../notify/index.ts';
 import type { DirectConfig, Fetch, ForgeEvent, Json, Logger } from '../types.ts';
 import type { Forge } from '../types/forge.ts';
+import type { JobStore } from '../store/jobs.ts';
+import { isDry } from '../dry.ts';
 
 const PAGE = 50;
 const MAX_FILES = 1000;
+// A held two-key merge is looked at again this often (the timer in the dispatch tick), so that a lifted HOLD_LABEL or a new commit is noticed.
+const HOLD_RECHECK_MS = 5 * 60000;
+const DAY_MS = 24 * 60 * 60000;
+
+// The ledger key of a pull request's hold: "repo#pr<n>" (lower case), the same form as the ledger keys of bot pull requests.
+export const holdKey = (repository: string, number: number): string => repository.toLowerCase() + '#pr' + number;
 
 // Merges the pull request of an agent issue (or of a dependency bot, BOT_AUTHORS) once the reviewer approved it, CI is green and it touches no protected path.
 // What may merge is the operator's decision (MERGE_POLICY, per repository), never the repository's or the agent's.
@@ -32,6 +40,9 @@ export class Merger {
   // Repository@commit pairs known to have no workflow file (REVIEW_WITHOUT_CI), for this process only. "Has CI" is never kept: a workflow
   // file can arrive with the next commit, and a commit that has them must be looked at again.
   noCiSeen = new Set<string>();
+  // The ledger (the dispatcher sets it): holds of two-key merges are kept there, so that a restart neither loses nor shortens one.
+  ledger: JobStore | null = null;
+  now: () => number = Date.now;
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -110,6 +121,8 @@ export class Merger {
       const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
+      // A revert pull request (REVERT_ON_RED) is an agent pull request as any other, but skips the hold and the daily limit.
+      const revert = REVERT_BRANCH.test(pr.head.ref || '');
       const labels = (pr.labels || []).map((label: Json) => label.name);
       // The approval label (comment mode, or a human's) is a claim; native reviews need no label, they are the proof themselves.
       const labelled = labels.includes(this.config.approvedLabel);
@@ -159,8 +172,21 @@ export class Merger {
         this.tell('conflict', repository, number, { title: current?.title }, current?.html_url);
         return metrics.refused('not_mergeable');
       }
+      // The two keys have agreed and everything else holds: the daily limit (TWO_KEYS_DAILY_LIMIT) and a hold (TWO_KEYS_HOLD_MINUTES) come before the merge.
+      if (twoKeys && !revert) {
+        if (this.config.twoKeysDailyLimit && this.twoKeysToday(repository) >= this.config.twoKeysDailyLimit) {
+          const limit = 'daily limit of ' + this.config.twoKeysDailyLimit + ' merges through two keys reached';
+          await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, false)
+            + '\n\nNot merged: ' + limit + ' (TWO_KEYS_DAILY_LIMIT). A human has to merge it.', true);
+          await this.tellHandOver(repository, number, sha, policy, protectedFiles, current);
+          return metrics.refused('daily_limit');
+        }
+        const gate = await this.holdGate(repository, number, sha, labels);
+        if (gate !== 'go') return gate;
+      }
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
+      await this.recordMerge(repository, number, pr.head.ref, twoKeys);
       this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
       const checks = ci === 'no_ci' ? 'there is no CI in this repository' : 'CI green';
       await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, ' + checks + '; the protected paths it touches are configured for two keys.'
@@ -177,6 +203,93 @@ export class Merger {
       this.tell('failed', repository, number, { why: 'merge_failed' });
       return metrics.refused('merge_failed');
     }
+  }
+
+  // What ForgeHands merged goes to the ledger: the merge commit, read from the pull request after the merge (Forgejo's merge call does not return
+  // it), and whether two keys merged it. A dry run merged nothing; a failed read keeps the record without the commit. Best effort.
+  async recordMerge(repository: string, number: number, branch: string, twoKeys: boolean): Promise<void> {
+    if (!this.ledger || isDry(this.config, repository)) return;
+    let sha: string | null = null;
+    try {
+      const pr = await this.forge.getPull(repository, number);
+      sha = pr?.merge_commit_sha || null;
+    } catch (error) {
+      this.logger.error('could not read the merge commit of #' + number + ':', error.message);
+    }
+    this.ledger.merges.push({ repository: repository.toLowerCase(), number, branch, sha, merged_at: this.now(), two_keys: twoKeys });
+    await this.saveLedger();
+  }
+
+  // The merges through two keys of this repository in the last 24 hours (TWO_KEYS_DAILY_LIMIT). Without a ledger, none.
+  twoKeysToday(repository: string): number {
+    if (!this.ledger) return 0;
+    const since = this.now() - DAY_MS;
+    return this.ledger.merges.filter((entry) => entry.two_keys && entry.repository === repository.toLowerCase() && entry.merged_at > since).length;
+  }
+
+  // The hold of a two-key merge (TWO_KEYS_HOLD_MINUTES): 'go' when the merge may happen now; otherwise 'held' (the hold runs; it is started here, and
+  // commented once per hold period) or 'held_label' (HOLD_LABEL is on). A hold belongs to one commit: a new commit clears it. Taking the label off
+  // starts a full hold period again, so the operator always gets the whole time. Off (0) or without a ledger: 'go'.
+  async holdGate(repository: string, number: number, sha: string, labels: string[]): Promise<'go' | 'held' | 'held_label'> {
+    const store = this.ledger;
+    if (!store || !this.config.twoKeysHoldMinutes) return 'go';
+    const key = holdKey(repository, number);
+    const now = this.now();
+    let hold = store.holds.get(key);
+    if (hold && hold.sha !== sha) { store.holds.delete(key); hold = undefined; }
+    if (labels.includes(this.config.holdLabel)) {
+      store.holds.set(key, { repository, number, sha, since: hold?.since ?? now, merge_after: null, check_at: now + HOLD_RECHECK_MS });
+      await this.saveLedger();
+      return 'held_label';
+    }
+    if (hold && hold.merge_after !== null) {
+      if (hold.merge_after > now) {
+        hold.check_at = Math.min(hold.merge_after, now + HOLD_RECHECK_MS);
+        return 'held';
+      }
+      store.holds.delete(key);
+      return 'go';
+    }
+    // No hold yet, or HOLD_LABEL came off: a full hold period starts now.
+    const until = now + this.config.twoKeysHoldMinutes * 60000;
+    store.holds.set(key, { repository, number, sha, since: now, merge_after: until, check_at: Math.min(until, now + HOLD_RECHECK_MS) });
+    await this.saveLedger();
+    try { await this.forge.findOrCreateLabel(repository, this.config.holdLabel, '#fbca04'); }
+    catch (error) { this.logger.error('could not create the label ' + this.config.holdLabel + ':', error.message); }
+    await this.remark(repository, number, 'approved by both keys. It merges at ' + new Date(until).toISOString().slice(11, 16) + ' UTC unless the label `'
+      + this.config.holdLabel + '` is put on this pull request or a new commit arrives.', true);
+    return 'held';
+  }
+
+  // The timer of the holds, called once per dispatch tick. A hold that is due is looked at through handle(), which merges when the hold has ended
+  // and everything still holds (the reviewer, the security review, CI, mergeable, HOLD_LABEL off). A pull request that closed or got a new commit
+  // loses its hold. Returns whether a hold was looked at.
+  async recheckHolds(): Promise<boolean> {
+    const store = this.ledger;
+    if (!store || !store.holds.size) return false;
+    let looked = false;
+    for (const [key, hold] of [...store.holds]) {
+      if (hold.check_at > this.now()) continue;
+      looked = true;
+      try {
+        const pr = await this.forge.getPull(hold.repository, hold.number);
+        if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== hold.sha) { store.holds.delete(key); continue; }
+        await this.handle({ repository: { full_name: hold.repository }, pull_request: { number: hold.number } } as unknown as ForgeEvent);
+      } catch (error) {
+        this.logger.error('could not look again at the hold of #' + hold.number + ':', error.message);
+      }
+      // Whatever handle() decided, a hold whose time has run out is over; a held one is looked at again soon.
+      const left = store.holds.get(key);
+      if (left && left.merge_after !== null && left.merge_after <= this.now()) store.holds.delete(key);
+      else if (left) left.check_at = Math.min(left.merge_after ?? Infinity, this.now() + HOLD_RECHECK_MS);
+    }
+    if (looked) await this.saveLedger();
+    return looked;
+  }
+
+  async saveLedger(): Promise<void> {
+    try { await this.ledger!.persist(this.now()); }
+    catch (error) { this.logger.error('could not persist the holds:', error.message); }
   }
 
   // The verdict word of the latest security review comment for this commit ("OK" or "CONCERNS"), or null. Advisory, written by the

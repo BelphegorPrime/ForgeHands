@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { Job, JobStatus, NewJob } from '../types.ts';
+import type { Hold, Job, JobStatus, MergeRecord, NewJob } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -18,6 +18,10 @@ export class JobStore {
   meta: { digest_sent?: string } = {};
   /** Keys of things already done, kept 30 days: a human comment that restarted a run (`comment:<repo>#<n>#<id>`), a notice sent once (`limit:<repo>#<n>:<label>`). */
   dedupe = new Map<string, number>();
+  /** Two-key merges on hold (TWO_KEYS_HOLD_MINUTES), per pull request ("repo#pr<n>"). Held until merged, cleared or the pull request changes; never pruned by age. */
+  holds = new Map<string, Hold>();
+  /** What ForgeHands merged, kept 30 days (see Merger.recordMerge): the daily limit and REVERT_ON_RED read it. */
+  merges: MergeRecord[] = [];
   writes: Promise<void> = Promise.resolve();
 
   constructor(file: string) {
@@ -32,6 +36,10 @@ export class JobStore {
       if (typeof content?.meta?.digest_sent === 'string') this.meta.digest_sent = content.meta.digest_sent;
       for (const [key, value] of Object.entries((content?.dedupe || {}) as Record<string, number>)) {
         if (typeof value === 'number') this.dedupe.set(key, value);
+      }
+      if (Array.isArray(content?.merges)) this.merges = content.merges.filter((entry: MergeRecord) => entry && typeof entry.repository === 'string');
+      for (const [key, value] of Object.entries((content?.holds || {}) as Record<string, Hold>)) {
+        if (value && typeof value.sha === 'string') this.holds.set(key, value);
       }
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
@@ -103,9 +111,10 @@ export class JobStore {
       }
       for (const [key, value] of this.labels) if (value.seen < now - KEEP_MS) this.labels.delete(key);
       for (const [key, seen] of this.dedupe) if (seen < now - KEEP_MS) this.dedupe.delete(key);
+      this.merges = this.merges.filter((entry) => entry.merged_at >= now - KEEP_MS);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe) }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), merges: this.merges }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;

@@ -51,7 +51,7 @@ export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_r
   'pull_request_approved', 'pull_request_rejected', 'pull_request_review_approved', 'pull_request_review_rejected', 'pull_request_review_comment',
   'Issue Hook', 'Merge Request Hook', 'Pipeline Hook', 'Push Hook'];
 const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed', 'deleted'];
-const KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
+const KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'];
 
 const escapeLabel = (value: string): string => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 const escapeHelp = (value: string): string => value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');

@@ -20,6 +20,8 @@ export interface PullRequest {
   mergeable?: boolean;
   merge_base?: string;
   merged_at?: string | null;
+  /** The commit a merge made on the default branch (Forgejo and Gitea report it once the pull request is merged). */
+  merge_commit_sha?: string | null;
   /** Who merged it (Forgejo and Gitea answer it on a single pull request, not in a list). */
   merged_by?: { login?: string } | null;
   updated_at: string;
