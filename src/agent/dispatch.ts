@@ -4,6 +4,7 @@ import { parseDeclaredFiles } from './files.ts';
 import { anyOverlap } from '../utils/path-overlap.ts';
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
+import { REVERT_BRANCH } from './bot.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
@@ -53,7 +54,7 @@ const IDLE_LOG_EVERY_MS = 15 * 60000;
 const STALL_REPEAT_MS = 6 * 3600000;
 
 // The route kinds, as the token counter labels them (a known set, see metrics.known).
-const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
+const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'];
 const TOKEN_TYPES = ['prompt', 'completion', 'cache_read', 'reasoning'] as const;
 
 // Tokens of a conversation (stats.usage_to_metrics: one entry per usage id, each with its LLM calls in token_usages), summed. Null when the
@@ -242,6 +243,7 @@ export class Dispatcher {
   // A green commit starts every review route (on: ci_success), once per commit each: a second reviewer is a second route. The event names
   // the first one; the others are the same event under their own label.
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
+    if (event.type === 'ci.main_failure') return this.onMainFailure(event);
     if (event.type !== 'ci.success') return this.enqueueOne(event);
     const labels = [...this.config.routes].filter(([, entry]) => entry.kind === 'ci_success').map(([label]) => label);
     const results: { status: string }[] = [];
@@ -714,6 +716,57 @@ export class Dispatcher {
       }
     });
     return true;
+  }
+
+  // REVERT_ON_RED: a CI run failed on the default branch for a commit that ForgeHands merged (the ledger knows it, see Merger.recordMerge). Once per
+  // commit: the merged pull request is told, the human is told at once, and a route of kind main_red (when one exists) starts a run that reverts
+  // the merge in a pull request ai/revert-<n>. Without that route the human is called on the pull request. A red revert only tells the human: no
+  // revert of a revert. A failure outside the window or of a commit ForgeHands did not merge does nothing.
+  async onMainFailure(event: ForgeEvent): Promise<{ status: string }> {
+    if (!this.config.revertOnRed) return { status: 'revert_off' };
+    if (!this.config.forgejo) return { status: 'no_forgejo_access' };
+    const repository = event.repository.full_name;
+    const sha = event.ci!.commit_sha.toLowerCase();
+    const merge = this.jobs.merges.find((entry) => entry.repository === repository.toLowerCase() && entry.sha?.toLowerCase() === sha);
+    if (!merge) return { status: 'not_our_merge' };
+    if (this.now() - merge.merged_at > this.config.revertWindowMinutes * 60000) return { status: 'outside_window' };
+    if (await this.commitRecovered(event)) return { status: 'ci_not_red' };
+    const key = 'main_red:' + repository.toLowerCase() + '@' + sha;
+    if (this.jobs.noted(key)) return { status: 'duplicate' };
+    this.jobs.note(key, this.now());
+    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+    const number = merge.number;
+    const short = sha.slice(0, 8);
+    const branch = event.repository.default_branch || 'the default branch';
+    let title = '';
+    try { title = String((await this.forge.getPull(repository, number))?.title || ''); } catch (error) { this.logger.error('could not read #' + number + ':', error.message); }
+    // The pull request as the notice names it: the merged one, or the revert that went red (whose merge was a revert).
+    const told = { ...event, issue: { ...event.issue, number, title: title.slice(0, 1000), html_url: null }, pull_request: { number, head_ref: merge.branch, html_url: null } };
+    if (REVERT_BRANCH.test(merge.branch)) {
+      this.tell('failed', told, { why: 'revert_red' });
+      return { status: 'revert_red_told' };
+    }
+    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'main_red')?.[0];
+    this.tell('failed', told, { why: 'main_red' });
+    try {
+      await this.forge.addComment(repository, number, (route ? '' : mentionOf(this.config)) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + ').'
+        + (route ? ' A revert is started.' : ' A human has to look at it.'));
+    } catch (error) {
+      this.logger.error('could not comment on #' + number + ':', error.message);
+    }
+    if (!route) return { status: 'handed_to_human' };
+    const job = this.jobs.add({ key: repository.toLowerCase() + '!pr' + number + ':' + route + ':' + short, label: route, status: 'queued', created: this.now(),
+      event: { type: 'ci.main_failure', source: this.forge.kind, action: 'main_red', label: route, repository: event.repository,
+        issue: { number, title: title.slice(0, 1000), body: '', html_url: null, comments: 0, labels: [] }, ci: event.ci, sender: event.sender } });
+    try {
+      await this.jobs.persist(this.now());
+    } catch (error) {
+      this.jobs.remove(job.id); // not durable: the retried delivery must be able to start it again
+      this.jobs.dedupe.delete(key);
+      throw error;
+    }
+    this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
+    return { status: 'queued' };
   }
 
   // A CI outcome kept while an agent worked on the issue. Once no run of the issue is active any more it is judged as if it had just

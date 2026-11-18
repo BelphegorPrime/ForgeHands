@@ -1,6 +1,6 @@
 import { createForge, createTransport } from '../forge/index.ts';
 import { DryLog } from '../dry.ts';
-import { isBotPull } from './bot.ts';
+import { isBotPull, REVERT_BRANCH } from './bot.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
 import { immediateMessage } from '../notify/texts.ts';
@@ -121,6 +121,8 @@ export class Merger {
       const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
       const sha = pr.head.sha;
+      // A revert pull request (REVERT_ON_RED) is an agent pull request as any other, but skips the hold and the daily limit.
+      const revert = REVERT_BRANCH.test(pr.head.ref || '');
       const labels = (pr.labels || []).map((label: Json) => label.name);
       // The approval label (comment mode, or a human's) is a claim; native reviews need no label, they are the proof themselves.
       const labelled = labels.includes(this.config.approvedLabel);
@@ -171,7 +173,7 @@ export class Merger {
         return metrics.refused('not_mergeable');
       }
       // The two keys have agreed and everything else holds: the daily limit (TWO_KEYS_DAILY_LIMIT) and a hold (TWO_KEYS_HOLD_MINUTES) come before the merge.
-      if (twoKeys) {
+      if (twoKeys && !revert) {
         if (this.config.twoKeysDailyLimit && this.twoKeysToday(repository) >= this.config.twoKeysDailyLimit) {
           const limit = 'daily limit of ' + this.config.twoKeysDailyLimit + ' merges through two keys reached';
           await this.remark(repository, number, await this.handOverText(repository, number, sha, policy, protectedFiles, false)

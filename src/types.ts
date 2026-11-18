@@ -13,7 +13,7 @@ export interface Logger {
 /** VERDICT_SOURCE: where the verdict of a review comes from. */
 export type VerdictSource = 'comment' | 'review' | 'both';
 
-export type RouteKind = 'issue' | 'pull_request' | 'ci_failure' | 'ci_success' | 'epic_done' | 'conflict' | 'sensitive_review';
+export type RouteKind = 'issue' | 'pull_request' | 'ci_failure' | 'ci_success' | 'epic_done' | 'conflict' | 'sensitive_review' | 'main_red';
 
 export interface Route {
   profile: string;
@@ -175,6 +175,10 @@ export interface DirectConfig extends BaseConfig {
   holdLabel: string;
   /** TWO_KEYS_DAILY_LIMIT: merges through two keys per repository in 24 hours (0: no limit). See Merger.twoKeysToday. */
   twoKeysDailyLimit: number;
+  /** REVERT_ON_RED: a CI run that fails on the default branch for a commit ForgeHands merged is answered (see Dispatcher.onMainFailure). */
+  revertOnRed: boolean;
+  /** REVERT_WINDOW_MINUTES: how long after a merge a red default branch still counts as this merge's doing. */
+  revertWindowMinutes: number;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
   botRepos: Set<string>;

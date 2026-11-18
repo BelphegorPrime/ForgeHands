@@ -9,6 +9,7 @@ import { Dispatcher } from '../src/agent/dispatch.ts';
 import { holdKey } from '../src/agent/merge.ts';
 import { loadConfig } from '../src/config.ts';
 import { JobStore } from '../src/store/jobs.ts';
+import { normalizeEvent } from '../src/webhook/events.ts';
 
 const WORKER = '22222222-2222-4222-8222-222222222222';
 const REVIEWER = '44444444-4444-4444-8444-444444444444';
@@ -47,10 +48,13 @@ const env = (extra = {}) => ({
 });
 
 // A fake Forgejo for one pull request (#34 of owner/hello, branch ai/issue-26). `pr` and `comments` change between the calls of a test.
+const MAIN_SHA = 'feed0000feed0000feed0000feed0000feed0000';
 function forge(state) {
   const calls = [];
+  const starts = [];
   const routes = {
-    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: 'ai/issue-26', sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })), merge_commit_sha: state.mergeSha || null }),
+    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: state.ref || 'ai/issue-26', sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })), merge_commit_sha: state.mergeSha || null }),
+    ['GET ' + API + '/commits/' + MAIN_SHA + '/status']: () => state.mainCi || { state: 'failure', total_count: 2 },
     ['GET ' + API + '/commits/cafe0000cafe/status']: () => state.ci,
     ['GET ' + API + '/commits/beef0000beef/status']: { state: 'success', total_count: 2 },
     ['GET ' + API + '/pulls/34/files']: state.files.map((filename) => ({ filename })),
@@ -63,6 +67,12 @@ function forge(state) {
   const send = async (url, request) => {
     const u = new URL(url);
     const body = request.body ? JSON.parse(request.body) : undefined;
+    // OpenHands (any other host): the conversations started are recorded, every call answers as a running conversation.
+    if (u.origin !== 'https://forge.example') {
+      if (request.method === 'POST') starts.push({ path: u.pathname, body });
+      if (request.method === 'POST') return { ok: true, status: 201, json: async () => ({ id: 'conv-' + starts.length }) };
+      return { ok: true, status: 200, json: async () => ({ execution_status: 'running', stats: { usage_to_metrics: {} } }) };
+    }
     calls.push({ method: request.method, path: u.pathname, body });
     const route = routes[request.method + ' ' + u.pathname];
     if (route === undefined) return { ok: false, status: 404 };
@@ -71,7 +81,7 @@ function forge(state) {
   };
   const wrote = () => calls.filter((call) => call.method !== 'GET').map((call) => call.method + ' ' + call.path.replace(API, ''));
   const comments = () => calls.filter((call) => call.method === 'POST' && call.path.endsWith('/issues/34/comments')).map((call) => call.body.body);
-  return { calls, send, wrote, comments };
+  return { calls, send, wrote, comments, starts };
 }
 
 function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security = true, labels = ['ai:approved'] } = {}) {
@@ -80,6 +90,7 @@ function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security 
     files,
     ci: { state: 'success', total_count: 2 },
     mergeSha: null,
+    ref: 'ai/issue-26',
     comments: [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...(security ? [SECURITY_OK()] : [])]
   };
   const fake = forge(state);
@@ -260,4 +271,124 @@ test('daily limit: merges older than 30 days are pruned from the ledger', async 
   earlier(h, 2);
   await h.jobs.persist(clock);
   assert.equal(h.jobs.merges.length, 1);
+});
+
+// ---- revert on red: REVERT_ON_RED, REVERT_WINDOW_MINUTES, the main_red route and the revert pull request
+const REVERTER = '55555555-5555-4555-8555-555555555555';
+const revertRoutes = () => JSON.stringify({ ...JSON.parse(env().LABEL_ROUTES), 'main:red': { profile: REVERTER, tier: 'free', max_iterations: 60, on: 'main_red' } });
+const mainRun = (sha = MAIN_SHA, { ref = 'refs/heads/main', status = 'failure', event = 'push' } = {}) => ({
+  action: status, run: { id: 77, workflow_id: 'ci.yaml', commit_sha: sha, event, status, html_url: 'https://forge.example/owner/hello/actions/runs/77',
+    repository: { full_name: repo, clone_url: 'https://forge.example/owner/hello.git', html_url: 'https://forge.example/owner/hello', default_branch: 'main' },
+    trigger_user: { login: 'forgehands' }, event_payload: JSON.stringify({ ref, after: sha, repository: { full_name: repo } }) }
+});
+const mainFailure = (extra = {}, payload = mainRun()) => normalizeEvent('action_run_failure', payload, new Set([repo]), [],
+  { ci: { failure: 'ci:failure', success: 'ci:success', mainRed: 'main:red', revertOnRed: extra.revertOnRed ?? true } });
+// The merge ForgeHands made of pull request #34 (the ledger knows it); `branch` names the revert when the merge was one.
+function merged34(h, { ago = 10, branch = 'ai/issue-26', sha = MAIN_SHA } = {}) {
+  h.jobs.merges.push({ repository: repo.toLowerCase(), number: 34, branch, sha, merged_at: clock - ago * MINUTE, two_keys: false });
+}
+function withNotifier(h) {
+  h.notices = [];
+  h.dispatcher.notifier = { wants: () => true, notify: (message) => h.notices.push(message) };
+  return h;
+}
+
+test('revert on red: a failed run on the default branch for a merge of ForgeHands comments, tells the human and starts one revert run', async () => {
+  const h = withNotifier(harness({ LABEL_ROUTES: revertRoutes() }));
+  merged34(h);
+  const event = mainFailure();
+  assert.equal(event.type, 'ci.main_failure');
+  assert.equal((await h.dispatcher.enqueue(event)).status, 'queued');
+  assert.equal(h.comments().length, 1);
+  assert.match(h.comments()[0], /^ForgeHands: CI failed on main after this merge \(commit feed0000\)\. A revert is started\.$/);
+  assert.equal(h.notices.length, 1, 'the human is told at once');
+  await h.dispatcher.tick();
+  assert.equal(h.starts.length, 1);
+  const prompt = h.starts[0].body.initial_message.content[0].text;
+  assert.equal(h.starts[0].body.agent_profile_id, REVERTER);
+  assert.match(prompt, new RegExp('Commit ' + MAIN_SHA + ' \\(the merge of pull request #34\\) on main broke the CI'));
+  assert.match(prompt, /Create the branch `ai\/revert-34` from main and revert that merge commit with `git revert -m 1 feed0000/);
+  assert.match(prompt, /Do not fix forward/);
+  assert.match(prompt, /titled `WIP: Revert: /);
+  // the same commit again (a second failed workflow): nothing more
+  assert.equal((await h.dispatcher.enqueue(mainFailure())).status, 'duplicate');
+  assert.equal(h.comments().length, 1);
+  assert.equal(h.notices.length, 1);
+  await h.dispatcher.tick();
+  assert.equal(h.starts.length, 1, 'at most one run per merge commit');
+});
+
+test('revert on red: without a main_red route the human is called on the pull request and no run starts', async () => {
+  const h = withNotifier(harness());
+  merged34(h);
+  assert.equal((await h.dispatcher.enqueue(mainFailure())).status, 'handed_to_human');
+  assert.match(h.comments()[0], /@marcel ForgeHands: CI failed on main after this merge \(commit feed0000\)\. A human has to look at it\./);
+  assert.equal(h.notices.length, 1);
+  await h.dispatcher.tick();
+  assert.equal(h.starts.length, 0);
+});
+
+test('revert on red: a failed run outside REVERT_WINDOW_MINUTES, or for a commit ForgeHands did not merge, does nothing', async () => {
+  const h = withNotifier(harness({ LABEL_ROUTES: revertRoutes() }));
+  merged34(h, { ago: 121 });
+  assert.equal((await h.dispatcher.enqueue(mainFailure())).status, 'outside_window');
+  const window = withNotifier(harness({ LABEL_ROUTES: revertRoutes(), REVERT_WINDOW_MINUTES: '240' }));
+  merged34(window, { ago: 121 });
+  assert.equal((await window.dispatcher.enqueue(mainFailure())).status, 'queued', 'the window is configurable');
+  const other = withNotifier(harness({ LABEL_ROUTES: revertRoutes() }));
+  merged34(other, { sha: 'beef0000beef0000beef0000beef0000beef000000' });
+  assert.equal((await other.dispatcher.enqueue(mainFailure())).status, 'not_our_merge');
+  assert.equal(other.notices.length + other.comments().length, 0);
+  assert.equal(h.starts.length + other.starts.length, 0);
+});
+
+test('revert on red: a red revert only tells the human; a recovered commit and REVERT_ON_RED=0 do nothing', async () => {
+  const h = withNotifier(harness({ LABEL_ROUTES: revertRoutes() }));
+  merged34(h, { branch: 'ai/revert-34' });
+  assert.equal((await h.dispatcher.enqueue(mainFailure())).status, 'revert_red_told');
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0].text, /after a revert of ForgeHands/);
+  assert.equal(h.comments().length, 0, 'no comment on the revert');
+  await h.dispatcher.tick();
+  assert.equal(h.starts.length, 0, 'no revert of a revert');
+  const green = withNotifier(harness({ LABEL_ROUTES: revertRoutes() }));
+  merged34(green);
+  green.state.mainCi = { state: 'success', total_count: 2 };
+  assert.equal((await green.dispatcher.enqueue(mainFailure())).status, 'ci_not_red');
+  const off = withNotifier(harness({ LABEL_ROUTES: revertRoutes(), REVERT_ON_RED: '0' }));
+  merged34(off);
+  assert.equal((await off.dispatcher.enqueue(mainFailure())).status, 'revert_off');
+  assert.equal(off.notices.length + off.comments().length, 0);
+});
+
+test('revert on red: only a failed run of the default branch is an event at all', () => {
+  assert.equal(mainFailure({}, mainRun(MAIN_SHA, { ref: 'refs/heads/feature/x' })), null);
+  assert.equal(mainFailure({}, mainRun(MAIN_SHA, { status: 'success' })), null);
+  assert.equal(mainFailure({ revertOnRed: false }), null);
+  assert.equal(mainFailure({}, mainRun('not-a-sha')), null);
+  // the pull request run of the same workflow is unchanged
+  const pullRun = { action: 'failure', run: { id: 5, workflow_id: 'ci.yaml', commit_sha: 'abcdef0123456789abcdef0123456789abcdef01', event: 'pull_request', status: 'failure',
+    repository: { full_name: repo, default_branch: 'main' }, event_payload: JSON.stringify({ pull_request: { number: 34, state: 'open', head: { ref: 'ai/issue-26' } } }) } };
+  assert.equal(normalizeEvent('action_run_failure', pullRun, new Set([repo]), [], { ci: { failure: 'ci:failure', mainRed: 'main:red', revertOnRed: true } }).type, 'ci.failure');
+});
+
+test('revert on red: the route kind main_red validates in LABEL_ROUTES; it is optional', () => {
+  const config = loadConfig(env({ LABEL_ROUTES: revertRoutes() }));
+  assert.equal(config.routes.get('main:red').kind, 'main_red');
+  assert.throws(() => loadConfig(env({ REVERT_ON_RED: 'yes' })), /REVERT_ON_RED must be 0 or 1/);
+  assert.throws(() => loadConfig(env({ REVERT_WINDOW_MINUTES: '0' })), /REVERT_WINDOW_MINUTES must be an integer between 1 and 10080/);
+  assert.equal(loadConfig(env()).revertOnRed, true);
+  assert.equal(loadConfig(env()).revertWindowMinutes, 120);
+});
+
+test('revert on red: the revert pull request is an agent pull request: approved and green it merges, skips the hold and the daily limit, closes no ticket', async () => {
+  const h = harness({ LABEL_ROUTES: revertRoutes(), TWO_KEYS_HOLD_MINUTES: '30', TWO_KEYS_DAILY_LIMIT: '1' }, { files: ['seed/infra/tests/a.test.ts'] });
+  h.state.ref = 'ai/revert-34';
+  merged34(h, { ago: 300 });
+  h.jobs.merges.push({ repository: repo.toLowerCase(), number: 40, branch: 'ai/issue-30', sha: 'a'.repeat(40), merged_at: clock - MINUTE, two_keys: true });
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged');
+  assert.ok(h.wrote().includes('POST /pulls/34/merge'));
+  assert.ok(!h.wrote().some((line) => line.startsWith('PATCH /issues/')), 'no ticket is closed for a revert');
+  assert.equal(h.jobs.holds.size, 0);
+  assert.equal(h.jobs.merges.at(-1).branch, 'ai/revert-34');
 });

@@ -1,10 +1,11 @@
-import { isBotPull, type BotRules } from '../agent/bot.ts';
+import { isBotPull, REVERT_BRANCH, type BotRules } from '../agent/bot.ts';
 import type { BranchPushEvent, ForgeEvent, Json, NormalizedEvent, PushEvent } from '../types.ts';
 
 export interface NormalizeOptions {
   labelEvents?: boolean;
   prLabels?: string[];
-  ci?: { failure?: string; success?: string };
+  /** mainRed: the label of the route that reverts a merge after a red default branch (absent: no such route); revertOnRed: REVERT_ON_RED. */
+  ci?: { failure?: string; success?: string; mainRed?: string; revertOnRed?: boolean };
   approved?: string;
   pushes?: boolean;
   /** REVIEW_WITHOUT_CI: a commit on an agent's or a bot's branch (a push, or a pull request opened or updated) is an event, to look for a repository without CI. */
@@ -197,9 +198,10 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
 // A finished Forgejo Actions run of a pull request of an agent issue. Forgejo sends one event per workflow run (header
 // `action_run_failure` or `action_run_success`); `run.event_payload` is the pull request payload that started the run as a
 // JSON string. `ci.failure` and `ci.success` are the route names that handle each outcome (absent: not handled).
-function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>, ci: { failure?: string; success?: string }, bots?: NormalizeOptions['bots']): ForgeEvent | null {
+function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>, ci: NormalizeOptions['ci'] = {}, bots?: NormalizeOptions['bots']): ForgeEvent | null {
   const label = event === 'action_run_failure' ? ci.failure : ci.success;
   const run = payload?.run;
+  if (event === 'action_run_failure' && run && typeof run === 'object' && run.event === 'push') return normalizeMainFailure(payload, allowedRepos, ci);
   if (!label || !run || typeof run !== 'object' || run.event !== 'pull_request' || typeof run.event_payload !== 'string') return null;
   // Forgejo also sends `action_run_failure` for a run that was cancelled (a newer push replaced it) or skipped: not a failure.
   if (run.status !== (event === 'action_run_failure' ? 'failure' : 'success')) return null;
@@ -236,6 +238,30 @@ function normalizeCiRun(event: string, payload: Json, allowedRepos: Set<string>,
       labels: []
     },
     pull_request: { number: pr.number, head_ref: pr.head.ref, html_url: pr.html_url || null },
+    ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
+    sender: { login: run.trigger_user?.login || null }
+  };
+}
+
+// A failed run of a push to the default branch (REVERT_ON_RED). The commit may be a merge ForgeHands made: the dispatcher looks it up in its
+// ledger, so this only says what happened on the default branch. Anything else (a run of another branch, a run that is not a failure) is ignored.
+function normalizeMainFailure(payload: Json, allowedRepos: Set<string>, ci: NonNullable<NormalizeOptions['ci']>): ForgeEvent | null {
+  const run = payload.run;
+  if (!ci.revertOnRed || run.status !== 'failure' || typeof run.event_payload !== 'string') return null;
+  const fullName = run.repository?.full_name;
+  const branch = run.repository?.default_branch;
+  if (typeof fullName !== 'string' || !allowedRepos.has(fullName.toLowerCase()) || typeof branch !== 'string' || !branch) return null;
+  let data: Json;
+  try { data = JSON.parse(run.event_payload); } catch { return null; }
+  if (data?.ref !== 'refs/heads/' + branch) return null;
+  if (typeof run.commit_sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(run.commit_sha)) return null;
+  return {
+    type: 'ci.main_failure',
+    source: 'forgejo',
+    action: 'action_run_failure',
+    ...(ci.mainRed ? { label: ci.mainRed } : {}),
+    repository: { full_name: fullName, clone_url: run.repository.clone_url || null, html_url: run.repository.html_url || null, default_branch: branch },
+    issue: { number: 0, title: '', body: '', html_url: null, comments: 0, labels: [] },
     ci: { run_id: run.id ?? null, workflow: String(run.workflow_id || ''), commit_sha: run.commit_sha, status: String(run.status || ''), html_url: run.html_url || null },
     sender: { login: run.trigger_user?.login || null }
   };
@@ -318,7 +344,7 @@ function normalizePush(payload: Json, allowedRepos: Set<string>): PushEvent | nu
 // the pull request itself (author, state, head) against the forge; this only keeps pushes of every other branch from costing an API call.
 function reviewableBranch(branch: unknown, bots?: NormalizeOptions['bots']): branch is string {
   if (typeof branch !== 'string' || !branch) return false;
-  if (/^ai\/issue-\d+$/.test(branch)) return true;
+  if (/^ai\/issue-\d+$/.test(branch) || REVERT_BRANCH.test(branch)) return true;
   return !!bots && bots.authors.size > 0 && (!bots.prefixes.length || bots.prefixes.some((prefix) => branch.startsWith(prefix)));
 }
 

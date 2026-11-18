@@ -47,7 +47,7 @@ function parseRoutes(text: string): Map<string, Route> {
       maxBudget: budget,
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100) as number,
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
-      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'].includes(route.on) ? route.on : 'issue') as RouteKind,
+      kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'].includes(route.on) ? route.on : 'issue') as RouteKind,
       // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route.
       escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to),
       // "fallback_to": "<label of another route>": while the tier of this route is out of quota, jobs start with the profile and tier of that route.
@@ -423,6 +423,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     holdLabel: env.HOLD_LABEL?.trim() || 'ai:hold',
     // TWO_KEYS_DAILY_LIMIT (0 = off, at most 100): merges through two keys per repository in the last 24 hours; the next one is handed to a human.
     twoKeysDailyLimit: wholeOf(env.TWO_KEYS_DAILY_LIMIT, 0, 'TWO_KEYS_DAILY_LIMIT', 100),
+    // REVERT_ON_RED (1 by default, 0 = off) and REVERT_WINDOW_MINUTES (default 120): a red default branch within this long after a merge of
+    // ForgeHands starts the revert, once, when a route of "on": "main_red" exists; without one the human is told instead.
+    revertOnRed: switchDefault(env.REVERT_ON_RED, true, 'REVERT_ON_RED'),
+    revertWindowMinutes: positiveInt(env.REVERT_WINDOW_MINUTES, 120, 'REVERT_WINDOW_MINUTES', 10080) as number,
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
     // Pull requests of dependency bots (Renovate): Forgejo logins and, optionally, head branch prefixes (comma separated). They get the same
@@ -487,6 +491,14 @@ function commentRestartsOf(value: string | undefined): number {
   if (value === undefined || value === '') return 2;
   if (!/^\d{1,3}$/.test(value) || Number(value) > 100) throw new Error('COMMENT_RESTARTS must be an integer between 0 and 100');
   return Number(value);
+}
+
+// A 0/1 switch with a default; any other value is a mistake worth a clear message.
+function switchDefault(value: string | undefined, fallback: boolean, name: string): boolean {
+  if (value === undefined || value === '') return fallback;
+  if (value === '1') return true;
+  if (value === '0') return false;
+  throw new Error(name + ' must be 0 or 1');
 }
 
 // A 0/1 switch that is off unless set to 1; any other value is a mistake worth a clear message.

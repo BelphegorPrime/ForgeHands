@@ -156,7 +156,7 @@ function tierStats(config: DirectConfig, jobs: Job[], days: number, now: number)
 // What ForgeHands knows about the work in flight, from its ledger: per issue the runs, their kind, state and cost.
 // Read only, no event text beyond the issue title; it says nothing about Forgejo's side (the pull request itself).
 const KIND_TEXT: Record<string, string> = {
-  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review'
+  issue: 'worker', pull_request: 'follow-up round', ci_failure: 'fix after red CI', ci_success: 'review', epic_done: 'epic review', conflict: 'conflict round', sensitive_review: 'security review', main_red: 'revert after red CI'
 };
 
 // A ticket the forge reports deleted: some of its jobs were dropped for that, and none of its jobs is waiting, queued or running any more.
