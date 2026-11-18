@@ -262,6 +262,7 @@ export class GitlabForge implements Forge {
 
   async getIssue(repository: string, number: number): Promise<Issue> { return toIssue(await this.call(repository, 'GET', '/issues/' + number)); }
   async closeIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PUT', '/issues/' + number, { state_event: 'close' }); }
+  async reopenIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PUT', '/issues/' + number, { state_event: 'reopen' }); }
   dependencies(repository: string, number: number): Promise<Issue[]> { return this.links(repository, number, 'is_blocked_by'); }
   blocks(repository: string, number: number): Promise<Issue[]> { return this.links(repository, number, 'blocks'); }
   // Issue links of the type `blocks` / `is_blocked_by` need GitLab Premium. Without it (or without the right to see them) GitLab answers

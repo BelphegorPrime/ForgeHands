@@ -397,6 +397,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     splitLabel: env.SPLIT_LABEL?.trim() || null,
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
+    // REVERT_RETRIES (default 1, 0 = off, at most 5): after a revert of a ticket's merge is merged, the ticket is reopened and started again this many times.
+    revertRetries: wholeOf(env.REVERT_RETRIES, 1, 'REVERT_RETRIES', 5),
     // REVIEW_SWEEP_MINUTES (default 10, 0 = off, at most 1440): the reconciler that starts the review of a head that has none (lost or deferred events).
     reviewSweepMinutes: wholeOf(env.REVIEW_SWEEP_MINUTES, 10, 'REVIEW_SWEEP_MINUTES', 1440),
     // DELETE_AFTER_DAYS (0 = off): the step after archiving, the OpenHands conversation of an archived run goes. A failed run may keep its

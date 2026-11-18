@@ -146,6 +146,8 @@ export interface DirectConfig extends BaseConfig {
   quotaGiveUpMs: number;
   splitLabel: string | null;
   archiveAfterDays: number;
+  /** REVERT_RETRIES (0 = off, at most 5): how often a ticket whose change was reverted after a red default branch is started again. See Dispatcher.revertMerged. */
+  revertRetries: number;
   /** REVIEW_SWEEP_MINUTES (0 = off): how often a head without a review in the ledger is looked for and reviewed. See ReviewSweep. */
   reviewSweepMinutes: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
@@ -258,6 +260,8 @@ export interface ForgeEvent extends BaseEvent {
   comment?: { id: string; login: string | null };
   /** A comment of HUMAN_LOGIN that started a planner again, because it had finished without sub-issues (PLAN_ANSWER_RESTARTS). */
   plan_answer?: boolean;
+  /** A ticket started again because its change was reverted (REVERT_RETRIES): the message says so. */
+  revert_retry?: boolean;
 }
 
 /** A push to the default branch. */
@@ -294,6 +298,24 @@ export interface MergeRecord {
   sha: string | null;
   merged_at: number;
   two_keys: boolean;
+}
+
+/** A revert of a merge that turned the default branch red (REVERT_RETRIES): the original ticket, the merge, and where the revert got to. */
+export interface RevertRecord {
+  repository: string;
+  /** The original pull request (its number is the one of the revert branch ai/revert-<n>). */
+  number: number;
+  /** The ticket of the original pull request (ai/issue-<m>). */
+  issue: number;
+  sha: string;
+  /** started: the revert run runs; merged: the revert pull request is merged; handled: done (or given to the human). */
+  state: 'started' | 'merged' | 'handled';
+  at: number;
+  revert?: number;
+  reopened?: boolean;
+  commented?: boolean;
+  restarted?: boolean;
+  blocked?: boolean;
 }
 
 /** A two-key merge on hold (TWO_KEYS_HOLD_MINUTES), kept in the ledger per pull request ("repo#pr<n>"). `merge_after` is null while HOLD_LABEL is on. */

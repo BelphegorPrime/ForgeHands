@@ -152,6 +152,7 @@ export class ForgejoForge implements Forge {
     return this.login;
   }
   async closeIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PATCH', '/issues/' + number, { state: 'closed' }); }
+  async reopenIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PATCH', '/issues/' + number, { state: 'open' }); }
   dependencies(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/dependencies'); }
   blocks(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/blocks'); }
 

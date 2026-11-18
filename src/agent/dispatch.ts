@@ -5,6 +5,7 @@ import { anyOverlap } from '../utils/path-overlap.ts';
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
 import { REVERT_BRANCH } from './bot.ts';
+import { redact } from '../utils/redact.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
@@ -16,7 +17,7 @@ import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '..
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
+import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RevertRecord } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
@@ -533,7 +534,7 @@ export class Dispatcher {
     const key = this.issueKey(event) + ':' + label + (event.ci ? ':' + event.ci.commit_sha.slice(0, 8) : '');
     if (event.ci ? this.jobs.list().some((job) => job.key === key) : this.jobs.activeByKey(key)) return { status: 'duplicate_job' };
     const kind = this.config.routes.get(label)!.kind;
-    if (this.config.epicLabels.has(label) && !event.pull_request && !event.ci && !event.plan_answer && event.type.startsWith('issues.')) await this.endOriginalPull(event, label);
+    if (this.config.epicLabels.has(label) && !event.pull_request && !event.ci && !event.plan_answer && !event.revert_retry && event.type.startsWith('issues.')) await this.endOriginalPull(event, label);
     if (event.ci) {
       // While an agent still works on the issue (it will push again) the outcome is not acted on, but kept: it is looked at again
       // when that run ends (see releaseDeferred), because CI often finishes seconds before the agent's last step.
@@ -757,8 +758,15 @@ export class Dispatcher {
     try {
       const pulls = await this.forge.listPulls(repository, { state: 'closed', sort: 'recentupdate', limit: 20 });
       for (const pr of Array.isArray(pulls) ? pulls : []) {
+        const reverted = /^ai\/revert-(\d+)$/.exec(String(pr?.head?.ref || ''));
+        if (reverted && pr.merged && (!event.repository.default_branch || !pr.base?.ref || pr.base.ref === event.repository.default_branch)) {
+          closed += (await this.revertMerged(repository, pr, Number(reverted[1]))) ? 1 : 0;
+          continue;
+        }
         const match = /^ai\/issue-(\d+)$/.exec(String(pr?.head?.ref || ''));
         if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
+        // A merged pull request whose change was reverted: its ticket is reopened by the revert, not closed again here.
+        if (this.revertOf(repository, Number(pr.number))) continue;
         const number = Number(match[1]);
         const issue = await this.forge.getIssue(repository, number);
         if (issue && issue.state === 'closed' && !issue.pull_request) await this.markClosed(repository.toLowerCase() + '#' + number);
@@ -783,6 +791,100 @@ export class Dispatcher {
       this.logger.error('could not close the tickets of merged pull requests:', error.message);
     }
     return closed;
+  }
+
+  // The record of the revert of pull request n (REVERT_RETRIES), if any.
+  revertOf(repository: string, number: number): RevertRecord | undefined {
+    if (!this.config.revertRetries) return undefined;
+    return this.jobs.reverts.find((entry) => entry.repository === repository.toLowerCase() && entry.number === number);
+  }
+
+  // The revert of an agent's merge is merged (by ForgeHands or by a human; seen on the push to the default branch that merged it). Once per revert:
+  // the ticket is reopened (its work was undone), one comment says what broke and quotes the revert's own account (redacted), and the worker route
+  // starts again, as a newly added label does, while REVERT_RETRIES allows it. Then the ticket gets BLOCKED_LABEL and the human is called. Each step
+  // is recorded, so a step that failed is tried again on the next push, and the steps done are not repeated. Returns whether it closed something.
+  async revertMerged(repository: string, revert: Json, number: number): Promise<boolean> {
+    const record = this.revertOf(repository, number);
+    if (!record || record.state === 'handled' || !this.config.forgejo) return false;
+    const name = repository.toLowerCase();
+    const ticket = record.issue;
+    const branch = revert.base?.ref || 'the default branch';
+    record.revert = Number(revert.number);
+    record.state = 'merged';
+    if (!record.reopened) {
+      try {
+        await this.forge.reopenIssue(repository, ticket);
+        record.reopened = true;
+      } catch (error) {
+        this.logger.error('could not reopen #' + ticket + ' of ' + repository + ' after its revert #' + revert.number + ', trying again on the next push:', error.message);
+        return false;
+      }
+    }
+    if (!record.commented) {
+      let body = '';
+      try { body = String((await this.forge.getPull(repository, Number(revert.number)))?.body || ''); } catch (error) { this.logger.error('could not read #' + revert.number + ':', error.message); }
+      const cause = redact(body.slice(0, 1200), this.secretValues()).trim();
+      const quoted = (cause || 'The revert pull request has no text: read the failed run of the default branch.').split('\n').map((line) => '> ' + line).join('\n');
+      try {
+        await this.forge.addComment(repository, ticket, 'ForgeHands: the merge of #' + record.number + ' turned the CI of ' + branch + ' red (commit ' + record.sha.slice(0, 8)
+          + '); it was reverted by #' + revert.number + '. Fix the cause, do not repeat the change that broke it. Cause as the revert run found it:\n\n' + quoted, 'issue');
+        record.commented = true;
+      } catch (error) {
+        this.logger.error('could not comment on #' + ticket + ' after its revert:', error.message);
+        return false;
+      }
+    }
+    const used = this.jobs.reverts.filter((entry) => entry !== record && entry.repository === name && entry.issue === ticket && entry.restarted).length;
+    if (!record.restarted && !record.blocked) {
+      if (used < this.config.revertRetries) {
+        const label = this.lastRunLabel(name, ticket);
+        if (!label) { this.logger.error(name + '#' + ticket + ': no run of the ticket to start again after its revert, nothing started'); }
+        else {
+          try {
+            const issue = await this.forge.getIssue(repository, ticket);
+            const result = await this.enqueueOne({ type: 'issues.labeled', source: this.forge.kind, action: 'revert_retry', label, revert_retry: true,
+              repository: { full_name: repository, clone_url: null, html_url: null, default_branch: revert.base?.repo?.default_branch || null },
+              issue: { number: ticket, title: String(issue?.title || '').slice(0, 1000), body: String(issue?.body || '').slice(0, 50000), html_url: issue?.html_url || null, comments: 0, labels: [label] },
+              sender: { login: null } });
+            if (result.status === 'queued' || result.status === 'waiting' || result.status === 'duplicate_job') {
+              record.restarted = true;
+              metrics.inc('forgehands_revert_retries_total');
+              this.logger.error(repository + '#' + ticket + ': reverted by #' + revert.number + ', running ' + label + ' again');
+            }
+          } catch (error) {
+            this.logger.error('could not start ' + name + '#' + ticket + ' again after its revert:', error.message);
+            return false;
+          }
+        }
+      } else {
+        try {
+          const blocked = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
+          await this.forge.addLabels(repository, ticket, [blocked], 'issue');
+          await this.forge.addComment(repository, ticket, mentionOf(this.config) + 'ForgeHands: the merge of #' + record.number + ' turned the CI red again and was reverted by #'
+            + revert.number + '. The ticket was started again ' + used + ' times already (REVERT_RETRIES=' + this.config.revertRetries + '). It is blocked (' + this.config.blockedLabel + '): a human has to look at it.', 'issue');
+          this.tell('blocked', { repository: { full_name: repository, clone_url: null, html_url: null, default_branch: branch }, type: 'ci.main_failure', source: this.forge.kind,
+            sender: { login: null }, issue: { number: ticket, title: '', body: '', html_url: null, comments: 0, labels: [] } }, { why: 'revert_retries' });
+          record.blocked = true;
+        } catch (error) {
+          this.logger.error('could not block #' + ticket + ' after its revert:', error.message);
+          return false;
+        }
+      }
+    }
+    record.state = 'handled';
+    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+    return true;
+  }
+
+  // The worker label of the ticket's last run: the trigger that starts it again (an issue route, not a planner's label; the newest run wins).
+  lastRunLabel(repository: string, issue: number): string | undefined {
+    const runs = this.jobs.list().filter((job) => job.key.startsWith(repository + '#' + issue + ':') && this.config.routes.get(job.label)?.kind === 'issue');
+    return runs.at(-1)?.label;
+  }
+
+  // The secret values a comment must not contain (AGENT_SECRETS and the forge token).
+  secretValues(): string[] {
+    return [...Object.values(this.config.agentSecrets || {}), this.config.forgejo?.token].filter((value): value is string => typeof value === 'string' && value.length > 0);
   }
 
   // All dependencies of the epic are closed: have it reviewed (and closed when its criteria are met). Once per run.
@@ -843,6 +945,10 @@ export class Dispatcher {
       this.logger.error('could not comment on #' + number + ':', error.message);
     }
     if (!route) return { status: 'handed_to_human' };
+    // REVERT_RETRIES: the revert of an agent's merge is recorded, so that its merged revert can reopen and restart the ticket (see revertMerged).
+    const ticket = /^ai\/issue-(\d+)$/.exec(merge.branch);
+    const record = this.config.revertRetries && ticket ? { repository: repository.toLowerCase(), number, issue: Number(ticket[1]), sha, state: 'started' as const, at: this.now() } : null;
+    if (record) this.jobs.reverts.push(record);
     const job = this.jobs.add({ key: repository.toLowerCase() + '!pr' + number + ':' + route + ':' + short, label: route, status: 'queued', created: this.now(),
       event: { type: 'ci.main_failure', source: this.forge.kind, action: 'main_red', label: route, repository: event.repository,
         issue: { number, title: title.slice(0, 1000), body: '', html_url: null, comments: 0, labels: [] }, ci: event.ci, sender: event.sender } });
@@ -851,6 +957,7 @@ export class Dispatcher {
     } catch (error) {
       this.jobs.remove(job.id); // not durable: the retried delivery must be able to start it again
       this.jobs.dedupe.delete(key);
+      if (record) this.jobs.reverts.splice(this.jobs.reverts.indexOf(record), 1);
       throw error;
     }
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
