@@ -162,6 +162,17 @@ This is a feature release on top of 0.7.1. Two of the three changes are on by de
 - **The ledger** gains `nudged`, `nudge_settled`, `tokens` and `tokens_seen` on a job. A 0.7.1 release ignores them, so rolling back is safe.
 - **Rollback.** Set `NUDGE_AT_PERCENT=0` and `STALL_ALERT_MINUTES=0` first, or go back to 0.7.1 directly.
 
+# Upgrading to the version after 0.8.1: safety nets for merges without a human
+
+This is a feature release on top of 0.8.1. It changes no default: the hold and the daily limit are off until you set them, and the revert needs a route of kind `main_red` before it starts a run. Without that route, `REVERT_ON_RED` (on by default) only comments on the merged pull request and tells you.
+
+- **The hold (`TWO_KEYS_HOLD_MINUTES`, default `0`, `HOLD_LABEL`, default `ai:hold`).** A two-key merge can wait this many minutes after both keys agreed. The label stops it for as long as it is on. Nothing to change while it is off.
+- **The daily limit (`TWO_KEYS_DAILY_LIMIT`, default `0`).** At most this many two-key merges per repository in 24 hours; the next one is handed to a human with the reason in the comment.
+- **Revert on red (`REVERT_ON_RED`, default `1`, `REVERT_WINDOW_MINUTES`, default `120`).** A failed run of the default branch for a commit ForgeHands merged is read now; before, a failed push run was ignored. To use the revert, add a route `"on": "main_red"` to `LABEL_ROUTES`. Check it once with a real red push to the default branch: the failed run's event payload must carry the branch (`ref`), which ForgeHands reads to tell a push to the default branch apart. Set `REVERT_ON_RED=0` to keep the old behaviour.
+- **Revert pull requests** (`ai/revert-<n>`) are handled as dependency bot pull requests: no ticket, no worker fixes them, `BOT_FIX_ROUNDS` decides whether a red run of one gets a fix round. Check that your reviewer accepts them.
+- **The ledger** gains `holds` (the holds of two-key merges, per pull request) and `merges` (what ForgeHands merged: repository, pull request, branch, merge commit, time, two keys; kept 30 days). Version 0.8.1 ignores both fields, but it has no hold: a two-key pull request that was waiting for one merges at its next event there. Before you roll back, put `HOLD_LABEL` on the pull requests you want to keep.
+- **Rollback.** Set `TWO_KEYS_HOLD_MINUTES=0`, `TWO_KEYS_DAILY_LIMIT=0` and `REVERT_ON_RED=0` first (and see the note on holds above), or go back to 0.8.1.
+
 # Upgrading to the version after 0.8.0: the nudge waits for its answer in the background
 
 **Fix.** On a real run the nudge's message timed out after the normal 10 seconds (a message to a running conversation answers after the agent's current step) and was lost. From this version the nudge has its own timeout, `NUDGE_TIMEOUT_SECONDS` (default `180`, 10 to 600), it is sent in the background, and a timeout is checked in the events before the message is sent again.
