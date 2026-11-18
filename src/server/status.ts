@@ -1,6 +1,6 @@
 import { isDry } from '../dry.ts';
 import type { DryLog, DryWrite } from '../dry.ts';
-import type { DirectConfig, Job } from '../types.ts';
+import type { DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
@@ -22,13 +22,15 @@ export interface TierStats {
   started: number; finished: number; failed: Record<string, number>; split: number; fell_back: number; escalated: number;
   worker_runs_finished: number; worker_runs_merged: number; merged_share: number | null;
 }
+// The tokens of the runs of one tier that started in the last 7 days (the sums of the runs' totals, see Dispatcher.countTokens).
+export interface TierTokens { prompt: number; completion: number; cache_read: number }
 export interface Status {
   generated: string;
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
   // Where the human is told (no secrets): the channels, the immediate kinds and the time of the digest.
   notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
-  summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats }> }>;
+  summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats; tokens: TierTokens }> }>;
   issues: { issue: string; title: string; pr: number | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
@@ -36,6 +38,8 @@ export interface Status {
   waiting_for_human: { repository: string; issue: number; pr: number; since: string; reason: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
+  // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
+  idle?: { since: string; reasons: IdleCounts; quota_tiers: string[] };
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -94,6 +98,25 @@ function tierOfJob(config: DirectConfig, job: Job): string | undefined {
   const own = config.routes.get(job.label);
   return (job.escalated && own?.escalateTo ? config.routes.get(own.escalateTo) : own)?.tier;
 }
+
+// Tokens per repository and tier for the runs that started within `days` days (their totals, see Dispatcher.countTokens).
+function tokenStats(config: DirectConfig, jobs: Job[], days: number, now: number): Record<string, Record<string, TierTokens>> {
+  const since = now - days * DAY_MS;
+  const result: Record<string, Record<string, TierTokens>> = {};
+  for (const job of jobs) {
+    if (!job.tokens || !job.started || job.started < since) continue;
+    const tier = tierOfJob(config, job);
+    if (!tier) continue;
+    const repo = String(job.event?.repository?.full_name || job.key.split('#')[0]).toLowerCase();
+    const entry = ((result[repo] ||= {})[tier] ||= emptyTokens());
+    entry.prompt += job.tokens.prompt;
+    entry.completion += job.tokens.completion;
+    entry.cache_read += job.tokens.cache_read;
+  }
+  return result;
+}
+
+const emptyTokens = (): TierTokens => ({ prompt: 0, completion: 0, cache_read: 0 });
 
 // Runs per repository, tier and window (by the time the run started). A ticket sent to the planner counts for the tier of the run that held the
 // split note. A worker run counts as merged when any job of its ticket carries `merged_at` (so a pull request merged later still counts).
@@ -155,7 +178,8 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null, options: { all?: boolean } = {}): Status {
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
+  options: { all?: boolean; idle?: IdleState | null } = {}): Status {
   const byIssue = new Map<string, { key: string; title: string; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -202,6 +226,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const month = summarize(config, all, 30, now);
   const tierWeek = tierStats(config, all, 7, now);
   const tierMonth = tierStats(config, all, 30, now);
+  const tokensWeek = tokenStats(config, all, 7, now);
   const emptyTier = (): TierStats => ({ started: 0, finished: 0, failed: Object.fromEntries(FAIL_REASONS.map((reason) => [reason, 0])), split: 0, fell_back: 0, escalated: 0, worker_runs_finished: 0, worker_runs_merged: 0, merged_share: null });
   return {
     generated: new Date(now).toISOString(),
@@ -209,11 +234,12 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     notify: { channels: notifyChannels(config.notify), immediate: config.notify.immediate, digest: config.notify.digest },
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
     summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
-      tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier] }])) }])),
+      tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier], tokens: tokensWeek[repo]?.[tier] || emptyTokens() }])) }])),
     issues,
     hidden,
     waiting_for_human: waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
-    workspace
+    workspace,
+    ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers } } : {})
   };
 }
 

@@ -9,11 +9,11 @@ import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
-import { digestIsEmpty, digestMessage, immediateMessage } from '../notify/texts.ts';
+import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
+import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 
@@ -41,6 +41,35 @@ const RESUME_SETTLE_MS = 60000;
 // Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
 // `no_delivery` is not one of them: it is only ever reported for issue runs, which have no escalate_to.
 const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
+// Nudge (NUDGE_AT_PERCENT): a run's actions are counted at most once a minute, and not before the run is three minutes old.
+const NUDGE_CHECK_EVERY_MS = 60000;
+const NUDGE_MIN_RUN_MS = 180000;
+// The idle line is logged again after this long when nothing about the waiting work has changed (see reportIdle).
+const IDLE_LOG_EVERY_MS = 15 * 60000;
+// After a stall alert no other one for this long, unless nothing waits any more (see checkStall).
+const STALL_REPEAT_MS = 6 * 3600000;
+
+// The route kinds, as the token counter labels them (a known set, see metrics.known).
+const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review'];
+const TOKEN_TYPES = ['prompt', 'completion', 'cache_read', 'reasoning'] as const;
+
+// Tokens of a conversation (stats.usage_to_metrics: one entry per usage id, each with its LLM calls in token_usages), summed. Null when the
+// conversation carries no usage at all.
+export function tokenUsage(data: Json): TokenTotals | null {
+  const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
+  if (!usage || typeof usage !== 'object') return null;
+  const totals: TokenTotals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
+  for (const entry of Object.values(usage) as Json[]) {
+    for (const call of Array.isArray(entry?.token_usages) ? entry.token_usages as Json[] : []) {
+      totals.prompt += Number(call?.prompt_tokens) || 0;
+      totals.completion += Number(call?.completion_tokens) || 0;
+      totals.cache_read += Number(call?.cache_read_tokens) || 0;
+      totals.cache_write += Number(call?.cache_write_tokens) || 0;
+      totals.reasoning += Number(call?.reasoning_tokens) || 0;
+    }
+  }
+  return totals;
+}
 
 // Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
 export function conversationCost(data: Json): number | null {
@@ -48,6 +77,15 @@ export function conversationCost(data: Json): number | null {
   const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
   if (!usage || typeof usage !== 'object') return null;
   return (Object.values(usage) as Json[]).reduce((sum: number, entry) => sum + (Number(entry?.accumulated_cost) || 0), 0);
+}
+
+// The idle line: how many waiting jobs wait for what (see Dispatcher.reportIdle). `could_start` is only named when it is not 0.
+function idleLine(reasons: IdleCounts, tiers: string[]): string {
+  const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
+  return 'idle: ' + total + ' waiting: ' + reasons.dependencies + ' on dependencies, ' + reasons.files + ' on files of older tickets, '
+    + reasons.quota + ' held (quota ' + (tiers.join('/') || 'none') + '), ' + reasons.disk + ' held (low disk), '
+    + reasons.hourly + ' over the hourly limit, ' + reasons.concurrency + ' over a concurrency limit'
+    + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '');
 }
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
@@ -79,6 +117,13 @@ export class Dispatcher {
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
+  nudgeChecks = new Map<string, number>(); // job id -> when the actions of its run were last counted (NUDGE_AT_PERCENT); in memory only
+  /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
+  idle: IdleState | null = null;
+  idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
+  /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
+  lastStart: number;
+  stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
 
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
@@ -86,6 +131,7 @@ export class Dispatcher {
     this.send = send;
     this.logger = logger;
     this.now = now;
+    this.lastStart = now();
     this.dry = new DryLog(logger);
     this.transport = createTransport(config, send, this.dry);
     this.forge = createForge(config, (repository, method, path, body) => this.forgejoCall({ repository: { full_name: repository } }, method, path, body));
@@ -983,12 +1029,17 @@ export class Dispatcher {
     }
     // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
     const tried = new Set<string>();
+    let started = 0;
     for (;;) {
       const job = this.pickNext(now, tried);
       if (!job) break;
       tried.add(job.id);
       if (await this.startJob(job, now)) changed = true;
+      if (job.started === now) started += 1;
     }
+    if (started) this.lastStart = now;
+    this.reportIdle(now, started);
+    this.checkStall(now);
     if (await this.refreshMoved(now)) changed = true;
     if (await this.archiveOld(now)) changed = true;
     if (await this.sweepClosed(now)) changed = true;
@@ -1347,18 +1398,82 @@ export class Dispatcher {
   }
 
   hasRoom(job: Job, now: number): boolean {
-    // Low disk space (DISK_MIN_FREE_GB): nothing new starts; running jobs are not touched.
-    if (this.workspace.holding) return false;
+    return this.holdOf(job, now) === null;
+  }
+
+  // The limit that keeps a queued job from starting now, checked in this order, or null when it may start: low disk space (DISK_MIN_FREE_GB, running
+  // jobs are not touched), the global concurrency, the quota hold of its tier (`tier` is that tier), the concurrency of its tier, the hourly limit.
+  holdOf(job: Job, now: number): { reason: 'disk' | 'quota' | 'concurrency' | 'hourly'; tier?: string } | null {
+    if (this.workspace.holding) return { reason: 'disk' };
     const running = this.jobs.list('running');
-    if (running.length >= this.config.maxConcurrent) return false;
+    if (running.length >= this.config.maxConcurrent) return { reason: 'concurrency' };
     const effective = this.effectiveRoute(job, now).route;
     const tier = effective.tier;
-    if ((this.cooldowns.get(tier) || 0) > now) return false;
+    if ((this.cooldowns.get(tier) || 0) > now) return { reason: 'quota', tier };
     const tierLimit = effective.maxConcurrent ?? this.config.maxConcurrentPerTier;
-    if (running.filter((other) => this.tierOf(other) === tier).length >= tierLimit) return false;
+    if (running.filter((other) => this.tierOf(other) === tier).length >= tierLimit) return { reason: 'concurrency' };
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
-    if (startedLastHour >= this.config.maxRunsPerHour) return false;
-    return true;
+    if (startedLastHour >= this.config.maxRunsPerHour) return { reason: 'hourly' };
+    return null;
+  }
+
+  // What holds the waiting and queued jobs back right now, counted per job with the waits the dispatcher already decides: an issue that depends on
+  // open issues (and a CI result kept while its run goes on) is a dependency wait; a ticket that shares files with an older one is a files wait; a queued
+  // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
+  // and is not counted.
+  idleCounts(now: number): { reasons: IdleCounts; tiers: string[] } {
+    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0 };
+    const tiers = new Set<string>();
+    for (const job of this.jobs.list(true)) {
+      if (job.status === 'waiting') {
+        if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
+        else if (job.waiting_for_files?.length) reasons.files += 1;
+        continue;
+      }
+      if (job.status !== 'queued' || (job.next_try && job.next_try > now)) continue;
+      const hold = this.holdOf(job, now);
+      if (!hold) { reasons.could_start += 1; continue; }
+      reasons[hold.reason] += 1;
+      if (hold.tier) tiers.add(hold.tier);
+    }
+    return { reasons, tiers: [...tiers].sort() };
+  }
+
+  // The idle line of a pass in which something waits and nothing could start (`started` is the number of jobs this pass started). It is logged
+  // when its composition changes and at most every 15 minutes otherwise; the same numbers are on /status.json and in the idle gauge.
+  reportIdle(now: number, started: number): void {
+    const { reasons, tiers } = this.idleCounts(now);
+    const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
+    if (started) this.idleLogged = null;
+    if (started || !total) this.idle = null;
+    if (!total) { this.stallAlertAt = null; this.idleLogged = null; }
+    if (started || !total) return;
+    this.idle = { since: this.idle?.since ?? now, reasons, tiers };
+    const key = JSON.stringify([reasons, tiers]);
+    if (this.idleLogged?.key === key && now - this.idleLogged.at < IDLE_LOG_EVERY_MS) return;
+    this.idleLogged = { key, at: now };
+    this.logger.error(idleLine(reasons, tiers));
+  }
+
+  idleState(): IdleState | null {
+    return this.idle;
+  }
+
+  // STALL_ALERT_MINUTES: work waits on a hold that is not a dependency (quota, disk, a limit, or a job that could start and did not), no run is running,
+  // and nothing has started for that long: one notification (kind stalled), and not again for six hours unless nothing waits any more. The waits on
+  // dependencies and on files do not count: a chain of tickets is normal.
+  checkStall(now: number): void {
+    const minutes = this.config.stallAlertMinutes;
+    if (!minutes || !this.idle) return;
+    const { reasons, tiers } = this.idle;
+    if (!(reasons.quota + reasons.disk + reasons.hourly + reasons.concurrency + reasons.could_start)) return;
+    if (this.jobs.list('running').length || now - this.lastStart < minutes * 60000) return;
+    if (this.stallAlertAt !== null && now - this.stallAlertAt < STALL_REPEAT_MS) return;
+    if (!this.notifier.wants('stalled')) return;
+    this.stallAlertAt = now;
+    const quiet = Math.round((now - this.lastStart) / 60000);
+    this.logger.error('stall alert: nothing has started for ' + quiet + ' min and no run is running. ' + idleLine(reasons, tiers));
+    this.notifier.notify(stallMessage(this.config.notify.language, { minutes: quiet, reasons, tiers }));
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {
@@ -1429,6 +1544,9 @@ export class Dispatcher {
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
       // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
       delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
+      // The nudge is once per conversation too (see nudgeIfNoBranch).
+      delete job.nudged; delete job.nudge_settled; this.nudgeChecks.delete(job.id);
+      delete job.tokens_seen;
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
@@ -1454,6 +1572,7 @@ export class Dispatcher {
     }
     let state: string | null = null;
     let costChanged = false;
+    let usage: TokenTotals | null = null; // the tokens of the conversation as this read sees them (null: the read failed)
     try {
       const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!));
       if (response.status === 404) state = 'deleted';
@@ -1462,6 +1581,7 @@ export class Dispatcher {
         state = data.execution_status || data.status;
         const cost = conversationCost(data);
         if (cost !== null && cost !== job.cost) { job.cost = cost; costChanged = true; }
+        usage = tokenUsage(data);
       }
     } catch (error) {
       this.logger.error('polling ' + job.key + ' failed:', error.message);
@@ -1479,6 +1599,7 @@ export class Dispatcher {
           const fallback = error.unavailable ? Math.min(60000 * 2 ** Math.min(job.rate_limited || 0, 5), 30 * 60000) : 15 * 60000;
           const wait = Math.min(Math.max(error.waitMs ?? fallback, 60000), this.config.quotaHoldMaxMs);
           const until = now + wait;
+          this.countTokens(job, usage);
           this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
           this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
           // The job may start again as soon as one of the routes it can run on is free: its own (or escalated) route, or that route's fallback.
@@ -1493,6 +1614,7 @@ export class Dispatcher {
     }
     // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
     if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
+      this.countTokens(job, usage);
       this.logger.error(job.key + ' ended with an error, running it once more');
       metrics.inc('forgehands_error_retries_total');
       Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,
@@ -1502,6 +1624,7 @@ export class Dispatcher {
     if (state !== null && TERMINAL.has(state)) {
       // A run continued a moment ago may still be reported in the state it stopped in: that is not news yet.
       if (job.resumed_from === state && now - job.resumed_at! < RESUME_SETTLE_MS) return false;
+      this.countTokens(job, usage);
       // A pause the operator wants is not resumed: the ticket is closed or its trigger label is gone (see pauseStop). Such a run ends as it is
       // (no split, no hand-over, no new branch update), and the operator's stop is the one thing ForgeHands does not fight.
       let stopped: string | null = null;
@@ -1528,10 +1651,13 @@ export class Dispatcher {
       else if (done === 'issue') await this.checkDelivery(job);
       return true;
     }
+    // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).
+    if (state === 'running' && await this.nudgeIfNoBranch(job, now)) return true;
     if (costChanged) return true;
     // Free the slot of a run that never ends; the conversation itself is left alone unless the run is continued (see resume).
     // A continued run counts its timeout from the continuation.
     if (job.started && (job.resumed_at ?? job.started) + this.config.maxRunMs < now) {
+      this.countTokens(job, usage);
       if (await this.resume(job, 'timeout', now)) return true;
       return this.failed(job, 'timeout', now);
     }
@@ -1578,8 +1704,7 @@ export class Dispatcher {
     // The message and the run are two calls: a run call that is not answered is repeated on its own (startResumed), never the message.
     const text = paused ? PAUSE_MESSAGE : 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
     try {
-      const response = await this.api('POST', conversation + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, repository);
-      if (!response.ok) throw new Error('HTTP ' + response.status);
+      await this.sendMessage(job, text);
     } catch (error) {
       this.logger.error(job.key + ': ' + state + ', the message to continue it was not sent (' + error.message + '), the next stage decides');
       return false;
@@ -1590,6 +1715,107 @@ export class Dispatcher {
     this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + (used + 1) + '/' + budget + ')');
     await this.startResumed(job);
     return true;
+  }
+
+  // The tokens of a conversation are added to the job's totals and to the counter forgehands_tokens_total when its run ends: at a terminal state,
+  // when the conversation is dropped for a retry or a quota hold, or when a run times out. `tokens_seen` is what of the current conversation is
+  // counted already, so a continued run adds only what came after. A read that failed (no usage) adds nothing.
+  countTokens(job: Job, usage: TokenTotals | null): void {
+    if (!usage) return;
+    const seen = job.tokens_seen;
+    const totals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0, ...job.tokens };
+    const delta = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
+    for (const field of Object.keys(delta) as (keyof TokenTotals)[]) {
+      delta[field] = Math.max(0, usage[field] - (seen?.[field] ?? 0));
+      totals[field] += delta[field];
+    }
+    job.tokens = totals;
+    job.tokens_seen = usage;
+    const tiers = new Set([...this.config.routes.values()].map((route) => route.tier));
+    const labels = {
+      repository: known(String(job.event?.repository?.full_name).toLowerCase(), this.config.allowedRepos), tier: known(this.tierOf(job), tiers),
+      kind: known(this.config.routes.get(job.label)?.kind || 'issue', ROUTE_KINDS)
+    };
+    for (const type of TOKEN_TYPES) if (delta[type] > 0) metrics.inc('forgehands_tokens_total', { ...labels, type }, delta[type]);
+  }
+
+  // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it; shared by resume and the nudge.
+  async sendMessage(job: Job, text: string): Promise<void> {
+    const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, job.event.repository.full_name);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+  }
+
+  // NUDGE_AT_PERCENT: a worker run on an issue that has used that share of its route's iteration limit, and whose forge shows no branch ai/issue-<n>,
+  // is told once (per conversation) to stop exploring and push. Only a running conversation is looked at. Every read is best effort: when the count,
+  // the forge or OpenHands fails, nothing is sent and the next look comes a minute later. Returns true when the job changed (to be persisted).
+  async nudgeIfNoBranch(job: Job, now: number): Promise<boolean> {
+    const route = this.config.routes.get(job.label);
+    // Planner, epic and split routes are not workers: they plan, they do not push a branch of their own.
+    const worker = !!route && route.kind === 'issue' && !job.event.pull_request && !job.event.bot && job.event.type !== 'epic.done'
+      && !this.config.epicLabels.has(job.label) && job.label !== this.config.splitLabel;
+    if (!this.config.nudgeAtPercent || !worker || !this.config.forgejo || !job.started || !job.conversation_id || job.nudged !== undefined || job.nudge_settled) return false;
+    if (now - job.started < NUDGE_MIN_RUN_MS) return false;
+    const last = this.nudgeChecks.get(job.id);
+    if (last !== undefined && now - last < NUDGE_CHECK_EVERY_MS) return false;
+    this.nudgeChecks.set(job.id, now);
+    const repository = job.event.repository.full_name;
+    const number = job.event.issue.number;
+    let used: number;
+    try {
+      used = await this.actionCount(job);
+    } catch (error) {
+      this.logger.error(job.key + ': actions not counted, no nudge yet (' + error.message + ')');
+      return false;
+    }
+    const max = route.maxIterations;
+    if (used < Math.ceil(max * this.config.nudgeAtPercent / 100)) return false;
+    let pushed: boolean;
+    try {
+      pushed = await this.branchExists(repository, 'ai/issue-' + number);
+    } catch (error) {
+      this.logger.error(job.key + ': the branch is not read, no nudge yet (' + error.message + ')');
+      return false;
+    }
+    if (pushed) { job.nudge_settled = true; return true; }
+    try {
+      await this.sendMessage(job, this.nudgeText(used, max, number));
+    } catch (error) {
+      this.logger.error(job.key + ': not nudged, the message was not sent (' + error.message + ')');
+      return false;
+    }
+    job.nudged = used;
+    metrics.inc('forgehands_nudges_total', { kind: route.kind });
+    this.logger.error(job.key + ': nudged at ' + used + '/' + max + ' actions, no branch yet');
+    return true;
+  }
+
+  // The agent actions of a conversation so far: OpenHands' event count, restricted to ActionEvent. Throws when the count cannot be read.
+  async actionCount(job: Job): Promise<number> {
+    const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/count?kind=ActionEvent', undefined, job.event.repository.full_name);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = (await response.json()) as Json;
+    const count = typeof data === 'number' ? data : Number(data?.count);
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('the answer carries no count');
+    return count;
+  }
+
+  // Whether a branch exists in the forge. A missing branch is HTTP 404 (false); any other failure throws, so that the caller treats it as unknown.
+  async branchExists(repository: string, branch: string): Promise<boolean> {
+    try {
+      return (await this.forge.branchTip(repository, branch)) !== null;
+    } catch (error) {
+      if (/HTTP 404\b/.test(error.message)) return false;
+      throw error;
+    }
+  }
+
+  // The nudge's text: the default, or NUDGE_MESSAGE with {used}, {max} and {branch} filled in.
+  nudgeText(used: number, max: number, number: number): string {
+    const branch = 'ai/issue-' + number;
+    if (this.config.nudgeMessage) return this.config.nudgeMessage.replaceAll('{used}', String(used)).replaceAll('{max}', String(max)).replaceAll('{branch}', branch);
+    return 'You have used ' + used + ' of ' + max + ' actions and have not pushed a branch yet. Stop exploring. Implement the smallest change that meets the acceptance check, '
+      + 'commit and push it to the branch ' + branch + ' and open the draft pull request; or, if something blocks you, write a comment on the issue that names the exact blocker '
+      + 'and finish. Do not start new investigations.';
   }
 
   // The run call of a continued conversation. 200 starts it, 409 says it runs already: both clear the pending call. 404 means the conversation is

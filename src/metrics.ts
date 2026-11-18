@@ -2,7 +2,7 @@
 // process (Prometheus copes with that); the gauges are read from the ledger when /metrics is asked for (see gaugeSamples).
 // Callers use one-liners: metrics.inc('forgehands_merges_total', { repository }). Label values are limited to known sets (a repository of
 // ALLOWED_REPOS, a route kind, a tier, a fixed reason) and never carry issue or pull request numbers, so the number of series stays bounded.
-import type { DirectConfig } from './types.ts';
+import type { DirectConfig, IdleState } from './types.ts';
 import type { JobStore } from './store/jobs.ts';
 
 type Labels = Record<string, string>;
@@ -29,6 +29,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
   forgehands_resumes_total: 'Runs that ended stuck, timed out or paused and were continued on their own conversation, by route kind and the state they stopped in (RESUME_ATTEMPTS, PAUSE_RESUMES).',
   forgehands_ledger_sync_closed_total: 'Tickets the ledger sync (LEDGER_SYNC_HOURS) found closed or merged in the forge and marked closed on the status page.',
+  forgehands_tokens_total: 'Tokens of the agent runs, added up when the run ended, by repository, the tier it really ran on, route kind and type (prompt, completion, cache_read, reasoning).',
+  forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
   forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
 const GAUGES: Record<string, string> = {
@@ -37,8 +39,11 @@ const GAUGES: Record<string, string> = {
   forgehands_queued_jobs: 'Jobs waiting for a free slot, by repository.',
   forgehands_workspace_disk_used_percent: 'Used share of the filesystem of WORKSPACE_CLEANUP_DIR, in percent (absent while the cleanup is off).',
   forgehands_workspace_disk_free_bytes: 'Bytes available to ForgeHands on the filesystem of WORKSPACE_CLEANUP_DIR (absent while the cleanup is off).',
-  forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.'
+  forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
+  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency); 0 while nothing waits.'
 };
+// The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
+const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency'] as const;
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
@@ -116,13 +121,14 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
 // The gauges, read from the ledger and the dispatcher's quota holds at the moment of the scrape. `disk` is the workspace's last reading
 // (null while the cleanup is off, then no disk gauge is written).
-export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Map<string, number>, now: number, disk: { usedPercent: number | null; freeBytes: number | null } | null = null): Sample[] {
+export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Map<string, number>, now: number, disk: { usedPercent: number | null; freeBytes: number | null } | null = null,
+  idle: IdleState | null = null): Sample[] {
   const samples: Sample[] = [];
   if (disk && disk.usedPercent !== null) samples.push({ name: 'forgehands_workspace_disk_used_percent', labels: {}, value: disk.usedPercent });
   if (disk && disk.freeBytes !== null) samples.push({ name: 'forgehands_workspace_disk_free_bytes', labels: {}, value: disk.freeBytes });
@@ -135,6 +141,7 @@ export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Ma
   for (const repo of [...config.allowedRepos].sort()) {
     samples.push({ name: 'forgehands_queued_jobs', labels: { repository: repo }, value: all.filter((job) => job.status === 'queued' && String(job.event?.repository?.full_name).toLowerCase() === repo).length });
   }
+  for (const reason of IDLE_REASONS) samples.push({ name: 'forgehands_idle_jobs', labels: { reason }, value: idle?.reasons[reason] ?? 0 });
   for (const tier of [...new Set([...config.routes.values()].map((route) => route.tier))].sort()) {
     samples.push({ name: 'forgehands_tier_cooldown_active', labels: { tier }, value: (cooldowns.get(tier) || 0) > now ? 1 : 0 });
   }

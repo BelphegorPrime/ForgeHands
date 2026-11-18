@@ -151,3 +151,13 @@ Every OpenHands run clones the repository into its own directory below the works
 - **Caveat for rounds.** The round prompt tells the agent to remove the trigger label as its last step. A pause that lands after that step (before the agent's finish) is therefore not resumed, because the label is gone; the run ends as `paused` and the human is called. Stop a round by removing the label, and check the pull request after a restart.
 - **What you see.** The status page shows a run that is continued as "resumed". The metric `forgehands_resumes_total` counts the pause resumes under `state="paused"`. The job ledger gains `pause_resumes`.
 - **Rollback.** Go back to 0.7.0. Its ledger loads with the new field ignored. A job that was resumed after a pause is then polled as 0.7.0 does: a paused conversation goes to the split or the human again.
+
+# Upgrading to the next version: a run is nudged, a stall is reported, tokens are counted
+
+This is a feature release on top of 0.7.1. Two of the three changes are on by default and change what a run does, so read the first item before you upgrade.
+
+- **A worker that explores is nudged (`NUDGE_AT_PERCENT`, default `65`).** Measured on 60+ runs, 10 of the 12 worker runs that hit their iteration limit had pushed no branch. Once a worker run on an issue has used 65 % of its route's `max_iterations` and the forge shows no branch `ai/issue-<n>`, the conversation gets one message to stop exploring and push. Nothing else changes; a run that pushes in time never sees it. Set `NUDGE_AT_PERCENT=0` to keep the former behaviour. `NUDGE_MESSAGE` replaces the text.
+- **Stalls are reported (`STALL_ALERT_MINUTES`, default `90`, `0` = off).** The log of a dispatch pass that starts nothing now says why work waits (the `idle:` line), `/status.json` has an `idle` field while it does, and the gauge `forgehands_idle_jobs{reason}` shows the same. The alert needs a channel and `NOTIFY_IMMEDIATE=stalled`, like `failed`; without `stalled` in that list nothing is sent.
+- **Tokens are counted.** `forgehands_tokens_total{repository,tier,kind,type}` adds up the tokens of a run when its conversation ends, and each tier in `/status.json` has `tokens` for the last 7 days. Nothing to set. The cost stays what OpenHands reports, which is 0 for the gateway models.
+- **The ledger** gains `nudged`, `nudge_settled`, `tokens` and `tokens_seen` on a job. A 0.7.1 release ignores them, so rolling back is safe.
+- **Rollback.** Set `NUDGE_AT_PERCENT=0` and `STALL_ALERT_MINUTES=0` first, or go back to 0.7.1 directly.

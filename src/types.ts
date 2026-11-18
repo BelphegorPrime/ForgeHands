@@ -39,7 +39,12 @@ export interface MergeRule {
 }
 
 export type NotifyLanguage = 'en' | 'de';
-export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder'] as const;
+export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled'] as const;
+
+/** What holds the queued and waiting jobs back, counted per job (see Dispatcher.idleCounts). `could_start`: a job that could start and did not. */
+export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number }
+/** The last pass in which something waited and nothing could start: since when, the counts, and the tiers whose quota holds the queued jobs. */
+export interface IdleState { since: number; reasons: IdleCounts; tiers: string[] }
 
 /** Notifications (SMTP_*, NOTIFY_*, HUMAN_MENTION): how the human hears of what needs him without the forge's mail. */
 export interface NotifyConfig {
@@ -153,6 +158,12 @@ export interface DirectConfig extends BaseConfig {
   commentRestarts: number;
   /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
   humanReviewRounds: boolean;
+  /** STALL_ALERT_MINUTES: a notification when nothing has started for this long while work waits on a hold that is not a dependency (0 = off). */
+  stallAlertMinutes: number;
+  /** NUDGE_AT_PERCENT: the share of a worker run's iteration limit after which, without a branch ai/issue-<n>, the run is nudged (0 = off). */
+  nudgeAtPercent: number;
+  /** NUDGE_MESSAGE: the text of the nudge instead of the default (null: the default). */
+  nudgeMessage: string | null;
   notify: NotifyConfig;
   securityReviewers: Set<string> | null;
   approvedLabel: string;
@@ -246,6 +257,9 @@ export type NormalizedEvent = ForgeEvent | PushEvent | BranchPushEvent;
 export const isPushEvent = (event: NormalizedEvent): event is PushEvent => event.type === 'push.default';
 export const isBranchPush = (event: NormalizedEvent): event is BranchPushEvent => event.type === 'push.branch';
 
+/** Tokens of an LLM conversation, summed over its usage ids (default, condenser) and every LLM call (OpenHands' token_usages). */
+export interface TokenTotals { prompt: number; completion: number; cache_read: number; cache_write: number; reasoning: number }
+
 // `dry`: a dry run judged and scheduled this job but started nothing. Not active, it never holds a slot or blocks an issue.
 export type JobStatus = 'waiting' | 'queued' | 'running' | 'done' | 'failed' | 'dry';
 
@@ -298,6 +312,14 @@ export interface Job {
   delivery_retry?: number;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
   delivered_on?: number;
+  /** The tokens of the run's conversations so far, added up when each of them ended (see Dispatcher.countTokens). */
+  tokens?: TokenTotals;
+  /** The tokens of the current conversation that are in `tokens` already: a continued run adds only what came after. */
+  tokens_seen?: TokenTotals;
+  /** Nudge (NUDGE_AT_PERCENT): the actions the run had used when it was nudged, once per conversation; kept on the job so a restart does not repeat it. */
+  nudged?: number;
+  /** The branch ai/issue-<n> exists, so the run needs no nudge: no more counting for this conversation. */
+  nudge_settled?: boolean;
   /** Dry run: the first message the conversation would have started with. */
   dry_prompt?: string;
   /** When the pull request of the ticket was merged, and by whom: ForgeHands itself ('agent') or somebody else ('human'). Kept on the newest job of the ticket. */

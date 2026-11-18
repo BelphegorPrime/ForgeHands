@@ -397,6 +397,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     commentRestarts: commentRestartsOf(env.COMMENT_RESTARTS),
     // HUMAN_REVIEW_ROUNDS: a request for changes of HUMAN_LOGIN on an agent pull request starts a round in comment mode too. Off without HUMAN_LOGIN.
     humanReviewRounds: humanReviewRoundsOf(env.HUMAN_REVIEW_ROUNDS) && parseHumanLogin(env.HUMAN_LOGIN) !== null,
+    // NUDGE_AT_PERCENT: a worker run that has used this share of its iteration limit without a branch ai/issue-<n> is told to stop exploring and
+    // push (once per run). 0 switches it off. NUDGE_MESSAGE replaces the text of that message.
+    nudgeAtPercent: nudgePercentOf(env.NUDGE_AT_PERCENT),
+    nudgeMessage: nudgeMessageOf(env.NUDGE_MESSAGE),
+    // STALL_ALERT_MINUTES (0 = off): work waits on a quota, the disk or a limit and nothing has started for this long, so the human is told once.
+    stallAlertMinutes: wholeOf(env.STALL_ALERT_MINUTES, 90, 'STALL_ALERT_MINUTES', 10080),
     // Notifications of ForgeHands' own (SMTP, webhook, digest) and whether the hand-over comments mention HUMAN_LOGIN, see src/notify.
     notify: parseNotify(env),
     // Whose security review comments count (comma separated logins, case-insensitive). Empty: the comment of anybody counts, which is fine for
@@ -444,6 +450,21 @@ function humanReviewRoundsOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('HUMAN_REVIEW_ROUNDS must be 0 or 1');
+}
+
+// NUDGE_AT_PERCENT: an integer from 0 (off) to 95, default 65.
+function nudgePercentOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 65;
+  if (!/^\d{1,2}$/.test(value) || Number(value) > 95) throw new Error('NUDGE_AT_PERCENT must be an integer from 0 (off) to 95');
+  return Number(value);
+}
+
+// NUDGE_MESSAGE: the text of the nudge (unset or empty: the default text). At most 2000 characters.
+function nudgeMessageOf(value: string | undefined): string | null {
+  const text = value?.trim();
+  if (!text) return null;
+  if (text.length > 2000) throw new Error('NUDGE_MESSAGE must be at most 2000 characters');
+  return text;
 }
 
 // COMMENT_RESTARTS: 0 to 100, default 2; 0 switches the comment restarts off.
