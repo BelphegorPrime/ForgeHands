@@ -137,6 +137,18 @@ export class ForgejoForge implements Forge {
     }
     return false;
   }
+  // A missing path is a 404 of the contents API; any other failure throws, so that the caller can tell "no" from "cannot say".
+  async fileExists(repository: string, path: string, ref?: string): Promise<boolean> {
+    const query = ref ? '?ref=' + encodeURIComponent(ref) : '';
+    try {
+      await this.call(repository, 'GET', '/contents/' + path.split('/').map(encodeURIComponent).join('/') + query);
+      return true;
+    } catch (error) {
+      if (/HTTP 404\b/.test(error.message)) return false;
+      throw error;
+    }
+  }
+
   async branchTip(repository: string, branch: string): Promise<string | null> {
     const head = await this.call(repository, 'GET', '/branches/' + encodeURIComponent(branch));
     return head?.commit?.id || null;

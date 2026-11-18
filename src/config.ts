@@ -398,6 +398,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // When a worker run on an issue ends without finishing (paused at its iteration limit, stuck, timed out) the issue is probably too big:
     // this label (the planner route, e.g. ai:plan) is added so that the planner splits it into slices. Empty: off, a human is called.
     splitLabel: env.SPLIT_LABEL?.trim() || null,
+    // TICKET_PREFLIGHT (1 by default, 0 = off): a worker's ticket with a broken Steps, Files or Acceptance section starts no run (src/agent/preflight.ts).
+    ticketPreflight: ticketPreflightOf(env.TICKET_PREFLIGHT),
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // REVERT_RETRIES (default 1, 0 = off, at most 5): after a revert of a ticket's merge is merged, the ticket is reopened and started again this many times.
@@ -481,6 +483,13 @@ function checksFromCiOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('CHECKS_FROM_CI must be 0 or 1');
+}
+
+// TICKET_PREFLIGHT: 1 (default) or 0; any other value is a mistake worth a clear message.
+function ticketPreflightOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '1') return true;
+  if (value === '0') return false;
+  throw new Error('TICKET_PREFLIGHT must be 1 or 0');
 }
 
 // FAILURE_ESCALATE: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.

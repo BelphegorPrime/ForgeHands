@@ -367,6 +367,7 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `STALL_ALERT_MINUTES` | `90` | One `stalled` notification when work waits on a quota, the disk or a limit and nothing has started for this many minutes while no run is running (0 to 10080). `0` = off. See [Status page and metrics](#status-page-and-metrics). |
 | `QUOTA_HOLD_MAX_HOURS`, `QUOTA_GIVE_UP_HOURS` | 8, 24 | Out of quota: hold a tier back at most this long at a time, and give a job up once its quota has been out this long. |
 | `SPLIT_LABEL` | none | Label (for example `ai:plan`) that sends a ticket whose worker ran out of iterations or time to the planner. |
+| `TICKET_PREFLIGHT` | `1` | `1`: a worker's ticket that breaks a rule of the [ticket pre-flight](#a-ticket-is-checked-before-a-worker-starts) starts no run; it goes to the planner (`SPLIT_LABEL`) or gets `BLOCKED_LABEL`. `0` = off. |
 | `UPDATE_BRANCHES` | on | `0` switches off keeping agent pull requests current, see [Keeping pull requests current](#keeping-pull-requests-current). |
 | `WAIT_FOR_SAME_FILES` | off | `1` makes a ticket wait for older tickets that change the same files, see [Tickets on the same files](#tickets-on-the-same-files). |
 | `BRANCH_UPDATE_DELAY_SECONDS`, `BRANCH_UPDATE_MIN_INTERVAL_MINUTES` | 60, 30 | Quiet time of the default branch before pull requests are looked at, and the least time between two updates of one pull request. |
@@ -514,6 +515,25 @@ A same-files wait is never taken when the older ticket already waits for this on
 When an epic label (`EPIC_LABEL`, e.g. `ai:plan`) is put on an issue that already has an open agent pull request (`ai/issue-<n>`), ForgeHands comments on that pull request, closes it (the branch stays) and removes the queued or waiting jobs of the issue other than the planner's, so that the slices do not build the same thing a second time. A worker run that is already running is left alone. Without forge access nothing happens; with `DRY_RUN` it is only logged.
 
 When the update reports a conflict (Forgejo and Gitea: HTTP 409) the branch **conflicts**: a route with `"on": "conflict"` starts a **conflict round**, once per tip of the default branch and counted against `MAX_ROUNDS`: rebase, resolve each conflict so that the purpose of the pull request stays and what the default branch brought in is kept, run the checks, push once with `--force-with-lease`, comment what was resolved. This is the only kind of run in which a rebase and a force push are allowed. Without a conflict route, or with the rounds used up, the pull request gets `BLOCKED_LABEL` and a mention. A pull request that was busy (an active run) when the default branch moved is looked at once when that run ends, so a conflict that arrived meanwhile is not forgotten. Forgejo reports `mergeable: false` for a pull request titled `WIP:` even without a conflict, so that field is not used; the update call is the test.
+
+### A ticket is checked before a worker starts
+
+With `TICKET_PREFLIGHT=1` (the default) an issue that starts a worker route (any route that is not a planner: not `SPLIT_LABEL`, not `EPIC_LABEL`) is checked before its run starts, at the enqueue, so a retried delivery or a comment that restarts the run is checked too. Planner runs, epics and pull requests are not checked. The ticket is read from its headings:
+
+- `Steps`: the steps of the work.
+- `Files` (or `Exact files`, the heading `WAIT_FOR_SAME_FILES` reads): the list of files, one bullet per file with the path in backticks; `(new)` on the line says that the ticket creates the file.
+- `Acceptance`: the acceptance criteria, with a fenced block that holds the command the check runs.
+
+A ticket that breaks a rule starts no run. The rules:
+
+1. Every path named in `Steps` is listed in `Files`.
+2. `Acceptance` has a fenced block with a command (no section, no block, or an empty block breaks it).
+3. The command is not a placeholder (`...`, `<command>`, `TODO`) and its quotes close. A line that starts with `#` is a comment and is not read. **Not done: running the command on the default branch to see that it fails there.** That needs a checkout of the repository, which ForgeHands does not have, and a runner to run it in; until ForgeHands has one, the command is checked as text only.
+4. Every path listed in `Files` exists on the default branch, unless its line says `new`. The read uses the forge's contents API (Forgejo and Gitea). On GitLab the check is not made, because ForgeHands has no file read for it there; the rule then does not apply.
+
+A path is a code span or a bare word with a slash that ends in an extension (`src/a.ts`). A glob (`src/*.ts`) or a folder is not checked. A forge that cannot answer rule 4 (a failed read) does not break the ticket: that file is not checked, and the log says so.
+
+The ticket then goes back to the planner: the trigger label comes off and `SPLIT_LABEL` is set, with no mention. Without `SPLIT_LABEL` the trigger label comes off, `BLOCKED_LABEL` is set and the comment mentions `HUMAN_LOGIN`, and one notification goes out. The comment names each violated rule and is written **once per revision** of the ticket (a hash of its title and body): when the label is set again without an edit, the ticket is routed again but not commented again; an edit makes a new revision, which is checked and commented as well. The once-per-revision mark is kept in the ledger. A dry run (`DRY_RUN`) writes nothing and keeps no mark.
 
 ### Epics and the order of sub-issues
 
