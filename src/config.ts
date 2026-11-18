@@ -458,6 +458,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // ForgeHands starts the revert, once, when a route of "on": "main_red" exists; without one the human is told instead.
     revertOnRed: switchDefault(env.REVERT_ON_RED, true, 'REVERT_ON_RED'),
     revertWindowMinutes: positiveInt(env.REVERT_WINDOW_MINUTES, 120, 'REVERT_WINDOW_MINUTES', 10080) as number,
+    // REVERT_RATE_ALERT (percent, default off, 0 = off): a repository whose revert rate of the last 30 days is above it gets one `failed` notice a
+    // day, once REVERT_RATE_MIN_MERGES merges (default 10) are in the window. See src/agent/revert-rate.ts.
+    revertRateAlert: revertRateAlertOf(env.REVERT_RATE_ALERT),
+    revertRateMinMerges: wholeOf(env.REVERT_RATE_MIN_MERGES, 10, 'REVERT_RATE_MIN_MERGES', 1000),
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
     // Pull requests of dependency bots (Renovate): Forgejo logins and, optionally, head branch prefixes (comma separated). They get the same
@@ -529,6 +533,14 @@ function humanReviewRoundsOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('HUMAN_REVIEW_ROUNDS must be 0 or 1');
+}
+
+// REVERT_RATE_ALERT: a percentage from 0 (off) to 100, default off; a decimal share is allowed (0.5).
+function revertRateAlertOf(value: string | undefined): number {
+  if (value === undefined || value === '') return 0;
+  const percent = Number(value);
+  if (!Number.isFinite(percent) || percent < 0 || percent > 100) throw new Error('REVERT_RATE_ALERT must be a percentage from 0 (off) to 100');
+  return percent;
 }
 
 // NUDGE_AT_PERCENT: an integer from 0 (off) to 95, default 65.

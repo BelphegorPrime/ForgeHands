@@ -196,6 +196,10 @@ export interface DirectConfig extends BaseConfig {
   revertOnRed: boolean;
   /** REVERT_WINDOW_MINUTES: how long after a merge a red default branch still counts as this merge's doing. */
   revertWindowMinutes: number;
+  /** REVERT_RATE_ALERT (percent, 0 = off): a repository whose revert rate of 30 days is above it gets one `failed` notice a day. See Dispatcher.checkRevertRate. */
+  revertRateAlert: number;
+  /** REVERT_RATE_MIN_MERGES: the revert rate alert waits until this many merges are in the 30-day window. */
+  revertRateMinMerges: number;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
   botRepos: Set<string>;
@@ -329,6 +333,10 @@ export interface MergeRecord {
   sha: string | null;
   merged_at: number;
   two_keys: boolean;
+  /** The number of the revert pull request (ai/revert-<n>) that was merged for this merge. Set once. See revert-rate.ts. */
+  reverted_by?: number;
+  /** A red default branch after this merge needed a human: no revert route, a revert that went red, or a ticket blocked after its revert. */
+  needed_human?: boolean;
 }
 
 /** A revert of a merge that turned the default branch red (REVERT_RETRIES): the original ticket, the merge, and where the revert got to. */

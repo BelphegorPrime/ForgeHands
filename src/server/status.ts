@@ -7,6 +7,9 @@ import type { WorkspaceState } from '../agent/workspace.ts';
 import type { E2eState } from '../e2e/controller.ts';
 import { holdKey } from '../agent/merge.ts';
 import { behindBlocked, blockedTickets } from '../agent/stuck.ts';
+import { revertRate } from '../agent/revert-rate.ts';
+import type { RevertRate } from '../agent/revert-rate.ts';
+import type { MergeRecord } from '../types.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -16,6 +19,8 @@ interface Run {
 }
 export interface Summary {
   merged: number; merged_without_human: number; blocked: number; split: number;
+  // The merges ForgeHands made in the window and how many of them a merged revert undid (see revert-rate.ts); ratio is 0 to 1, null without merges.
+  revert_rate: RevertRate;
   merge_seconds: { median: number | null; p90: number | null };
   rounds_per_merged: number | null; review_retries: number; error_retries: number; cost: number;
 }
@@ -76,7 +81,7 @@ const percentile = (sorted: number[], p: number): number | null => sorted.length
 // A ticket counts as merged when ForgeHands merged its pull request or saw it merged (`merged_at`), as merged without a human when ForgeHands
 // merged it and it was never handed to a human (BLOCKED_LABEL). Time to merge runs from the first run of the ticket (its trigger label).
 // Retries and cost add up over the runs created in the window.
-function summarize(config: DirectConfig, jobs: Job[], days: number, now: number): Record<string, Summary> {
+function summarize(config: DirectConfig, jobs: Job[], merges: MergeRecord[], days: number, now: number): Record<string, Summary> {
   const since = now - days * DAY_MS;
   const repos = new Map<string, Job[]>([...config.allowedRepos].map((repo): [string, Job[]] => [repo, []]));
   for (const job of jobs) {
@@ -104,6 +109,7 @@ function summarize(config: DirectConfig, jobs: Job[], days: number, now: number)
     times.sort((a, b) => a - b);
     result[repo] = {
       merged, merged_without_human: free, blocked, split,
+      revert_rate: revertRate(merges, repo, now, days * DAY_MS),
       merge_seconds: { median: percentile(times, 0.5), p90: percentile(times, 0.9) },
       rounds_per_merged: merged ? Math.round(rounds / merged * 100) / 100 : null,
       review_retries: fresh.reduce((sum, job) => sum + (job.verdict_retry || 0), 0),
@@ -278,8 +284,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const running = jobs.list('running').length;
   // A dry run starts nothing: its would-be jobs say nothing about merges or cost.
   const all = jobs.list().filter((job) => job.status !== 'dry');
-  const week = summarize(config, all, 7, now);
-  const month = summarize(config, all, 30, now);
+  const week = summarize(config, all, jobs.merges, 7, now);
+  const month = summarize(config, all, jobs.merges, 30, now);
   const tierWeek = tierStats(config, all, 7, now);
   const tierMonth = tierStats(config, all, 30, now);
   const tokensWeek = tokenStats(config, all, 7, now);
@@ -303,15 +309,17 @@ const escape = (value: unknown): string => String(value ?? '').replace(/[&<>"']/
 
 const duration = (seconds: number | null): string => seconds === null ? '-' : seconds < 5400 ? Math.round(seconds / 60) + ' min' : seconds < 172800 ? Math.round(seconds / 360) / 10 + ' h' : Math.round(seconds / 8640) / 10 + ' d';
 
-// Per repository and window: tickets merged (without a human), blocked, split; median and p90 time to merge; rounds, retries, cost.
+// Per repository and window: tickets merged (without a human), reverted merges, blocked, split; median and p90 time to merge; rounds, retries, cost.
 function renderSummary(status: Status): string {
   const rows = Object.entries(status.summary).flatMap(([repo, windows]) => [['last 7 days', windows.last_7_days], ['last 30 days', windows.last_30_days]].map(([name, s]) => {
     const sum = s as Summary;
-    return '<tr><td>' + escape(repo) + '</td><td>' + name + '</td><td>' + sum.merged + ' (' + sum.merged_without_human + ')</td><td>' + sum.blocked + '</td><td>' + sum.split + '</td><td>'
+    const reverted = sum.revert_rate.ratio === null ? '-' : sum.revert_rate.reverted + ' of ' + sum.revert_rate.merges + ' (' + Math.round(sum.revert_rate.ratio * 1000) / 10 + ' %)'
+      + (sum.revert_rate.needed_human ? ', ' + sum.revert_rate.needed_human + ' needed a human' : '');
+    return '<tr><td>' + escape(repo) + '</td><td>' + name + '</td><td>' + sum.merged + ' (' + sum.merged_without_human + ')</td><td>' + reverted + '</td><td>' + sum.blocked + '</td><td>' + sum.split + '</td><td>'
       + duration(sum.merge_seconds.median) + ' / ' + duration(sum.merge_seconds.p90) + '</td><td>' + (sum.rounds_per_merged ?? '-') + '</td><td>' + sum.review_retries + ' / ' + sum.error_retries
       + '</td><td>$' + sum.cost.toFixed(2) + '</td></tr>';
   }));
-  return '<table><tr><th>Repository</th><th>Window</th><th>Merged (no human)</th><th>Blocked</th><th>Split</th><th>Median / p90 to merge</th><th>Rounds per merged</th><th>Review / error retries</th><th>Cost</th></tr>\n' + rows.join('\n') + '</table>';
+  return '<table><tr><th>Repository</th><th>Window</th><th>Merged (no human)</th><th>Reverted merges</th><th>Blocked</th><th>Split</th><th>Median / p90 to merge</th><th>Rounds per merged</th><th>Review / error retries</th><th>Cost</th></tr>\n' + rows.join('\n') + '</table>';
 }
 
 // Per repository, tier and window: runs started and finished, the failed ones by reason, split tickets, fallback and escalated runs, and the share

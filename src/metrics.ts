@@ -4,6 +4,7 @@
 // ALLOWED_REPOS, a route kind, a tier, a fixed reason) and never carry issue or pull request numbers, so the number of series stays bounded.
 import type { DirectConfig, IdleState } from './types.ts';
 import type { JobStore } from './store/jobs.ts';
+import { revertRate } from './agent/revert-rate.ts';
 
 type Labels = Record<string, string>;
 interface Sample { name: string; labels: Labels; value: number }
@@ -38,7 +39,9 @@ const COUNTERS: Record<string, string> = {
   forgehands_deleted_tickets_total: 'Tickets or pull requests found deleted in the forge (a 404 on their own read); their waiting and queued jobs are dropped.',
   forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
   forgehands_failure_escalations_total: 'Runs that ended stuck, timed out or out of iterations (rounds), or finished twice without a delivery (issues), and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).',
-  forgehands_stuck_pr_blocks_total: 'Agent pull requests the stuck-PR watchdog blocked for a human, by reason (stuck_rounds, stuck_verdict; STUCK_PR_MINUTES).'
+  forgehands_stuck_pr_blocks_total: 'Agent pull requests the stuck-PR watchdog blocked for a human, by reason (stuck_rounds, stuck_verdict; STUCK_PR_MINUTES).',
+  forgehands_merges_reverted_total: 'Merges ForgeHands made whose revert pull request was merged, by repository (counted once per merge).',
+  forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -49,7 +52,8 @@ const GAUGES: Record<string, string> = {
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
   forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle, stuck); 0 while nothing waits.',
   forgehands_stuck_pull_requests: 'Agent pull requests blocked for a human (BLOCKED_LABEL) that tickets may wait behind, from the ledger at the scrape.',
-  forgehands_e2e_scenario_ok: '1 when the scenario held in the last end-to-end run (E2E_REPO), 0 when it failed; absent until a run.'
+  forgehands_e2e_scenario_ok: '1 when the scenario held in the last end-to-end run (E2E_REPO), 0 when it failed; absent until a run.',
+  forgehands_merges_reverted_ratio: 'Share (0 to 1) of the merges ForgeHands made in the last 30 days whose revert was merged, by repository; absent without merges in the window.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
 const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle', 'stuck'] as const;
@@ -130,7 +134,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
@@ -152,6 +156,10 @@ export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Ma
   }
   for (const reason of IDLE_REASONS) samples.push({ name: 'forgehands_idle_jobs', labels: { reason }, value: idle?.reasons[reason] ?? 0 });
   samples.push({ name: 'forgehands_stuck_pull_requests', labels: {}, value: [...jobs.stuck.values()].filter((record) => record.blocked).length });
+  for (const repo of [...config.allowedRepos].sort()) {
+    const rate = revertRate(jobs.merges, repo, now).ratio;
+    if (rate !== null) samples.push({ name: 'forgehands_merges_reverted_ratio', labels: { repository: repo }, value: rate });
+  }
   for (const tier of [...new Set([...config.routes.values()].map((route) => route.tier))].sort()) {
     samples.push({ name: 'forgehands_tier_cooldown_active', labels: { tier }, value: (cooldowns.get(tier) || 0) > now ? 1 : 0 });
   }
