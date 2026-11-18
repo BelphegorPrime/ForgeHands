@@ -53,7 +53,7 @@ function forge(state) {
   const calls = [];
   const starts = [];
   const routes = {
-    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: state.ref || 'ai/issue-26', sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })), merge_commit_sha: state.mergeSha || null }),
+    ['GET ' + API + '/pulls/34']: () => ({ state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: state.ref || 'ai/issue-26', label: state.label, sha: state.pr.head.sha }, labels: state.pr.labels.map((name) => ({ name })), merge_commit_sha: state.mergeSha || null }),
     ['GET ' + API + '/commits/' + MAIN_SHA + '/status']: () => state.mainCi || { state: 'failure', total_count: 2 },
     ['GET ' + API + '/commits/cafe0000cafe/status']: () => state.ci,
     ['GET ' + API + '/commits/beef0000beef/status']: { state: 'success', total_count: 2 },
@@ -391,4 +391,17 @@ test('revert on red: the revert pull request is an agent pull request: approved 
   assert.ok(!h.wrote().some((line) => line.startsWith('PATCH /issues/')), 'no ticket is closed for a revert');
   assert.equal(h.jobs.holds.size, 0);
   assert.equal(h.jobs.merges.at(-1).branch, 'ai/revert-34');
+});
+
+test('revert on red: a revert pull request that reports refs/pull/<n>/head is still a revert (no hold, no daily limit), named by its label', async () => {
+  const h = harness({ LABEL_ROUTES: revertRoutes(), TWO_KEYS_HOLD_MINUTES: '30', TWO_KEYS_DAILY_LIMIT: '1' }, { files: ['seed/infra/tests/a.test.ts'] });
+  h.state.ref = 'refs/pull/34/head';
+  h.state.label = 'ai/revert-34';
+  merged34(h, { ago: 300 });
+  h.jobs.merges.push({ repository: repo.toLowerCase(), number: 40, branch: 'ai/issue-30', sha: 'a'.repeat(40), merged_at: clock - MINUTE, two_keys: true });
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged');
+  assert.ok(h.wrote().includes('POST /pulls/34/merge'));
+  assert.ok(!h.wrote().some((line) => line.startsWith('PATCH /issues/')), 'no ticket is closed for a revert');
+  assert.equal(h.jobs.holds.size, 0);
+  assert.equal(h.jobs.merges.at(-1).branch, 'ai/revert-34', 'the ledger keeps the branch name, not the pull request ref');
 });

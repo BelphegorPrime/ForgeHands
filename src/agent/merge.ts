@@ -1,6 +1,6 @@
 import { createForge, createTransport } from '../forge/index.ts';
 import { DryLog } from '../dry.ts';
-import { isBotPull, REVERT_BRANCH } from './bot.ts';
+import { isBotPull, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { metrics } from '../metrics.ts';
 import { NO_NOTIFY, mentionOf, pullUrl } from '../notify/index.ts';
 import { immediateMessage } from '../notify/texts.ts';
@@ -119,10 +119,10 @@ export class Merger {
       if (!pr || pr.state !== 'open' || pr.merged) return 'not_open';
       // Judged from the pull request as Forgejo has it now, not from the event: an agent branch, or a pull request of a listed bot.
       const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
-      if (!bot && !/^ai\/issue-\d+$/.test(pr.head?.ref || '')) return 'not_an_agent_branch';
+      if (!bot && !/^ai\/issue-\d+$/.test(pullBranch(pr))) return 'not_an_agent_branch';
       const sha = pr.head.sha;
       // A revert pull request (REVERT_ON_RED) is an agent pull request as any other, but skips the hold and the daily limit.
-      const revert = REVERT_BRANCH.test(pr.head.ref || '');
+      const revert = REVERT_BRANCH.test(pullBranch(pr));
       const labels = (pr.labels || []).map((label: Json) => label.name);
       // The approval label (comment mode, or a human's) is a claim; native reviews need no label, they are the proof themselves.
       const labelled = labels.includes(this.config.approvedLabel);
@@ -139,7 +139,7 @@ export class Merger {
         return 'awaiting_review';
       }
       if (!review.ok) {
-        this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'blocked');
+        this.note(this.ticketOf(repository, number, bot ? null : pullBranch(pr)), 'blocked');
         await this.rejectApproval(repository, number, sha, review.reason, pr);
         return metrics.refused('no_valid_review');
       }
@@ -186,14 +186,14 @@ export class Merger {
       }
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
-      await this.recordMerge(repository, number, pr.head.ref, twoKeys);
-      this.note(this.ticketOf(repository, number, bot ? null : pr.head.ref), 'merged');
+      await this.recordMerge(repository, number, pullBranch(pr), twoKeys);
+      this.note(this.ticketOf(repository, number, bot ? null : pullBranch(pr)), 'merged');
       const checks = ci === 'no_ci' ? 'there is no CI in this repository' : 'CI green';
       await this.remark(repository, number, twoKeys ? 'merged: approved by the reviewer and the security review, ' + checks + '; the protected paths it touches are configured for two keys.'
         : 'merged: approved by the reviewer, ' + checks + ', no protected path touched.');
       // A bot's pull request belongs to no ticket: there is nothing to close.
       if (bot) return 'merged';
-      const issue = Number(/^ai\/issue-(\d+)$/.exec(pr.head.ref)![1]);
+      const issue = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))![1]);
       try { await this.forge.closeIssue(repository, issue); }
       catch (error) { this.logger.error('could not close issue #' + issue + ':', error.message); }
       return 'merged';
