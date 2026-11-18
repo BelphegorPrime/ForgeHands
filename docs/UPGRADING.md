@@ -299,3 +299,12 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - Tickets are filed once per point while they are open, and not again for 14 days after one was closed. Forges without issue creation (GitLab) file nothing and log that once.
 - The ledger gains `findings` (30 days) and `filed_findings` (kept while needed). The previous version ignores both.
 - Rollback: unset `RECURRING_REASON_MIN` (or set `0`). Tickets already filed stay where they are.
+
+# Upgrading to the version after 0.9.9: the watchdog sees WIP pull requests, revert pull requests and conflicts
+
+The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull requests in three cases. A pull request titled `WIP:` (every agent pull request until it is merged) was skipped when Forgejo reports it as a draft (its `draft` field follows the `WIP:` title), so a NOT OK pull request could stand still unseen for ever. Revert pull requests (`ai/revert-<n>`) were never looked at. A pull request that Forgejo reports as not mergeable was not stuck, however long it waited. This release fixes the three. It changes no variable and no default.
+
+- **What changes without a switch.** Agent pull requests with a `WIP:` title are swept and watched even when Forgejo reports them as drafts. A draft without the WIP marker is still left alone. Revert pull requests are watched and, when the revert ledger has their original merge, their ticket is marked on the status page. A conflicting pull request with no run queued or running is blocked after `STUCK_PR_MINUTES` (reason `stuck_conflict`); a conflict round that is queued or running keeps it out.
+- **Expect more blocks, once.** A pull request that was stuck before this release is blocked by the next pass after the grace (when it has been seen for `STUCK_PR_MINUTES`). One comment and one notification per head and reason, as before.
+- **Metrics.** `forgehands_stuck_pr_blocks_total` has a new reason `stuck_conflict`.
+- **Rollback.** Go back to 0.9.9. Revert pull requests and drafts are then unwatched again. Set `STUCK_PR_MINUTES=0` to switch the watchdog off, which also keeps the new conflict blocks from starting.

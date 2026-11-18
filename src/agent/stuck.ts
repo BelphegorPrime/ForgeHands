@@ -10,7 +10,8 @@ export const stuckKey = (repository: string, number: number): string => reposito
 // The tickets ("repo#issue", lower case) whose pull request is blocked now.
 export function blockedTickets(records: Map<string, StuckRecord>): Set<string> {
   const tickets = new Set<string>();
-  for (const record of records.values()) if (record.blocked) tickets.add(record.repository.toLowerCase() + '#' + record.issue);
+  // A revert pull request without a ticket (issue 0) blocks no ticket.
+  for (const record of records.values()) if (record.blocked && record.issue > 0) tickets.add(record.repository.toLowerCase() + '#' + record.issue);
   return tickets;
 }
 

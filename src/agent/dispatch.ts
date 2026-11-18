@@ -183,7 +183,7 @@ export class Dispatcher {
     // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
       block: (event, text, why) => this.markForHuman(event, text, why),
-      rounds: (repository, issue) => this.rounds({ repository: { full_name: repository }, issue: { number: issue } } as ForgeEvent)
+      rounds: (event) => this.rounds(event)
     });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });

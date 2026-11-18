@@ -25,7 +25,8 @@ const QUOTED_LINES = 3;
 // What the stuck-PR watchdog needs from the dispatcher: the way to hand a pull request to a human (markForHuman), and the rounds the ledger counts.
 export interface StuckHooks {
   block: (event: ForgeEvent, text: string, why: string) => Promise<void>;
-  rounds: (repository: string, issue: number) => number;
+  // The follow-up rounds the ledger counts for the event's pull request (its ticket, or its own key for a bot or revert pull request).
+  rounds: (event: ForgeEvent) => number;
 }
 
 // The reconciler of REVIEW_SWEEP_MINUTES. A review is started by a green commit (webhook) or by a finished round; when an event is lost or
@@ -141,7 +142,7 @@ export class ReviewSweep {
   // Is this an agent pull request (ai/issue-<n>, in the repository itself), a revert pull request, or a bot pull request the config lets through?
   // Labels that already say something (approved, changes, blocked, hold), a draft, a head from a fork, or a pull request too old: no.
   candidate(repository: string, pr: Json): { issue: number; bot: boolean } | null {
-    if (!pr || pr.state !== 'open' || pr.merged || pr.draft === true || typeof pr.head?.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(pr.head.sha)) return null;
+    if (!pr || pr.state !== 'open' || pr.merged || this.isDraft(pr) || typeof pr.head?.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(pr.head.sha)) return null;
     if (!Number.isSafeInteger(pr.number) || pr.number <= 0) return null;
     const ref = pullBranch(pr);
     if (typeof pr.head?.repo?.full_name === 'string' && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return null;
@@ -154,6 +155,13 @@ export class ReviewSweep {
     const bots = { authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos };
     if (REVERT_BRANCH.test(ref) || isBotPull(bots, pr, repository)) return { issue: pr.number, bot: true };
     return null;
+  }
+
+  // A draft in the sense of the forge's own mark. Forgejo's `draft` follows a `WIP:` title, and every agent pull request keeps its WIP title until
+  // it is merged (merge.ts strips it then). So a draft with a WIP title is the normal state of an agent pull request, and is watched and swept;
+  // a draft by the author (no WIP marker) is left alone.
+  isDraft(pr: Json): boolean {
+    return pr.draft === true && !this.forge.isWip(String(pr.title || ''));
   }
 
   // Busy: a job of this pull request (or of its issue) is waiting, queued or running; or the head already has a review or a security review in the
@@ -215,11 +223,14 @@ export class ReviewSweep {
     }
   }
 
-  // One pull request of the watchdog. Returns true when the ledger's stuck records changed.
+  // One pull request of the watchdog. Returns true when the ledger's stuck records changed. An agent pull request (ai/issue-<n>) has its ticket
+  // n; a revert pull request (ai/revert-<n>, see REVERT_BRANCH) has the ticket of the original pull request from the revert ledger, or none (0).
   async watchOne(repository: string, pr: Json, now: number): Promise<boolean> {
-    if (!pr || pr.state !== 'open' || pr.merged || pr.draft === true) return false;
-    const agent = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
-    if (!agent || !Number.isSafeInteger(pr.number) || pr.number <= 0) return false;
+    if (!pr || pr.state !== 'open' || pr.merged || this.isDraft(pr)) return false;
+    const branch = pullBranch(pr);
+    const agent = /^ai\/issue-(\d+)$/.exec(branch);
+    if (!agent && !REVERT_BRANCH.test(branch)) return false;
+    if (!Number.isSafeInteger(pr.number) || pr.number <= 0) return false;
     if (typeof pr.head?.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(pr.head.sha)) return false;
     if (typeof pr.head?.repo?.full_name === 'string' && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return false;
     const created = Date.parse(pr.created_at || '');
@@ -227,7 +238,8 @@ export class ReviewSweep {
     const names = (Array.isArray(pr.labels) ? pr.labels : []).map((label: Json) => label?.name);
     // An approval or a hold is somebody's decision (the merger's, or the operator's): the watchdog keeps out of it.
     if ([this.config.approvedLabel, this.config.holdLabel].some((name) => names.includes(name))) return false;
-    const issue = Number(agent[1]);
+    const issue = agent ? Number(agent[1]) : (this.revertTicket(repository, pr.number) ?? 0);
+    const event = this.stuckEvent(repository, pr, issue, !agent);
     const sha = pr.head.sha.toLowerCase();
     const key = stuckKey(repository, pr.number);
     let record = this.jobs.stuck.get(key);
@@ -244,7 +256,7 @@ export class ReviewSweep {
       record.eligible_at = now + this.config.stuckPrMinutes * MINUTE_MS;
       changed = true;
     }
-    const reason = await this.stuckReason(repository, pr, issue, sha);
+    const reason = await this.stuckReason(repository, pr, event, sha);
     if (!reason) {
       if (record) this.jobs.stuck.delete(key);
       return changed || !!record;
@@ -260,27 +272,45 @@ export class ReviewSweep {
     record.blocked_at = now;
     metrics.inc('forgehands_stuck_pr_blocks_total', { reason });
     this.logger.error(repository + '#' + pr.number + ': stuck (' + reason + ') at head ' + sha.slice(0, 7) + ', blocking it for a human');
-    await this.hooks.block(this.stuckEvent(repository, pr, issue), await this.stuckText(repository, pr, issue, sha, reason), reason);
+    await this.hooks.block(event, await this.stuckText(repository, pr, event, sha, reason), reason);
     return true;
   }
 
-  // Why the pull request is stuck now, or null: a run queued or running on it or its issue says it moves on; no verdict on the head says nothing
-  // was decided. A verdict that approves it is the merger's business.
-  async stuckReason(repository: string, pr: Json, issue: number, sha: string): Promise<'stuck_rounds' | 'stuck_verdict' | null> {
-    if (this.activeOn(repository, pr.number, repository.toLowerCase() + '#' + issue)) return null;
+  // The ticket (issue number) of a revert pull request, from the revert ledger; null when the ledger has no record of it.
+  revertTicket(repository: string, number: number): number | null {
+    const name = repository.toLowerCase();
+    const record = this.jobs.reverts.find((entry) => entry.repository.toLowerCase() === name && entry.number === number);
+    return record && Number.isSafeInteger(record.issue) && record.issue > 0 ? record.issue : null;
+  }
+
+  // Why the pull request is stuck now, or null. A run queued, waiting or running on it (or on its ticket) says it moves on. Otherwise, in this order:
+  // (a) the rounds are used up and the latest verdict on the head is not OK (`stuck_rounds`); (b) Forgejo reports a merge conflict with the default
+  // branch and no conflict round is on its way (`stuck_conflict`); (c) the latest verdict says NOT OK or asks for changes (`stuck_verdict`).
+  // No verdict and no conflict says nothing was decided, so the pull request is left alone. An approval that is not merged yet is the merger's business.
+  async stuckReason(repository: string, pr: Json, event: ForgeEvent, sha: string): Promise<'stuck_rounds' | 'stuck_verdict' | 'stuck_conflict' | null> {
+    const name = repository.toLowerCase();
+    const issueKey = event.bot ? name + '!pr' + pr.number : name + '#' + event.issue.number;
+    if (this.activeOn(repository, pr.number, issueKey)) return null;
     const verdict = await this.merger.reviewOf(repository, pr.number, sha);
-    if (verdict.ok || !verdict.reason || verdict.reason === 'none') return null;
-    if (this.hooks.rounds(repository, issue) >= this.config.maxRounds) return 'stuck_rounds';
-    return verdict.reason === 'not_ok' || verdict.reason === 'changes_requested' ? 'stuck_verdict' : null;
+    const decided = !verdict.ok && !!verdict.reason && verdict.reason !== 'none';
+    if (decided && this.hooks.rounds(event) >= this.config.maxRounds) return 'stuck_rounds';
+    if (pr.mergeable === false) return 'stuck_conflict';
+    return decided && (verdict.reason === 'not_ok' || verdict.reason === 'changes_requested') ? 'stuck_verdict' : null;
   }
 
   // The words of the comment: the reason, and the first lines of the last verdict on the head (quoted). The mention is added by markForHuman.
-  async stuckText(repository: string, pr: Json, issue: number, sha: string, reason: string): Promise<string> {
+  async stuckText(repository: string, pr: Json, event: ForgeEvent, sha: string, reason: string): Promise<string> {
     const short = sha.slice(0, 8);
     const minutes = this.config.stuckPrMinutes;
+    // The ticket of the pull request: an agent's issue, a revert's original ticket, or none (0).
+    const issue = event.issue.number;
+    const subject = issue ? 'issue #' + issue : 'this pull request';
+    const rounds = this.hooks.rounds(event);
     const why = reason === 'stuck_rounds'
-      ? 'the follow-up rounds for issue #' + issue + ' are used up (' + this.hooks.rounds(repository, issue) + '/' + this.config.maxRounds + ') and commit ' + short + ' has a review that does not approve it'
-      : 'the latest review of commit ' + short + ' says NOT OK, no run is queued or running for issue #' + issue + ', and nothing has changed for ' + minutes + ' minutes';
+      ? 'the follow-up rounds for ' + subject + ' are used up (' + rounds + '/' + this.config.maxRounds + ') and commit ' + short + ' has a review that does not approve it'
+      : reason === 'stuck_conflict'
+        ? 'commit ' + short + ' conflicts with ' + (event.repository.default_branch || 'the default branch') + ' (Forgejo says it is not mergeable), and no run is queued or running on it'
+        : 'the latest review of commit ' + short + ' says NOT OK, no run is queued or running for ' + subject + ', and nothing has changed for ' + minutes + ' minutes';
     let quote = '';
     try {
       const lines = await this.merger.verdictLines(repository, pr.number, sha);
@@ -292,11 +322,12 @@ export class ReviewSweep {
       + ', lets ForgeHands look at it again.';
   }
 
-  // The event the watchdog hands to the dispatcher: the pull request and its issue, as a sweep event carries them (no run is started by it).
-  stuckEvent(repository: string, pr: Json, issue: number): ForgeEvent {
+  // The event the watchdog hands to the dispatcher: the pull request and its ticket, as a sweep event carries them (no run is started by it).
+  // A bot or revert pull request (`bot`) has no ticket of its own: its ledger key is "repo!pr<n>", as for any bot pull request.
+  stuckEvent(repository: string, pr: Json, issue: number, bot: boolean): ForgeEvent {
     const base = pr.base?.repo || {};
     return {
-      type: 'ci.success', source: this.forge.kind, action: 'stuck',
+      type: 'ci.success', source: this.forge.kind, action: 'stuck', ...(bot ? { bot: true } : {}),
       repository: { full_name: repository, clone_url: base.clone_url || null, html_url: base.html_url || null, default_branch: base.default_branch || null },
       issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: '', html_url: pr.html_url || null, comments: 0, labels: [] },
       pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
