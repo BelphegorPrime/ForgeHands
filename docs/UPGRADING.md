@@ -287,3 +287,13 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - The result of the last run is kept in the ledger (`meta.e2e` in `jobs.json`). A version the ledger has a run for does not run again at a start, so an upgrade with `E2E_ON_START=1` runs the suite once, after which a restart of the same version runs nothing.
 - The cleanup restores the default branch with commits (the forge's REST API cannot move a branch pointer): the test repository's history grows by a commit per changed file in each run, and CI runs on them. This is why the repository must be a test repository.
 - Rollback: unset `E2E_REPO` (or go back to the previous version). The ledger's `meta.e2e` is ignored by the previous version.
+
+# Upgrading to the version after 0.9.8: recurring findings become check tickets (off by default)
+
+**A new feature, nothing changes until you switch it on.** When the same correction of the reviewer comes back, ForgeHands can now file one ticket that asks for a deterministic check (a lint rule, a test or a type constraint) instead of another line of prompt. See README, "Recurring findings become checks".
+
+- Nothing to set: `RECURRING_REASON_MIN` defaults to `0`, so nothing is read, counted or filed, and the ledger gains no records until a changes round runs with the variable on.
+- To use it, set `RECURRING_REASON_MIN=3` (50 at most). A NOT OK point of a changes round counts once per pull request head and repository; the third one within 14 days files `Make this a check: <point>` in that repository, labelled with `SPLIT_LABEL` when it is set (the planner route). Without `SPLIT_LABEL` the ticket gets a comment that mentions `HUMAN_LOGIN`.
+- Tickets are filed once per point while they are open, and not again for 14 days after one was closed. Forges without issue creation (GitLab) file nothing and log that once.
+- The ledger gains `findings` (30 days) and `filed_findings` (kept while needed). The previous version ignores both.
+- Rollback: unset `RECURRING_REASON_MIN` (or set `0`). Tickets already filed stay where they are.
