@@ -37,7 +37,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_wait_cycles_broken_total: 'Same-files waits not taken, or dropped, because the older ticket already waits for this one (a cycle of waits).',
   forgehands_deleted_tickets_total: 'Tickets or pull requests found deleted in the forge (a 404 on their own read); their waiting and queued jobs are dropped.',
   forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
-  forgehands_failure_escalations_total: 'Rounds that ended stuck, timed out or out of iterations and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
+  forgehands_failure_escalations_total: 'Runs that ended stuck, timed out or out of iterations (rounds), or finished twice without a delivery (issues), and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',

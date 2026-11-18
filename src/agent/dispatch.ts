@@ -44,7 +44,7 @@ const PAUSE_MESSAGE = 'The run was interrupted (the agent server was restarted o
 // A continued run is given this long before its state counts again: the state it stopped in may still be reported for a moment.
 const RESUME_SETTLE_MS = 60000;
 // Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
-// `no_delivery` is not one of them: it is only ever reported for issue runs, which have no escalate_to.
+// `no_delivery` is not one of them: an issue run that ends empty twice is escalated by checkDelivery instead (once, when its route has escalate_to).
 const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
 // Nudge (NUDGE_AT_PERCENT): a run's actions are counted at most once a minute, and not before the run is three minutes old.
 const NUDGE_CHECK_EVERY_MS = 60000;
@@ -599,8 +599,11 @@ export class Dispatcher {
   // and after the start. A round whose route has "escalate_to" runs with the profile and tier of that route from ESCALATE_FROM_ROUND on.
   escalationTarget(job: Job): Route | undefined {
     const own = this.config.routes.get(job.label);
-    if (!own?.escalateTo || !job.event.pull_request || !ROUND_KINDS.has(own.kind)) return undefined;
+    if (!own?.escalateTo) return undefined;
     const target = this.config.routes.get(own.escalateTo);
+    // An issue run is escalated only by checkDelivery (no delivery twice): from then on the job is `escalated` and runs on the target.
+    if (!job.event.pull_request) return own.kind === 'issue' && job.escalated ? target : undefined;
+    if (!ROUND_KINDS.has(own.kind)) return undefined;
     if (job.escalated) return target;
     const base = this.issueKey(job.event) + ':';
     const all = this.jobs.list();
@@ -1206,12 +1209,25 @@ export class Dispatcher {
         this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
         return;
       }
+      if (this.escalateDelivery(job)) return;
       Object.assign(job, { status: 'failed', result: 'no_delivery' });
       this.tierRunEnded(job, 'no_delivery');
       await this.reportFailure(job, 'no_delivery');
     } catch (error) {
       this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
     }
+  }
+
+  // The second empty run of an issue whose route has escalate_to starts once more on the profile of that route (FAILURE_ESCALATE), on the same
+  // ticket: a fresh run, `escalated` and `escalated_after` no_delivery. It is counted as the escalation and the target's tier like any escalated
+  // run. The escalated run keeps delivery_retry, so when it also ends empty the human is called at once (no third run). Returns true when queued.
+  escalateDelivery(job: Job): boolean {
+    const route = this.config.routes.get(job.label);
+    if (!this.config.failureEscalate || !route?.escalateTo || job.escalated) return false;
+    Object.assign(job, { status: 'queued', escalated: true, failure_escalation: true, escalated_after: 'no_delivery', started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
+    metrics.inc('forgehands_failure_escalations_total');
+    this.logger.error(job.key + ': no delivery twice, starting once more on ' + route.escalateTo);
+    return true;
   }
 
   // A worker on a ticket that blocks another (the parent, where its report belongs) may deliver by a comment of the agent on that parent. Returns

@@ -504,8 +504,8 @@ async function buildWatched(extra) {
 
 // A worker run that "finishes" without delivering anything is not a delivery.
 let deliveryRuns = 0;
-async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready', routes = {}, logger = quiet } = {}) {
-  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel' }));
+async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready', routes = {}, logger = quiet, extra = {} } = {}) {
+  const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', ...extra }));
   const jobs = new JobStore(join(dir, 'delivery-' + (deliveryRuns++) + '.json'));
   await jobs.load();
   const forgejo = fakeForgejo({
@@ -535,6 +535,65 @@ test('a worker run that finishes without a pull request or a comment is run once
   assert.equal(t.job.status, 'failed');
   assert.equal(t.job.result, 'no_delivery');
   assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, so nothing was delivered\./);
+});
+
+// An issue route with escalate_to: the second empty run starts once more on the target profile; only that run being empty too calls the human.
+const DELIVERY_ROUTES = JSON.stringify({
+  'ai:ready': { profile: WORKER, tier: 'free', escalate_to: 'ai:escalate' },
+  'ai:escalate': { profile: ESCALATE, tier: 'strong' }
+});
+
+test('an issue run that finishes twice without a delivery starts once more on the escalate_to profile, and the human is called only if that run is empty too', async () => {
+  const t = await buildDelivery({ extra: { LABEL_ROUTES: DELIVERY_ROUTES } });
+  await t.end();
+  assert.equal(t.job.escalated, undefined, 'the first empty run is only run once more, on the same profile');
+  assert.equal(starts().at(-1).body.agent_profile_id, WORKER);
+  await t.end();
+  assert.equal(t.job.escalated, true, 'the second empty run escalates');
+  assert.equal(t.job.escalated_after, 'no_delivery');
+  assert.equal(t.job.failure_escalation, true);
+  assert.equal(t.job.status, 'running', 'a fresh run, started in the same pass');
+  assert.equal(t.job.result, undefined);
+  assert.equal(t.dispatcher.tierOf(t.job), 'strong', 'the escalated run counts for the tier it runs on');
+  assert.equal(starts().length, 3);
+  assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE);
+  assert.deepEqual(t.comments(), [], 'no notice to the human yet');
+  await t.end();
+  assert.equal(t.job.status, 'failed');
+  assert.equal(t.job.result, 'no_delivery');
+  assert.equal(starts().length, 3, 'no third run');
+  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, so nothing was delivered\./);
+});
+
+test('a pull request opened by the escalated run is its delivery', async () => {
+  const pulls = [];
+  const t = await buildDelivery({ pulls, extra: { LABEL_ROUTES: DELIVERY_ROUTES } });
+  await t.end();
+  await t.end();
+  assert.equal(t.job.escalated, true);
+  pulls.push({ number: 5, head: { ref: 'ai/issue-26' }, updated_at: new Date(clock + 60000).toISOString(), state: 'open', merged: false });
+  await t.end();
+  assert.equal(t.job.status, 'done');
+  assert.equal(t.job.result, 'finished');
+  assert.deepEqual(t.comments(), []);
+});
+
+test('without FAILURE_ESCALATE=0 an issue run with escalate_to that is empty twice goes to the human at once, and so does a route without escalate_to', async () => {
+  const off = await buildDelivery({ extra: { LABEL_ROUTES: DELIVERY_ROUTES, FAILURE_ESCALATE: '0' } });
+  await off.end();
+  await off.end();
+  assert.equal(off.job.result, 'no_delivery');
+  assert.equal(off.job.escalated, undefined);
+  assert.equal(starts().length, 2, 'two runs, both on the own profile');
+  assert.equal(starts().every((call) => call.body.agent_profile_id === WORKER), true);
+  calls = [];
+  const plain = await buildDelivery();
+  await plain.end();
+  await plain.end();
+  assert.equal(plain.job.result, 'no_delivery');
+  assert.equal(plain.job.escalated, undefined, 'no escalate_to, no escalation');
+  assert.equal(starts().length, 2);
+  assert.equal(starts().every((call) => call.body.agent_profile_id === WORKER), true);
 });
 
 test('a pull request or a comment since the run began, a closed issue or an epic is a delivery or needs none', async () => {
@@ -2471,7 +2530,8 @@ test('escalate_to has to name another configured route, on a round route', () =>
   assert.equal(loadConfig(env(withChanges())).routes.get('ai:changes').escalateTo, null);
   assert.throws(() => loadConfig(env(escalating({}, { escalate_to: 'ai:nope' }))), /escalate_to/);
   assert.throws(() => loadConfig(env(escalating({}, { escalate_to: 'ai:changes' }))), /escalate_to/);
-  assert.throws(() => loadConfig(env(withChanges({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, escalate_to: 'ai:escalate' }, 'ai:escalate': { profile: ESCALATE } }) }))), /round/);
+  assert.equal(loadConfig(env(withChanges({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, escalate_to: 'ai:escalate' }, 'ai:escalate': { profile: ESCALATE } }) }))).routes.get('ai:ready').escalateTo, 'ai:escalate', 'an issue route may escalate');
+  assert.throws(() => loadConfig(env(withChanges({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, on: 'main_red', escalate_to: 'ai:escalate' }, 'ai:escalate': { profile: ESCALATE } }) }))), /round/);
   assert.equal(loadConfig(env(escalating())).escalateFromRound, 3);
   assert.equal(loadConfig(env(escalating({ ESCALATE_FROM_ROUND: '2' }))).escalateFromRound, 2);
   assert.throws(() => loadConfig(env(escalating({ ESCALATE_FROM_ROUND: '4' }))), /ESCALATE_FROM_ROUND/);

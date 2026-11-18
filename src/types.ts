@@ -140,7 +140,7 @@ export interface DirectConfig extends BaseConfig {
   /** PAUSE_RESUMES: how often a run that was paused (an interruption: an OpenHands restart, or a stop of the operator) continues on its own conversation.
    * Its own budget, apart from RESUME_ATTEMPTS; 0 switches the resume off (the run is then handed to the human, never split). */
   pauseResumes: number;
-  /** FAILURE_ESCALATE: a round that is still stuck, timed out or out of iterations then starts once more on the profile of its escalate_to route (once per head commit); 0 switches it off. */
+  /** FAILURE_ESCALATE: a round that is still stuck, timed out or out of iterations then starts once more on the profile of its escalate_to route (once per head commit); so does an issue run that finished twice without a delivery. 0 switches it off. */
   failureEscalate: boolean;
   quotaHoldMaxMs: number;
   quotaGiveUpMs: number;
@@ -363,8 +363,8 @@ export interface Job {
   resume_pending?: boolean;
   /** PAUSE_RESUMES: how often the run was continued after it was paused (its own budget, counted apart from `resumes`). */
   pause_resumes?: number;
-  /** Stage B (FAILURE_ESCALATE): a fresh run of a round on the profile of its escalate_to route, started after `escalated_after` (the state the run stopped in).
-   * It is not a follow-up round: it does not count against MAX_ROUNDS. */
+  /** Stage B (FAILURE_ESCALATE): a fresh run of a round on the profile of its escalate_to route, started after `escalated_after` (the state the run stopped in,
+   * or `no_delivery` for an issue run that finished twice without a delivery). It is not a follow-up round: it does not count against MAX_ROUNDS. */
   failure_escalation?: boolean;
   escalated_after?: string;
   /** Label of the fallback route whose profile and tier this run started with, because the tier of its own route was on a quota hold. */

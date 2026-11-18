@@ -48,7 +48,8 @@ function parseRoutes(text: string): Map<string, Route> {
       maxConcurrent: route.max_concurrent === undefined ? null : positiveInt(route.max_concurrent, null, 'max_concurrent of ' + label, 100) as number,
       // "on": "pull_request" makes the route fire for a label on the pull request of an issue (branch ai/issue-<n>).
       kind: (['pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'].includes(route.on) ? route.on : 'issue') as RouteKind,
-      // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route.
+      // "escalate_to": "<label of another route>": the last round (see ESCALATE_FROM_ROUND) runs with the profile and tier of that route; an issue
+      // route's worker that ends empty twice (no pull request, no comment) runs once more there before a human is called (see checkDelivery).
       escalateTo: route.escalate_to === undefined ? null : String(route.escalate_to),
       // "fallback_to": "<label of another route>": while the tier of this route is out of quota, jobs start with the profile and tier of that route.
       fallbackTo: route.fallback_to === undefined ? null : String(route.fallback_to),
@@ -64,7 +65,7 @@ function parseRoutes(text: string): Map<string, Route> {
   }
   for (const [label, route] of routes) {
     if (route.escalateTo === null) continue;
-    if (!['pull_request', 'ci_failure', 'conflict'].includes(route.kind)) throw new Error('LABEL_ROUTES entry ' + label + ': escalate_to only applies to a route that is a round (on: pull_request, ci_failure or conflict)');
+    if (!['pull_request', 'ci_failure', 'conflict', 'issue'].includes(route.kind)) throw new Error('LABEL_ROUTES entry ' + label + ': escalate_to only applies to a route that is a round (on: pull_request, ci_failure or conflict) or an issue route (no on)');
     if (route.escalateTo === label || !routes.has(route.escalateTo)) throw new Error('LABEL_ROUTES entry ' + label + ': escalate_to must name another configured route');
   }
   return routes;
