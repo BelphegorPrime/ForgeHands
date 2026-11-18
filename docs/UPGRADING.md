@@ -256,3 +256,14 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 
 - **What to check.** The first pass after the upgrade blocks the pull requests with rounds used up at once, and the ones with a NOT OK verdict once the grace has run from that first look; each gets one comment and one notification. A pull request you want to keep moving: remove `BLOCKED_LABEL` (it is eligible again after the grace) or push a commit. Pull requests you parked on purpose have `ai:hold` or `ai:approved`, which the watchdog leaves alone. The watchdog runs with the review sweep, so `REVIEW_SWEEP_MINUTES=0` switches it off as well. The review sweep reads at most 50 open pull requests per repository; a pull request beyond that page is not looked at by the watchdog.
 - **Rollback.** Set `STUCK_PR_MINUTES=0`: no new blocks and no chain marks. The last-round check has no switch; to undo it, run the previous version. The ledger gains `stuck`, which the previous version ignores.
+
+# Upgrading to the release with CHECKS_FROM_CI: checks from the forge
+
+Review runs now get the forge's check result of their head as data (`ForgeHands check facts`), and a verdict of OK is not accepted while the head's check is a failure.
+
+- **The switch is `CHECKS_FROM_CI`, default `1`.** Set `CHECKS_FROM_CI=0` to restore the old prompts and verdicts. Any other value stops the start with `CHECKS_FROM_CI must be 0 or 1`.
+- **One extra read per review run and per verdict.** The commit status of the head is read again (one call), and a repository without a check report gets one more call for the workflow folder, as with `REVIEW_WITHOUT_CI`.
+- **A failed head gets no OK.** A pull request whose head check failed is refused at the merge gate as `ci_not_green`, even with an approving review or a verdict comment. Before, the same refusal came from the merge gate's own CI check; the difference is that a review of such a head is no longer accepted either.
+- **A repository without CI is reported once.** A notice (kind `checks`) per repository and process; it is sent only when `NOTIFY_IMMEDIATE` names `checks`. The review is not held back.
+- **Not covered.** Check names come only from what the forge reports; step names of a failed job are not read. ForgeHands does not run the repository's check command; `.forgehands.yaml` is a planned format, see the README.
+- **Rollback.** Set `CHECKS_FROM_CI=0`, or go back to the previous version (it ignores the variable).

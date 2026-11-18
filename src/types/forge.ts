@@ -46,8 +46,11 @@ export interface Issue {
 
 export interface Comment { created_at: string; body: string; user?: { login?: string } }
 
-/** The combined status of a commit: `state` is success, pending, failure or error; `total_count` is how many checks report. */
-export interface CommitStatus { state: string; total_count: number }
+/**
+ * The combined status of a commit: `state` is success, pending, failure or error; `total_count` is how many checks report. `statuses` names
+ * them when the forge says (Forgejo: `context` is the workflow and job, `status` the state of that check).
+ */
+export interface CommitStatus { state: string; total_count: number; statuses?: { context?: string; status?: string; state?: string }[] }
 
 export interface ChangedFile { filename: string; previous_filename?: string }
 

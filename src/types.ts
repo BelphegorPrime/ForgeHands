@@ -39,7 +39,7 @@ export interface MergeRule {
 }
 
 export type NotifyLanguage = 'en' | 'de';
-export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled'] as const;
+export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled', 'checks'] as const;
 
 /** What holds the queued and waiting jobs back, counted per job (see Dispatcher.idleCounts). `could_start`: a job that could start and did not. */
 export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number; /** waiting jobs of a dependency cycle (no way out by itself) */ cycle: number; /** waiting jobs that wait, directly or transitively, behind a blocked pull request (see stuck.ts) */ stuck: number }
@@ -125,6 +125,8 @@ export interface DirectConfig extends BaseConfig {
   updateBranches: boolean;
   /** REVIEW_WITHOUT_CI: a pull request in a repository without any workflow file is reviewed without waiting for a green CI run. */
   reviewWithoutCi: boolean;
+  /** CHECKS_FROM_CI: the forge's check result of the head is given to the reviewer as data, and a failed head never gets an OK verdict (see agent/checks.ts). */
+  checksFromCi: boolean;
   waitForSameFiles: boolean;
   branchUpdateDelayMs: number;
   branchUpdateMinIntervalMs: number;
