@@ -37,7 +37,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_wait_cycles_broken_total: 'Same-files waits not taken, or dropped, because the older ticket already waits for this one (a cycle of waits).',
   forgehands_deleted_tickets_total: 'Tickets or pull requests found deleted in the forge (a 404 on their own read); their waiting and queued jobs are dropped.',
   forgehands_nudges_total: 'Worker runs that used much of their iteration limit without a pushed branch and were told to stop exploring and push (NUDGE_AT_PERCENT), by route kind.',
-  forgehands_failure_escalations_total: 'Runs that ended stuck, timed out or out of iterations (rounds), or finished twice without a delivery (issues), and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).'
+  forgehands_failure_escalations_total: 'Runs that ended stuck, timed out or out of iterations (rounds), or finished twice without a delivery (issues), and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).',
+  forgehands_stuck_pr_blocks_total: 'Agent pull requests the stuck-PR watchdog blocked for a human, by reason (stuck_rounds, stuck_verdict; STUCK_PR_MINUTES).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -46,10 +47,11 @@ const GAUGES: Record<string, string> = {
   forgehands_workspace_disk_used_percent: 'Used share of the filesystem of WORKSPACE_CLEANUP_DIR, in percent (absent while the cleanup is off).',
   forgehands_workspace_disk_free_bytes: 'Bytes available to ForgeHands on the filesystem of WORKSPACE_CLEANUP_DIR (absent while the cleanup is off).',
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
-  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle); 0 while nothing waits.'
+  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle, stuck); 0 while nothing waits.',
+  forgehands_stuck_pull_requests: 'Agent pull requests blocked for a human (BLOCKED_LABEL) that tickets may wait behind, from the ledger at the scrape.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
-const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle'] as const;
+const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle', 'stuck'] as const;
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
@@ -127,7 +129,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
@@ -148,6 +150,7 @@ export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Ma
     samples.push({ name: 'forgehands_queued_jobs', labels: { repository: repo }, value: all.filter((job) => job.status === 'queued' && String(job.event?.repository?.full_name).toLowerCase() === repo).length });
   }
   for (const reason of IDLE_REASONS) samples.push({ name: 'forgehands_idle_jobs', labels: { reason }, value: idle?.reasons[reason] ?? 0 });
+  samples.push({ name: 'forgehands_stuck_pull_requests', labels: {}, value: [...jobs.stuck.values()].filter((record) => record.blocked).length });
   for (const tier of [...new Set([...config.routes.values()].map((route) => route.tier))].sort()) {
     samples.push({ name: 'forgehands_tier_cooldown_active', labels: { tier }, value: (cooldowns.get(tier) || 0) > now ? 1 : 0 });
   }

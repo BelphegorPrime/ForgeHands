@@ -5,6 +5,7 @@ import type { JobStore } from '../store/jobs.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
 import { holdKey } from '../agent/merge.ts';
+import { behindBlocked, blockedTickets } from '../agent/stuck.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -32,7 +33,8 @@ export interface Status {
   notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats; tokens: TierTokens }> }>;
-  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  // blocked_by_stuck: the issues of the blocked pull requests this ticket waits behind (directly or through other tickets); state says so too.
+  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them.
@@ -241,19 +243,25 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const closed = new Set([...byIssue.keys()].filter((key) => jobs.list().filter((job) => job.key.startsWith(key + ':')).every((job) => job.archived_view)));
   // A closed ticket whose last activity is older than STATUS_HIDE_DAYS is left out of the list (its counters stay in the summary); 0 hides nothing.
   const hideBefore = config.statusHideDays > 0 && !options.all ? now - config.statusHideDays * DAY_MS : null;
+  // The chain of waits behind blocked pull requests (see stuck.ts): read from the ledger, once per request.
+  const behind = behindBlocked(jobs.list(), blockedTickets(jobs.stuck));
   let hidden = 0;
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
     const rounds = entry.runs.filter((run) => (run.kind === 'pull_request' || run.kind === 'ci_failure') && !run.escalated_after && (run.started || run.status !== 'failed')).length;
     const pr = entry.runs.find((run) => run.pr)?.pr || null;
     const issueNumber = entry.key.includes('#') ? Number(entry.key.slice(entry.key.lastIndexOf('#') + 1)) : 0;
+    const chain = closed.has(entry.key) ? [] : behind.get(entry.key) ?? [];
+    const base = deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
+    // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
+    const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ') : base;
     return {
       issue: entry.key,
       issue_url: entry.issueUrl || (issueNumber ? forgeItemUrl(config, entry.key.slice(0, entry.key.lastIndexOf('#')), 'issue', issueNumber) : null),
       title: entry.title,
       pr,
       pr_url: entry.prUrl || (pr ? forgeItemUrl(config, entry.key.split(/[#!]/)[0], 'pr', pr) : null),
-      rounds, state: deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null),
+      rounds, state, blocked_by_stuck: chain,
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last

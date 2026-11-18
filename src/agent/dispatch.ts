@@ -21,6 +21,7 @@ import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, Token
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
+import { behindBlocked, blockedTickets } from './stuck.ts';
 
 // `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
@@ -97,7 +98,8 @@ function idleLine(reasons: IdleCounts, tiers: string[]): string {
     + reasons.quota + ' held (quota ' + (tiers.join('/') || 'none') + '), ' + reasons.disk + ' held (low disk), '
     + reasons.hourly + ' over the hourly limit, ' + reasons.concurrency + ' over a concurrency limit'
     + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '')
-    + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '');
+    + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '')
+    + (reasons.stuck ? ', ' + reasons.stuck + ' behind a blocked pull request' : '');
 }
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
@@ -170,7 +172,11 @@ export class Dispatcher {
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
     this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket));
     this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
-    this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now);
+    // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
+    this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
+      block: (event, text, why) => this.markForHuman(event, text, why),
+      rounds: (repository, issue) => this.rounds({ repository: { full_name: repository }, issue: { number: issue } } as ForgeEvent)
+    });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
   }
 
@@ -1113,6 +1119,26 @@ export class Dispatcher {
     }
   }
 
+  // The last allowed round has ended. Nothing else looks at a pull request whose round pushed nothing: the next round is what would call the human
+  // (enqueueOne), and no event asks for that round. So when the head the round left still has a NOT OK verdict, the human is called now, as that
+  // refused start would have done. A head the round pushed is not judged here: its CI and review come next, and a NOT OK on it calls the human then.
+  async checkRoundsAfterRun(job: Job): Promise<void> {
+    const event = job.event;
+    if (!this.config.forgejo || !event?.pull_request || this.rounds(event) < this.roundLimit(event)) return;
+    try {
+      const repository = event.repository.full_name;
+      const pr = await this.forge.getPull(repository, event.pull_request.number);
+      if (!pr || pr.state !== 'open' || pr.merged) return;
+      const names = (pr.labels || []).map((label: Json) => label.name);
+      if ([this.config.approvedLabel, this.config.blockedLabel].some((name) => names.includes(name))) return;
+      const verdict = await this.merger.reviewOf(repository, event.pull_request.number, pr.head.sha);
+      if (verdict.ok || (verdict.reason !== 'not_ok' && verdict.reason !== 'changes_requested')) return;
+      await this.roundsUsedUp(event);
+    } catch (error) {
+      this.logger.error('could not check the last round of #' + event.pull_request.number + ':', error.message);
+    }
+  }
+
   // The rounds are used up: say so on the pull request and mark it for a human. Best effort, a failure is only logged.
   async roundsUsedUp(event: ForgeEvent): Promise<void> {
     const limit = this.roundLimit(event);
@@ -1918,14 +1944,17 @@ export class Dispatcher {
   // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
   // and is not counted.
   idleCounts(now: number): { reasons: IdleCounts; tiers: string[]; cycles: string[] } {
-    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0 };
+    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 };
     const tiers = new Set<string>();
     // Explicit dependencies only: a cycle of them is not broken by ForgeHands (the planner or a human made it), so its jobs wait for ever.
     const cycles = findCycles(waitGraph(this.jobs.list(), false));
     const inCycle = new Set(cycles.flat());
+    // A ticket that waits, directly or through other tickets, behind a blocked pull request (see stuck.ts) is counted as waiting behind it.
+    const behind = behindBlocked(this.jobs.list(), blockedTickets(this.jobs.stuck));
     for (const job of this.jobs.list(true)) {
       if (job.status === 'waiting') {
         if (job.waiting_for?.length && inCycle.has(ticketKey(job))) reasons.cycle += 1;
+        else if (!job.event.bot && !job.event.pull_request && behind.has(ticketKey(job))) reasons.stuck += 1;
         else if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
         else if (job.waiting_for_files?.length) reasons.files += 1;
         continue;
@@ -2158,6 +2187,7 @@ export class Dispatcher {
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
       else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
       else if (done === 'issue') await this.checkDelivery(job);
+      else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
       return true;
     }
     // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).
