@@ -24,6 +24,27 @@ const MARKED = (issue: { title: string; body: string }): string[] => [
   CLOSE
 ];
 
+// The name of the clone directory of a run, below WORKSPACE_DIR. The prompt names that directory and the workspace cleanup matches it against
+// the ledger, so both come from this one function. A round, a review, a fix, a conflict or a security review gets a suffix of its own: the
+// worker's checkout of the issue is still there, and a clone into it fails.
+export function workspaceName(event: ForgeEvent): string {
+  const { repository, issue } = event;
+  const repo = repository.full_name.replaceAll('/', '-');
+  if (event.type === 'epic.done') return repo + '-epic-' + issue.number;
+  if (!event.pull_request) return repo + '-issue-' + issue.number;
+  const pr = event.pull_request;
+  const sha = String(event.ci?.commit_sha || '').slice(0, 8);
+  const mode = event.type === 'ci.failure' ? 'fix' : event.type === 'ci.success' ? 'review' : event.type === 'ci.sensitive' ? 'sensitive' : event.type === 'pull_request.conflict' ? 'conflict' : 'round';
+  const suffix = mode === 'sensitive' ? '-security-' + sha : mode === 'review' ? '-review-' + sha : mode === 'fix' ? '-fix-' + sha : mode === 'conflict' ? '-conflict-' + String(event.base_sha || '').slice(0, 8) : '-round-' + String(event.delivery_id || Date.now()).replace(/[^\w]/g, '').slice(0, 8);
+  // A dependency bot's pull request (BOT_AUTHORS) has no ticket: it is named by its own number.
+  return repo + (event.bot ? '-pr-' + pr.number : '-issue-' + issue.number) + suffix;
+}
+
+// The directory a run works in: WORKSPACE_DIR (as OpenHands sees it) and the name above.
+export function workspacePath(config: DirectConfig, event: ForgeEvent): string {
+  return config.workspaceDir.replace(/\/$/, '') + '/' + workspaceName(event);
+}
+
 // Runs that work on a pull request of an agent issue (branch ai/issue-<n>): a follow-up round asked for by a label, a fix round
 // after a failed CI run, and the review after a green one.
 function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string {
@@ -34,11 +55,9 @@ function buildPullRequestPrompt(event: ForgeEvent, config: DirectConfig): string
   const mode = event.type === 'ci.failure' ? 'fix' : event.type === 'ci.success' ? 'review' : event.type === 'ci.sensitive' ? 'sensitive' : event.type === 'pull_request.conflict' ? 'conflict' : 'round';
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);
-  // A directory of its own per run: the worker's checkout of this issue is still there and a clone into it fails.
-  const suffix = mode === 'sensitive' ? '-security-' + ci.commit_sha.slice(0, 8) : mode === 'review' ? '-review-' + ci.commit_sha.slice(0, 8) : mode === 'fix' ? '-fix-' + ci.commit_sha.slice(0, 8) : mode === 'conflict' ? '-conflict-' + String(event.base_sha || '').slice(0, 8) : '-round-' + String(event.delivery_id || Date.now()).replace(/[^\w]/g, '').slice(0, 8);
   // A dependency bot's pull request (BOT_AUTHORS) has no ticket: its own title and description are the task, and every word of them is untrusted.
   const bot = Boolean(event.bot);
-  const dir = config.workspaceDir.replace(/\/$/, '') + '/' + repository.full_name.replaceAll('/', '-') + (bot ? '-pr-' + pr.number : '-issue-' + issue.number) + suffix;
+  const dir = workspacePath(config, event);
   const where = agent.name + ' pull request #' + pr.number + ' in ' + repository.full_name + (pr.html_url ? ' (' + pr.html_url + ')' : '') + (bot ? ', a dependency update by a bot (there is no ticket).' : ', the work on issue #' + issue.number + '.');
   const clone = repository.clone_url
     ? 'Work in a fresh clone of ' + repository.clone_url + ' at ' + dir + ' (use ' + agent.secrets + '; never print them). If that directory exists from an earlier run, delete it and clone again.'
@@ -192,7 +211,7 @@ function buildEpicPrompt(event: ForgeEvent, config: DirectConfig): string {
   const epic = event.epic!;
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);
-  const dir = config.workspaceDir.replace(/\/$/, '') + '/' + repository.full_name.replaceAll('/', '-') + '-epic-' + issue.number;
+  const dir = workspacePath(config, event);
   return [
     agent.name + ' epic #' + issue.number + ' in ' + repository.full_name + (issue.html_url ? ' (' + issue.html_url + ')' : '') + '. Every sub-issue is closed: '
       + (epic.children.length ? epic.children.map((child) => '#' + child.number + ' ' + child.title).join('; ') : 'none listed') + '. Review the epic. You do not change code and you do not create issues.',
@@ -216,7 +235,7 @@ export function buildPrompt(event: ForgeEvent, config: DirectConfig): string {
   const { repository, issue, label, sender } = event;
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);
-  const dir = config.workspaceDir.replace(/\/$/, '') + '/' + repository.full_name.replaceAll('/', '-') + '-issue-' + issue.number;
+  const dir = workspacePath(config, event);
   return [
     agent.name + ' issue #' + issue.number + ' in ' + repository.full_name + (issue.html_url ? ' (' + issue.html_url + ')' : '') + '.',
     'Trigger label: ' + label + (sender.login ? '. Set by: ' + sender.login : '') + '.',
