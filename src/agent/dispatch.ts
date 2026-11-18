@@ -17,7 +17,7 @@ import type { BranchPushEvent, DirectConfig, Route, Fetch, ForgeEvent, Job, Json
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 
-// `paused` counts: someone stopped the run on purpose (POST /pause), it does not end by itself and must not hold its slot or block the issue.
+// `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
 const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
 const RETRY_BASE_MS = 60000;
 const MAX_ATTEMPTS = 3;
@@ -34,6 +34,8 @@ const ACTIVE_STATUSES = new Set(['waiting', 'queued', 'running']);
 // Stage A (RESUME_ATTEMPTS): the states a run is continued in, on its own conversation. A run that reached its iteration limit is not among
 // them: nothing in the API raises that limit of a conversation, so the same run would end the same way (see resume).
 const RESUMABLE = new Set(['stuck', 'timeout']);
+// A paused run (PAUSE_RESUMES) is continued with its own message: nothing went wrong with the ticket, the agent was interrupted.
+const PAUSE_MESSAGE = 'The run was interrupted (the agent server was restarted or the conversation was paused). Continue from where you stopped: check the state of the branch and of your last step, then finish the task and end with the finish tool.';
 // A continued run is given this long before its state counts again: the state it stopped in may still be reported for a moment.
 const RESUME_SETTLE_MS = 60000;
 // Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
@@ -1426,7 +1428,7 @@ export class Dispatcher {
       if (!created?.id) throw new Error('response without conversation id');
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
       // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
-      delete job.resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
+      delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
       metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
     } catch (error) {
       job.attempts += 1;
@@ -1447,7 +1449,8 @@ export class Dispatcher {
         return true;
       }
       delete job.resume_pending;
-      return this.failed(job, 'timeout', now);
+      // A continuation of a pause that never got its run call ends as paused: it is handed over, never split.
+      return this.failed(job, job.resumed_from === 'paused' ? 'paused' : 'timeout', now);
     }
     let state: string | null = null;
     let costChanged = false;
@@ -1522,12 +1525,15 @@ export class Dispatcher {
   }
 
   // Stage A (RESUME_ATTEMPTS): a run that ended stuck or timed out goes on in its own conversation, which keeps its context. One message says
-  // what happened and asks for another approach, then the run is started again; the job is running again and counts the resume. Once
-  // RESUME_ATTEMPTS are used up, or the run is not one of RESUMABLE (an iteration limit: nothing in the API raises it, so a continued run would
-  // stop at the same limit), this returns false and the next stage decides. A message that could not be sent counts as not continued.
+  // what happened and asks for another approach, then the run is started again; the job is running again and counts the resume. A paused run
+  // (an interruption, PAUSE_RESUMES) goes on the same way with a neutral message and a budget of its own. Once the budget of the state is used
+  // up, or the run is not one of RESUMABLE (an iteration limit: nothing in the API raises it, so a continued run would stop at the same limit),
+  // this returns false and the next stage decides. A message that could not be sent counts as not continued.
   async resume(job: Job, state: string, now: number): Promise<boolean> {
-    const resumes = job.resumes || 0;
-    if (!RESUMABLE.has(state) || !job.conversation_id || resumes >= this.config.resumeAttempts) return false;
+    const paused = state === 'paused';
+    const used = paused ? job.pause_resumes || 0 : job.resumes || 0;
+    const budget = paused ? this.config.pauseResumes : this.config.resumeAttempts;
+    if (!(paused || RESUMABLE.has(state)) || !job.conversation_id || used >= budget) return false;
     const repository = job.event.repository.full_name;
     const conversation = '/api/conversations/' + encodeURIComponent(job.conversation_id);
     // A timed out run is still running in OpenHands: it is paused first, so that the message does not go to a busy agent (best effort).
@@ -1536,7 +1542,7 @@ export class Dispatcher {
       catch (error) { this.logger.error('could not pause ' + job.key + ' before it is continued:', error.message); }
     }
     // The message and the run are two calls: a run call that is not answered is repeated on its own (startResumed), never the message.
-    const text = 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
+    const text = paused ? PAUSE_MESSAGE : 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
     try {
       const response = await this.api('POST', conversation + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, repository);
       if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1544,9 +1550,10 @@ export class Dispatcher {
       this.logger.error(job.key + ': ' + state + ', the message to continue it was not sent (' + error.message + '), the next stage decides');
       return false;
     }
-    Object.assign(job, { status: 'running', resumes: resumes + 1, resumed_from: state, resumed_at: now, resume_pending: true, finished: undefined, result: undefined });
-    metrics.inc('forgehands_resumes_total', { kind: this.config.routes.get(job.label)?.kind || 'issue', state: known(state, RESUMABLE) });
-    this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + job.resumes + '/' + this.config.resumeAttempts + ')');
+    const counted = paused ? { pause_resumes: used + 1 } : { resumes: used + 1 };
+    Object.assign(job, { status: 'running', ...counted, resumed_from: state, resumed_at: now, resume_pending: true, finished: undefined, result: undefined });
+    metrics.inc('forgehands_resumes_total', { kind: this.config.routes.get(job.label)?.kind || 'issue', state: known(state, [...RESUMABLE, 'paused']) });
+    this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + (used + 1) + '/' + budget + ')');
     await this.startResumed(job);
     return true;
   }
@@ -1606,8 +1613,9 @@ export class Dispatcher {
   }
 
   // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (max_iterations,
-  // paused, stuck, timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. Everything else is handed to the human,
-  // on the pull request (label and mention) or, without one, as a comment on the issue. Best effort: a failing call is only logged.
+  // stuck, timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. A paused run is an interruption and is
+  // never split. Everything else is handed to the human, on the pull request (label and mention) or, without one, as a comment on the issue.
+  // Best effort: a failing call is only logged.
   async reportFailure(job: Job, state: string): Promise<void> {
     const event = job.event;
     if (!this.config.forgejo || !event || state === 'deleted' || state === 'finished') return;
@@ -1616,7 +1624,7 @@ export class Dispatcher {
       ? 'the run for ' + job.label + ' finished twice without a pull request and without a comment, so nothing was delivered'
       : 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
     try {
-      const exhausted = state === 'max_iterations' || state === 'paused' || state === 'stuck' || state === 'timeout';
+      const exhausted = state === 'max_iterations' || state === 'stuck' || state === 'timeout';
       if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
         const number = event.issue.number;
         const repository = event.repository.full_name;

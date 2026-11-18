@@ -132,6 +132,9 @@ export interface DirectConfig extends BaseConfig {
   errorRetries: number;
   /** RESUME_ATTEMPTS: how often a run that ended stuck or timed out continues on its own conversation (one message, then run again); 0 switches it off. */
   resumeAttempts: number;
+  /** PAUSE_RESUMES: how often a run that was paused (an interruption: an OpenHands restart, or a stop of the operator) continues on its own conversation.
+   * Its own budget, apart from RESUME_ATTEMPTS; 0 switches the resume off (the run is then handed to the human, never split). */
+  pauseResumes: number;
   /** FAILURE_ESCALATE: a round that is still stuck, timed out or out of iterations then starts once more on the profile of its escalate_to route (once per head commit); 0 switches it off. */
   failureEscalate: boolean;
   quotaHoldMaxMs: number;
@@ -278,6 +281,8 @@ export interface Job {
   resumed_from?: string;
   resumed_at?: number;
   resume_pending?: boolean;
+  /** PAUSE_RESUMES: how often the run was continued after it was paused (its own budget, counted apart from `resumes`). */
+  pause_resumes?: number;
   /** Stage B (FAILURE_ESCALATE): a fresh run of a round on the profile of its escalate_to route, started after `escalated_after` (the state the run stopped in).
    * It is not a follow-up round: it does not count against MAX_ROUNDS. */
   failure_escalation?: boolean;

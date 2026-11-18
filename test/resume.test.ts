@@ -326,20 +326,245 @@ test('an issue run that is stuck resumes once and then still goes to the planner
   assert.ok(t.forge.calls.some((c) => c.method === 'POST' && c.path === '/issues/57/labels'), 'the planner label goes on');
 });
 
-test('a continued issue run that then pauses is not continued again, and goes to the split as paused', async () => {
+test('a continued issue run that then pauses is resumed again on the pause budget, and is not split (a pause is no sign of a big ticket)', async () => {
   const t = await setup({ SPLIT_LABEL: 'ai:plan' });
   await t.dispatcher.enqueue(issueEvent('ai:ready', 58));
   await t.dispatcher.tick();
   const job = t.jobs.list()[0];
   t.oh.states[job.conversation_id] = 'stuck';
   await t.dispatcher.tick();
+  assert.equal(job.resumes, 1);
   t.oh.states[job.conversation_id] = 'paused';
   clock += 61000;
   await t.dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.resumed_from, 'paused');
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(messages(t).length, 2);
+  assert.deepEqual(t.forge.comments(), []);
+  assert.equal(t.forge.labelled(), 0, 'no planner label');
+});
+
+// The neutral message of a paused run (not the "take a different approach" text of stuck and timed out runs).
+const PAUSE_TEXT = 'The run was interrupted (the agent server was restarted or the conversation was paused). Continue from where you stopped: check the state of the branch and of your last step, then finish the task and end with the finish tool.';
+
+test('a paused issue run is resumed on its conversation with the neutral message, not split to the planner', async () => {
+  const t = await setup({ SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running', 'continued, not failed');
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(job.resumes, undefined, 'the stuck budget is not touched');
+  assert.deepEqual(t.oh.calls.filter((c) => c.id === job.conversation_id && c.method !== 'start').map((c) => c.method), ['message', 'run']);
+  assert.equal(messages(t)[0].body.run, false, 'the message and the run are two calls');
+  assert.equal(messages(t)[0].body.content[0].text, PAUSE_TEXT);
+  assert.ok(logged('owner/hello#57:ai:ready: paused, resuming the conversation (1/3)'));
+  assert.equal(starts(t).length, 1, 'no second conversation');
+  assert.deepEqual(t.forge.comments(), [], 'nobody is called');
+  assert.equal(t.forge.labelled(), 0, 'no planner label');
+  // The paused state may still be reported for a moment after the run call: that is not news yet.
+  await t.dispatcher.tick();
+  assert.equal(messages(t).length, 1);
+  t.oh.states[job.conversation_id] = 'finished';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'done');
+  assert.equal(t.jobs.list().length, 1);
+});
+
+test('a paused round on a pull request is resumed, not handed to the human', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(messages(t)[0].body.content[0].text, PAUSE_TEXT);
+  assert.deepEqual(messages(t).map((c) => c.id), ['conv-1']);
+  assert.deepEqual(t.forge.comments(), []);
+  assert.ok(!t.forge.calls.some((c) => c.method === 'POST' && c.path === '/issues/34/labels'), 'the pull request is not marked for the human');
+});
+
+test('a paused planner run is resumed too (every kind of run gets the pause resume)', async () => {
+  const t = await setup();
+  await t.dispatcher.enqueue(issueEvent('ai:plan', 60));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(job.status, 'running');
+  assert.deepEqual(t.forge.comments(), []);
+});
+
+test('a paused review run (a route "on": "ci_success") is resumed, and the verdict is left for when it ends', async () => {
+  const routes = { ...ROUTES, 'ci:success': { profile: CHANGES, tier: 'strong', on: 'ci_success' } };
+  const t = await setup({ LABEL_ROUTES: JSON.stringify(routes) });
+  const event = { type: 'pull_request.ci_success', repository: { full_name: repo, clone_url: 'https://forge.example/owner/hello.git', default_branch: 'main' },
+    pull_request: { number: 34, title: 'Fix it', body: 'Closes #26', state: 'open', head: { ref: 'ai/issue-26' }, html_url: null }, ci: { commit_sha: SHA }, sender: { login: 'marcel' } };
+  // The job as the dispatcher writes it when the review starts (its own conversation, running).
+  const job = t.jobs.add({ key: 'owner/hello#26:ci:success:' + SHA.slice(0, 8), label: 'ci:success', event, status: 'running', created: clock, started: clock, conversation_id: 'conv-9' });
+  t.oh.states['conv-9'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.pause_resumes, 1);
+  assert.deepEqual(t.oh.calls.filter((c) => c.id === 'conv-9').map((c) => c.method), ['message', 'run']);
+  assert.deepEqual(t.forge.comments(), []);
+});
+
+test('PAUSE_RESUMES=0: a paused run is not resumed; it goes to the human, never to the planner', async () => {
+  const t = await setup({ PAUSE_RESUMES: '0', SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(messages(t).length, 0);
+  assert.equal(runs(t).length, 0);
   assert.equal(job.status, 'failed');
   assert.equal(job.result, 'paused');
+  assert.equal(t.jobs.list().length, 1, 'no split, no second run');
+  assert.equal(t.forge.labelled(), 0, 'no planner label');
+  assert.match(t.forge.comments()[0], /^ForgeHands: the run for ai:ready ended with "paused"\. A human has to look at it\./);
+});
+
+test('PAUSE_RESUMES=0 keeps the stuck resume as it was: a stuck run is still continued once', async () => {
+  const t = await setup({ PAUSE_RESUMES: '0' });
+  const job = await startRound(t);
+  t.oh.states['conv-1'] = 'stuck';
+  await t.dispatcher.tick();
   assert.equal(job.resumes, 1);
+  assert.equal(job.pause_resumes, undefined);
+});
+
+test('the pause budget is 3 by default and independent of RESUME_ATTEMPTS: a fourth pause goes to the human, a stuck run keeps its resume', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  // A stuck run is continued first; the pauses that follow have their own three resumes.
+  t.oh.states['conv-1'] = 'stuck';
+  await t.dispatcher.tick();
+  assert.equal(job.resumes, 1);
+  for (let i = 1; i <= 3; i++) {
+    clock += 61000;
+    t.oh.states['conv-1'] = 'paused';
+    await t.dispatcher.tick();
+    assert.equal(job.pause_resumes, i, 'pause resume ' + i);
+    assert.equal(job.status, 'running');
+  }
+  assert.equal(job.resumes, 1, 'the pauses did not touch the stuck budget');
+  clock += 61000;
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(job.pause_resumes, 3);
+  assert.equal(t.jobs.list().length, 1, 'a paused run is not escalated');
+  assert.match(t.forge.comments()[0], /ended with "paused"\. A human has to look at it\./);
+});
+
+test('a stuck run after three pause resumes still gets its own resume (the two budgets do not share)', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  for (let i = 1; i <= 3; i++) {
+    t.oh.states['conv-1'] = 'paused';
+    await t.dispatcher.tick();
+    clock += 61000;
+  }
+  assert.equal(job.pause_resumes, 3);
+  t.oh.states['conv-1'] = 'stuck';
+  await t.dispatcher.tick();
+  assert.equal(job.resumes, 1, 'continued on the stuck budget');
+  assert.equal(job.status, 'running');
+  assert.equal(job.resumed_from, 'stuck');
+  assert.equal(t.jobs.list().length, 1);
+});
+
+test('a paused run whose message OpenHands refuses is not resumed: the human is called, the issue is not split', async () => {
+  const t = await setup({ SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.oh.eventAnswers = [503];
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.pause_resumes, undefined);
+  assert.equal(runs(t).length, 0);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused');
+  assert.equal(t.jobs.list().length, 1);
+  assert.equal(t.forge.labelled(), 0, 'no planner label');
+  assert.match(t.forge.comments()[0], /^ForgeHands: the run for ai:ready ended with "paused"\. A human has to look at it\./);
+});
+
+test('a 429 from the run call of a paused run is repeated on the next poll, without a second message', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.oh.runAnswers = [429];
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'running');
+  assert.equal(job.resume_pending, true);
   assert.equal(messages(t).length, 1);
+  assert.equal(runs(t).length, 1);
+  clock += 15000;
+  await t.dispatcher.tick();
+  assert.equal(job.resume_pending, undefined);
+  assert.equal(runs(t).length, 2, 'the run was repeated');
+  assert.equal(messages(t).length, 1, 'the message was not repeated');
+});
+
+test('a 409 from the run call of a paused run means it runs already: no second run call, no message', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.oh.runAnswers = [409];
+  t.oh.states['conv-1'] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.resume_pending, undefined);
+  assert.equal(job.status, 'running');
+  t.oh.states['conv-1'] = 'running';
+  clock += 15000;
+  await t.dispatcher.tick();
+  assert.equal(runs(t).length, 1);
+  assert.equal(messages(t).length, 1);
+});
+
+test('a paused run whose run call keeps failing ends as paused after the run timeout, handed to the human and not split', async () => {
+  const t = await setup({ MAX_RUN_MINUTES: '1', SPLIT_LABEL: 'ai:plan' });
+  await t.dispatcher.enqueue(issueEvent('ai:ready', 57));
+  await t.dispatcher.tick();
+  const job = t.jobs.list()[0];
+  t.oh.runAnswers = Array(10).fill(503);
+  t.oh.states[job.conversation_id] = 'paused';
+  await t.dispatcher.tick();
+  assert.equal(job.resume_pending, true);
+  clock += 61000;
+  await t.dispatcher.tick();
+  assert.equal(job.status, 'failed');
+  assert.equal(job.result, 'paused', 'not a timeout');
+  assert.equal(t.jobs.list().length, 1, 'not split');
+  assert.equal(t.forge.labelled(), 0);
+  assert.match(t.forge.comments()[0], /ended with "paused"\. A human has to look at it\./);
+});
+
+test('a paused run found after a restart of ForgeHands is resumed from the ledger, like any running job', async () => {
+  const t = await setup();
+  const job = await startRound(t);
+  t.oh.states['conv-1'] = 'paused';
+  await t.jobs.persist(clock);
+  const jobs = new JobStore(t.jobs.file);
+  await jobs.load();
+  const again = new Dispatcher(t.config, jobs, t.send, t.logger, () => clock);
+  assert.equal(jobs.list()[0].status, 'running', 'still running in the ledger');
+  await again.tick();
+  const restored = jobs.list()[0];
+  assert.equal(restored.id, job.id);
+  assert.equal(restored.status, 'running');
+  assert.equal(restored.pause_resumes, 1);
+  assert.equal(messages(t).length, 1);
+  assert.equal(runs(t).length, 1);
+  assert.equal(jobs.list().length, 1);
 });
 
 test('a 429 from the run call is repeated on the next poll, without a second message', async () => {

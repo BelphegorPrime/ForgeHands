@@ -634,17 +634,26 @@ test('a failed round on a pull request marks it for the human; a review run leav
   assert.ok(forgejo.some((c) => c.method === 'POST' && c.path === '/issues/34/labels'), 'blocked label set');
 });
 
-test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to the planner; without it a human is called', async () => {
+test('SPLIT_LABEL: a worker run that ran out of iterations sends the ticket to the planner; without it a human is called; a paused run is resumed, never split', async () => {
   const split = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
   await split.dispatcher.enqueue(event('ai:ready', 57));
-  await split.finish('paused');
-  assert.match(split.comments()[0], /^ForgeHands: the run for ai:ready ended with "paused", so the ticket is probably too big/);
+  await split.finish('max_iterations');
+  assert.match(split.comments()[0], /^ForgeHands: the run for ai:ready ended with "max_iterations", so the ticket is probably too big/);
   assert.ok(split.forgejo.some((c) => c.method === 'DELETE' && c.path === '/issues/57/labels/3'), 'the worker label comes off');
   assert.ok(split.forgejo.some((c) => c.method === 'POST' && c.path === '/issues/57/labels' && c.body.labels[0] === 8), 'the planner label goes on');
+  // A pause is an interruption, not a too big ticket: the run goes on on its conversation and nothing is split.
+  const paused = await buildWatched({ SPLIT_LABEL: 'ai:plan' });
+  await paused.dispatcher.enqueue(event('ai:ready', 61));
+  await paused.finish('paused');
+  // The newest job: buildWatched ledgers share one file, so the split run above is listed first.
+  assert.equal(paused.jobs.list().at(-1).status, 'running');
+  assert.equal(paused.jobs.list().at(-1).pause_resumes, 1);
+  assert.deepEqual(paused.comments(), []);
+  assert.ok(!paused.forgejo.some((c) => c.method === 'DELETE' || (c.method === 'POST' && c.path === '/issues/61/labels')), 'no label changes');
   const plain = await buildWatched();
   await plain.dispatcher.enqueue(event('ai:ready', 58));
-  await plain.finish('paused');
-  assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "paused"\. A human/);
+  await plain.finish('max_iterations');
+  assert.match(plain.comments()[0], /^@marcel ForgeHands: the run for ai:ready ended with "max_iterations"\. A human/);
   assert.ok(!plain.forgejo.some((c) => c.method === 'DELETE'));
   const planner = await buildWatched({ SPLIT_LABEL: 'ai:plan', RESUME_ATTEMPTS: '0' });
   await planner.dispatcher.enqueue(event('ai:plan', 59));
@@ -1396,7 +1405,7 @@ test('a kept CI outcome does not hold the issue for ever', async () => {
   assert.ok(jobs.list().every((job) => job.status !== 'waiting' || !job.waiting_for_run));
 });
 
-test('a paused conversation frees its slot and the issue', async () => {
+test('a paused conversation is resumed on its conversation and keeps its slot until the run ends', async () => {
   const { dispatcher, jobs } = await build(withChanges());
   assert.equal((await dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
   await dispatcher.tick();
@@ -1404,8 +1413,12 @@ test('a paused conversation frees its slot and the issue', async () => {
   assert.equal(job.status, 'running');
   states[job.conversation_id] = 'paused';
   await dispatcher.tick();
-  assert.equal(job.status, 'failed');
-  assert.equal(job.result, 'paused');
+  assert.equal(job.status, 'running');
+  assert.equal(job.pause_resumes, 1);
+  assert.equal(jobs.list(true).length, 1, 'the run goes on, so the slot stays taken');
+  states[job.conversation_id] = 'finished';
+  await dispatcher.tick();
+  assert.equal(job.status, 'done');
   assert.equal(jobs.list(true).length, 0);
 });
 
