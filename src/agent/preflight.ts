@@ -16,13 +16,30 @@ import { pullBranch } from './bot.ts';
 //      ForgeHands does not have, so it is not done here);
 //   4. the files listed in Files exist on the default branch, unless the ticket says it creates them (a line says "new", or Steps has a
 //      creating verb, or one listed file exists). Only when none of them exists and nothing says they are created is the ticket broken.
+// Which rules reject is TICKET_PREFLIGHT_BLOCK (default 2,3). The other findings are advisory: they never reject, and their notes go into the
+// worker's prompt. Rule 1 may be made to reject; the weaker form of rule 4 (a listed file is missing, but another listed file exists or Steps
+// say that files are created) is advisory only.
 // Headings are read: Steps, Files (or "Exact files", the heading of WAIT_FOR_SAME_FILES) and Acceptance. A forge that cannot read files
 // makes rule 4 unknown, and unknown counts as no violation.
 // The pre-flight is skipped for a ticket that was worked on before (an issue run in the ledger) or whose pull request branch (ai/issue-<n>)
 // is open: such a ticket was workable once, and its rounds follow their own rules. A skipped ticket is never closed or sent back, so the
 // pre-flight never closes a pull request.
 
-export interface Violation { rule: 1 | 2 | 3 | 4; text: string }
+export interface Violation {
+  rule: 1 | 2 | 3 | 4;
+  /** The line of the rejection comment. */
+  text: string;
+  /** The fact the worker's prompt carries when the finding does not reject the ticket. */
+  note: string;
+  /** Whether TICKET_PREFLIGHT_BLOCK may make this finding reject the ticket. The weaker form of rule 4 is not blockable. */
+  blockable: boolean;
+}
+
+/** The findings that reject a ticket under the rules of TICKET_PREFLIGHT_BLOCK, and the rest, which are advisory. */
+export function splitViolations(violations: Violation[], block: readonly number[]): { blocking: Violation[]; advisory: Violation[] } {
+  const blocking = violations.filter((violation) => violation.blockable && block.includes(violation.rule));
+  return { blocking, advisory: violations.filter((violation) => !blocking.includes(violation)) };
+}
 
 /** The first words of the comment that rejects a ticket; the end-to-end suite looks for them to fail a scenario at once. */
 export const PREFLIGHT_REJECTION = 'ForgeHands: the ticket breaks the pre-flight';
@@ -208,35 +225,48 @@ export async function ticketViolations(body: string, exists?: Exists): Promise<V
       && !(path.includes('/') ? listed.some((item) => item.endsWith('/' + path)) : names.has(path)));
     for (const path of unlisted) {
       if (exists && (await exists(path)) === true) continue;
-      violations.push({ rule: 1, text: '`' + path + '` is named in Steps but not listed in Files' });
+      violations.push({
+        rule: 1, blockable: true,
+        text: '`' + path + '` is named in Steps but not listed in Files',
+        note: 'the Steps name `' + path + '`, which the Files list does not contain'
+      });
     }
   }
 
-  if (!acceptance.found) violations.push({ rule: 2, text: 'the ticket has no Acceptance section with a fenced command block' });
+  if (!acceptance.found) violations.push({ rule: 2, blockable: true, text: 'the ticket has no Acceptance section with a fenced command block', note: 'the ticket has no Acceptance section with a fenced command block' });
   else {
     const blocks = fencedBlocks(acceptance.lines).filter((block) => block.trim());
-    if (!blocks.length) violations.push({ rule: 2, text: 'the Acceptance section has no fenced command block' });
+    if (!blocks.length) violations.push({ rule: 2, blockable: true, text: 'the Acceptance section has no fenced command block', note: 'the Acceptance section has no fenced command block' });
     for (const block of blocks) {
       const problem = commandProblem(block);
-      if (problem) { violations.push({ rule: 3, text: 'the acceptance command ' + problem }); break; }
+      if (problem) { violations.push({ rule: 3, blockable: true, text: 'the acceptance command ' + problem, note: 'the acceptance command ' + problem }); break; }
     }
   }
 
-  // A listed file that does not exist is taken as new when the ticket says so: a line says "new", Steps has a creating verb, or one listed file
-  // exists (the planner's lists are mixed). Only when no listed file exists and nothing says a file is created is the ticket unworkable.
-  // An unknown answer (null) counts as no violation.
-  if (exists && files.size && ![...files.values()].some(Boolean) && !CREATES.test(steps.lines.join('\n'))) {
+  // Rule 4 is read when no listed file is marked new. A missing listed file is blockable only when no listed file exists, Steps say nothing about
+  // creating files and every answer is known: the ticket cannot be worked at all. Otherwise (one listed file exists, or Steps say that files are
+  // created) it is a note: the planner's lists are mixed, and a created file is not always marked new. An unknown answer (null) counts as no
+  // violation.
+  if (exists && files.size && ![...files.values()].some(Boolean)) {
     const missing: string[] = [];
     let unknown = false;
     let someExists = false;
     for (const path of files.keys()) {
       const here = await exists(path);
-      if (here === true) { someExists = true; break; }
-      if (here === false) missing.push(path);
+      if (here === true) someExists = true;
+      else if (here === false) missing.push(path);
       else unknown = true;
     }
-    if (!someExists && !unknown) {
-      for (const path of missing) violations.push({ rule: 4, text: '`' + path + '` is listed in Files but does not exist on the default branch (mark it new if the ticket creates it)' });
+    const creates = CREATES.test(steps.lines.join('\n'));
+    const advisory = someExists || creates;
+    if (advisory || !unknown) {
+      for (const path of missing) {
+        violations.push({
+          rule: 4, blockable: !advisory,
+          text: '`' + path + '` is listed in Files but does not exist on the default branch (mark it new if the ticket creates it)',
+          note: '`' + path + '` is listed in Files but does not exist on the default branch and is not marked new'
+        });
+      }
     }
   }
   return violations;
@@ -303,11 +333,8 @@ export class TicketPreflight {
     return false;
   }
 
-  // True when the run this event asks for must not start because the ticket breaks a rule. A passing ticket, or TICKET_PREFLIGHT=0: false.
-  // A rejected ticket is commented once per revision; every time it is rejected, its trigger label goes and the planner (SPLIT_LABEL) or the
-  // human (BLOCKED_LABEL) gets it. In a dry run the once-per-revision mark is not kept, as nothing was written.
-  async rejects(event: ForgeEvent, label: string): Promise<boolean> {
-    if (!this.config.ticketPreflight) return false;
+  // The findings of a ticket. Rule 4 is answered by the forge; a failed read is unknown, and that counts as no violation.
+  async violationsOf(event: ForgeEvent): Promise<Violation[]> {
     const repository = event.repository.full_name;
     const number = event.issue.number;
     const read = this.forge.fileExists?.bind(this.forge);
@@ -318,9 +345,37 @@ export class TicketPreflight {
         return null;
       }
     });
-    const violations = await ticketViolations(event.issue.body, exists);
-    if (!violations.length) {
+    return ticketViolations(event.issue.body, exists);
+  }
+
+  // The notes of the findings that do not reject the ticket, for the worker's prompt (startJob). Empty when the pre-flight is off.
+  async notesOf(event: ForgeEvent): Promise<string[]> {
+    if (!this.config.ticketPreflight) return [];
+    return splitViolations(await this.violationsOf(event), this.config.ticketPreflightBlock).advisory.map((violation) => violation.note);
+  }
+
+  // Counts the advisory findings of a ticket, once per rule. They are counted when the ticket is checked, not when its run starts.
+  countAdvised(advisory: Violation[]): void {
+    for (const rule of new Set(advisory.map((violation) => violation.rule))) metrics.inc('forgehands_preflight_total', { result: 'advised', rule: String(rule) });
+  }
+
+  // True when the run this event asks for must not start because the ticket breaks a blocking rule (TICKET_PREFLIGHT_BLOCK). A passing ticket,
+  // a ticket with advisory findings only, or TICKET_PREFLIGHT=0: false. A rejected ticket is commented once per revision; every time it is
+  // rejected, its trigger label goes and the planner (SPLIT_LABEL) or the human (BLOCKED_LABEL) gets it. In a dry run the once-per-revision
+  // mark is not kept, as nothing was written.
+  async rejects(event: ForgeEvent, label: string): Promise<boolean> {
+    if (!this.config.ticketPreflight) return false;
+    const repository = event.repository.full_name;
+    const number = event.issue.number;
+    const found = await this.violationsOf(event);
+    if (!found.length) {
       metrics.inc('forgehands_preflight_total', { result: 'ok', rule: 'none' });
+      return false;
+    }
+    const { blocking: violations, advisory } = splitViolations(found, this.config.ticketPreflightBlock);
+    // Advisory findings alone never reject, and need no look at the open pull requests.
+    if (!violations.length) {
+      this.countAdvised(advisory);
       return false;
     }
     const why = await this.skipReason(repository, number);
@@ -330,6 +385,7 @@ export class TicketPreflight {
       return false;
     }
     for (const rule of new Set(violations.map((violation) => violation.rule))) metrics.inc('forgehands_preflight_total', { result: 'rejected', rule: String(rule) });
+    this.countAdvised(advisory);
 
     const dry = isDry(this.config, repository);
     const key = 'preflight:' + repository.toLowerCase() + '#' + number + ':' + ticketRevision(event.issue.title, event.issue.body);

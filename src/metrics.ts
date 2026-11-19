@@ -45,7 +45,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_merges_reverted_total: 'Merges ForgeHands made whose revert pull request was merged, by repository (counted once per merge).',
   forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.',
   forgehands_comment_ignored_total: 'Answers of HUMAN_LOGIN to a planner that started nothing, by reason (has_sub_issues, not_open, label_gone, links_unknown, issue_unreadable, plan_answers_used_up).',
-  forgehands_preflight_total: 'Worker tickets checked by the ticket pre-flight (TICKET_PREFLIGHT), by result (ok, rejected, skipped) and rule (1 to 4 for a rejection, none otherwise); a rejection counts once per rule it breaks, a skip is a ticket worked on before or with an open pull request.'
+  forgehands_preflight_total: 'Worker tickets checked by the ticket pre-flight (TICKET_PREFLIGHT), by result (ok, rejected, advised, skipped) and rule (1 to 4 for a rejection or an advisory finding, none otherwise); a rejection counts once per blocking rule it breaks (TICKET_PREFLIGHT_BLOCK), an advised finding once per advisory rule, a skip is a ticket worked on before or with an open pull request.'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
