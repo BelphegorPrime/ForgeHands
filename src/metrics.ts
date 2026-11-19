@@ -55,7 +55,8 @@ const GAUGES: Record<string, string> = {
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
   forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle, stuck); 0 while nothing waits.',
   forgehands_stuck_pull_requests: 'Agent pull requests blocked for a human (BLOCKED_LABEL) that tickets may wait behind, from the ledger at the scrape.',
-  forgehands_e2e_scenario_ok: '1 when the scenario held in the last end-to-end run (E2E_REPO), 0 when it failed; absent until a run.',
+  forgehands_e2e_scenario_ok: '1 when the steps of the scenario held in the last end-to-end run (E2E_REPO), 0 when a step failed; absent until a run.',
+  forgehands_e2e_cleanup_ok: '1 when the cleanup of the scenario held in the last end-to-end run (E2E_REPO), 0 when it did not; absent until a run.',
   forgehands_merges_reverted_ratio: 'Share (0 to 1) of the merges ForgeHands made in the last 30 days whose revert was merged, by repository; absent without merges in the window.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).

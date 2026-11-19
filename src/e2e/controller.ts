@@ -34,7 +34,7 @@ export interface E2eState {
   scenarios: string[];
   version: string;
   running: { trigger: 'start' | 'manual'; since: string } | null;
-  last: { version: string; trigger: 'start' | 'manual'; at: string; error: string | null; results: { scenario: string; ok: boolean; reason: string | null; cleanup: 'ok' | 'failed'; cleanup_reason: string | null; failed_step: number | null; at: string }[] } | null;
+  last: { version: string; trigger: 'start' | 'manual'; at: string; error: string | null; results: { scenario: string; ok: boolean; reason: string | null; cleanup: 'ok' | 'failed'; cleanup_reason: string | null; cleanup_note: string | null; failed_step: number | null; at: string }[] } | null;
 }
 
 /** Why a run did not start: the suite is off, this repository is in a dry run, the forge cannot run it (GitLab), or a run is going. */
@@ -113,16 +113,26 @@ export class E2eController {
     }
     const link = config.forgejo ? config.forgejo.url + '/' + repository : undefined;
     for (const result of results) {
-      if (result.ok) {
-        logger.log?.('e2e: ' + result.scenario + ' ok');
+      if (result.ok && result.cleanup === 'ok') {
+        logger.log?.('e2e: ' + result.scenario + ' ok' + (result.cleanup_note ? ' (cleanup: ' + result.cleanup_note + ')' : ''));
         continue;
       }
-      const why = result.reason ?? 'the cleanup failed';
-      logger.error('e2e: ' + result.scenario + ' failed: ' + why + (result.cleanup_reason ? ' (cleanup: ' + result.cleanup_reason + ')' : ''));
+      // A scenario whose steps held and whose cleanup did not is reported as such: the steps are not what failed.
+      if (result.ok) {
+        logger.error('e2e: ' + result.scenario + ' held, but the cleanup failed: ' + result.cleanup_reason);
+        notifier.notify({
+          kind: 'failed', link,
+          subject: '[e2e] ' + result.scenario + ': cleanup failed',
+          text: 'The end-to-end scenario ' + result.scenario + ' held on ' + repository + ' (version ' + version + '), but its cleanup did not hold: '
+            + result.cleanup_reason + ' Look at the test repository.',
+        }, repository);
+        continue;
+      }
+      logger.error('e2e: ' + result.scenario + ' failed: ' + result.reason + (result.cleanup_reason ? ' (cleanup: ' + result.cleanup_reason + ')' : ''));
       notifier.notify({
         kind: 'failed', link,
         subject: '[e2e] ' + result.scenario + ' failed',
-        text: 'The end-to-end scenario ' + result.scenario + ' failed on ' + repository + ' (version ' + version + ').\n' + why
+        text: 'The end-to-end scenario ' + result.scenario + ' failed on ' + repository + ' (version ' + version + ').\n' + result.reason
           + (result.cleanup === 'failed' ? '\nThe cleanup did not hold: ' + result.cleanup_reason + ' Look at the test repository.' : ''),
       }, repository);
     }
@@ -133,11 +143,17 @@ export class E2eController {
 
   private now(): number { return this.deps.now ? this.deps.now() : Date.now(); }
 
-  /** The gauge forgehands_e2e_scenario_ok{scenario}: 1 when the scenario held in the last run, 0 when not. Absent until a run. */
+  /**
+   * The gauges of the last run, per scenario: forgehands_e2e_scenario_ok (1 when its steps held; a failed cleanup does not change it) and
+   * forgehands_e2e_cleanup_ok (1 when its cleanup held). Absent until a run.
+   */
   gauges(): { name: string; labels: Record<string, string>; value: number }[] {
     const record = this.deps.jobs.meta.e2e;
     if (!this.repository || !record) return [];
-    return record.results.map((result) => ({ name: 'forgehands_e2e_scenario_ok', labels: { scenario: result.scenario }, value: result.ok ? 1 : 0 }));
+    return record.results.flatMap((result) => [
+      { name: 'forgehands_e2e_scenario_ok', labels: { scenario: result.scenario }, value: result.ok ? 1 : 0 },
+      { name: 'forgehands_e2e_cleanup_ok', labels: { scenario: result.scenario }, value: result.cleanup === 'ok' ? 1 : 0 },
+    ]);
   }
 
   /** The status section (status.json): what the suite is, whether it runs now, and the last run. */
@@ -158,7 +174,7 @@ export class E2eController {
         at: iso(record.finished),
         error: record.error,
         results: record.results.map((result) => ({ scenario: result.scenario, ok: result.ok, reason: result.reason, cleanup: result.cleanup,
-          cleanup_reason: result.cleanup_reason, failed_step: result.failed_step, at: iso(result.finished) })),
+          cleanup_reason: result.cleanup_reason, cleanup_note: result.cleanup_note ?? null, failed_step: result.failed_step, at: iso(result.finished) })),
       } : null,
     };
   }

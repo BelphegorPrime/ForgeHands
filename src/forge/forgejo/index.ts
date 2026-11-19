@@ -198,7 +198,9 @@ export class ForgejoForge implements Forge {
     return branches;
   }
   async deleteBranch(repository: string, branch: string): Promise<void> { await this.call(repository, 'DELETE', '/branches/' + encodeURIComponent(branch)); }
-  // A missing file is an ordinary answer of the contents API (the 404 is not counted as an error).
+  // A missing file is an ordinary answer of the contents API (the 404 is not counted as an error). Something that exists but is not a
+  // regular file (a symlink, a submodule, a folder) throws: read as "missing" it would be restored as a deletion, or left unexplained.
+  // A file without content throws too: written back as "" it would destroy the file.
   async readFile(repository: string, path: string, ref: string): Promise<FileAt | null> {
     let entry: Json;
     try { entry = await this.call(repository, 'GET', '/contents/' + encodePath(path) + '?ref=' + encodeURIComponent(ref)); }
@@ -206,8 +208,10 @@ export class ForgejoForge implements Forge {
       if (/HTTP 404\b/.test(error.message)) return null;
       throw error;
     }
-    if (!entry || entry.type !== 'file') return null;
-    return { sha: String(entry.sha), content: String(entry.content || '') };
+    if (!entry) return null;
+    if (entry.type !== 'file') throw new Error('GET /contents/' + path + ' at ' + ref.slice(0, 8) + ': not a regular file (' + String(entry.type) + ')');
+    if (typeof entry.content !== 'string' || typeof entry.sha !== 'string') throw new Error('GET /contents/' + path + ': no content in the answer');
+    return { sha: entry.sha, content: entry.content };
   }
   // Create (POST) when there is no blob id, update (PUT) when there is one.
   async writeFile(repository: string, path: string, { message, branch, content, sha }: FileWrite): Promise<void> {
