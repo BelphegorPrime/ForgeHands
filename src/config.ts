@@ -403,6 +403,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     splitLabel: env.SPLIT_LABEL?.trim() || null,
     // TICKET_PREFLIGHT (1 by default, 0 = off): a worker's ticket with a broken Steps, Files or Acceptance section starts no run (src/agent/preflight.ts).
     ticketPreflight: ticketPreflightOf(env.TICKET_PREFLIGHT),
+    // TICKET_PREFLIGHT_BLOCK: the rules whose findings reject a ticket (default 2,3); the other findings are advisory and go into the prompt.
+    ticketPreflightBlock: ticketPreflightBlockOf(env.TICKET_PREFLIGHT_BLOCK),
     // HANDBACK_HANDLING (1 by default, 0 = off): a worker run that ends with a comment and no pull request is handed back (src/agent/handback.ts).
     handbackHandling: handbackHandlingOf(env.HANDBACK_HANDLING),
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
@@ -526,6 +528,18 @@ function ticketPreflightOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('TICKET_PREFLIGHT must be 1 or 0');
+}
+
+// TICKET_PREFLIGHT_BLOCK: a comma list of the rule numbers 1 to 4 whose findings reject a ticket, sorted; `none` for no rule. Unset or blank is
+// the default 2,3. Any other value is a mistake worth a clear message.
+function ticketPreflightBlockOf(value: string | undefined): number[] {
+  if (value === undefined || value.trim() === '') return [2, 3];
+  if (value.trim() === 'none') return [];
+  const rules = value.split(',').map((entry) => entry.trim());
+  if (!rules.every((entry) => /^[1-4]$/.test(entry))) {
+    throw new Error('TICKET_PREFLIGHT_BLOCK must be a comma list of rule numbers from 1 to 4 (or none), default 2,3; got ' + JSON.stringify(value));
+  }
+  return [...new Set(rules.map(Number))].sort((a, b) => a - b);
 }
 
 // FAILURE_ESCALATE: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.

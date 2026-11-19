@@ -150,6 +150,8 @@ export interface DirectConfig extends BaseConfig {
   splitLabel: string | null;
   /** TICKET_PREFLIGHT (on by default, 0 = off): a worker's ticket that breaks a rule of src/agent/preflight.ts starts no run. */
   ticketPreflight: boolean;
+  /** TICKET_PREFLIGHT_BLOCK: the rule numbers (1 to 4) whose findings reject a ticket; the other findings are advisory. Default [2, 3]. */
+  ticketPreflightBlock: number[];
   /** HANDBACK_HANDLING (on by default, 0 = off): a worker run that ends with a comment instead of a pull request is a hand-back, not a delivery (src/agent/handback.ts). */
   handbackHandling: boolean;
   archiveAfterDays: number;

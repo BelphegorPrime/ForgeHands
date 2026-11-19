@@ -5,7 +5,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/agent/dispatch.ts';
-import { ticketRevision, ticketViolations } from '../src/agent/preflight.ts';
+import { splitViolations, ticketRevision, ticketViolations } from '../src/agent/preflight.ts';
+import { preflightNoteLines } from '../src/agent/prompt.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { loadConfig } from '../src/config.ts';
 import { metrics } from '../src/metrics.ts';
@@ -85,17 +86,24 @@ const ticket = (label, body, number = 1, extra = {}) => ({
 });
 const starts = () => calls.filter((c) => c.method === 'POST' && c.path.startsWith('/api/conversations'));
 const rulesOf = (list) => list.map((v) => v.rule);
+// The rules of the findings that reject a ticket under a TICKET_PREFLIGHT_BLOCK list (default 2,3).
+const blockingRules = (list, block = [2, 3]) => splitViolations(list, block).blocking.map((v) => v.rule);
+// A forge answer for a repository: a path answers false when it is in `absent`, true otherwise.
+const notOnBranch = (absent) => async (path) => !absent.includes(path);
 
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-preflight-')); clock = 1_000_000; calls = []; });
 afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })); // background saves may still be writing
 
 // The rules, read from a ticket body.
 
-test('a path named in Steps but not listed in Files breaks rule 1', async () => {
+test('rule 1 advises: a path named in Steps but not listed in Files does not block by default, and blocks when TICKET_PREFLIGHT_BLOCK lists 1', async () => {
   const body = ['## Steps', '1. Change `src/a.ts` and `src/b.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
   const found = await ticketViolations(body);
   assert.deepEqual(rulesOf(found), [1]);
   assert.match(found[0].text, /`src\/b\.ts` is named in Steps but not listed in Files/);
+  assert.match(found[0].note, /the Steps name `src\/b\.ts`, which the Files list does not contain/);
+  assert.deepEqual(blockingRules(found), []);
+  assert.deepEqual(blockingRules(found, [1, 2, 3]), [1]);
 });
 
 test('a bare slash path in Steps counts for rule 1 as well as a code span', async () => {
@@ -156,11 +164,14 @@ test('rule 4 breaks when no listed file exists and nothing in the ticket says th
   const body = ['## Steps', '1. Change `src/gone.ts`.', '## Files', '- `src/gone.ts`', '- `src/also-gone.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
   const found = await ticketViolations(body, async () => false);
   assert.deepEqual(rulesOf(found), [4, 4]);
+  // Blocking only in this form (no listed file exists, nothing says it is created), and only when TICKET_PREFLIGHT_BLOCK lists 4.
+  assert.deepEqual(blockingRules(found), []);
+  assert.deepEqual(blockingRules(found, [2, 3, 4]), [4, 4]);
   assert.match(found[0].text, /`src\/gone\.ts` is listed in Files but does not exist/);
   assert.match(found[1].text, /`src\/also-gone\.ts` is listed in Files but does not exist/);
 });
 
-test('rule 4 passes when a listed file is marked new, when Steps say the ticket creates a file, or when one listed file exists', async () => {
+test('rule 4 is advisory when Steps say the ticket creates a file or when one listed file exists; a file marked new is not read', async () => {
   const acceptance = ['## Acceptance', '```sh', 'npm test', '```'];
   const marked = ['## Steps', '1. Change `src/new.ts`.', '## Files', '- `src/new.ts` (new)', ...acceptance].join('\n');
   const created = ['## Steps', '1. Create `src/gone.ts` with the rule.', '## Files', '- `src/gone.ts`', ...acceptance].join('\n');
@@ -168,8 +179,15 @@ test('rule 4 passes when a listed file is marked new, when Steps say the ticket 
   const answers = { 'src/a.ts': true };
   const exists = async (path) => answers[path] ?? false;
   assert.deepEqual(await ticketViolations(marked, exists), []);
-  assert.deepEqual(await ticketViolations(created, exists), []);
-  assert.deepEqual(await ticketViolations(oneExists, exists), []);
+  const creating = await ticketViolations(created, exists);
+  assert.deepEqual(rulesOf(creating), [4]);
+  assert.equal(creating[0].blockable, false);
+  assert.deepEqual(blockingRules(creating, [2, 3, 4]), []);
+  const mixed = await ticketViolations(oneExists, exists);
+  assert.deepEqual(rulesOf(mixed), [4]);
+  assert.equal(mixed[0].blockable, false);
+  assert.match(mixed[0].text, /`src\/gone\.ts` is listed in Files but does not exist/);
+  assert.deepEqual(blockingRules(mixed, [2, 3, 4]), []);
 });
 
 test('rule 4 is not broken when the forge cannot say whether a listed file exists', async () => {
@@ -201,10 +219,10 @@ test('the revision of a ticket is the hash of its title and body: an edit is a n
 
 // The dispatcher: a worker run does not start, the ticket goes back, once per revision.
 
-test('a worker ticket that breaks a rule starts no run, gets one comment and goes back to the planner', async () => {
+test('a worker ticket that breaks a blocking rule starts no run, gets one comment and goes back to the planner', async () => {
   const broken = ['## Steps', '1. Change `src/b.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
-  // src/b.ts is not in the repository (the fake says so), so it is no file that exists: rule 1 breaks.
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/b.ts']);
+  // src/b.ts is not in the repository (the fake says so), so it is no file that exists: rule 1 breaks, because TICKET_PREFLIGHT_BLOCK lists it.
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '1,2,3' }, ['ai:ready'], ['src/b.ts']);
   const result = await dispatcher.enqueue(ticket('ai:ready', broken));
   await dispatcher.tick();
   assert.equal(result.status, 'ticket_rejected');
@@ -264,8 +282,8 @@ test('a ticket that passes starts normally: one run, no comment, the label stays
   assert.deepEqual(forge.removed, []);
 });
 
-test('a ticket whose file is missing on the default branch starts no run', async () => {
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/a.ts']);
+test('a ticket whose file is missing on the default branch starts no run when TICKET_PREFLIGHT_BLOCK lists rule 4', async () => {
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '2,3,4' }, ['ai:ready'], ['src/a.ts']);
   const result = await dispatcher.enqueue(ticket('ai:ready', GOOD));
   assert.equal(result.status, 'ticket_rejected');
   assert.match(forge.comments[0].body, /rule 4: `src\/a\.ts` is listed in Files but does not exist/);
@@ -282,7 +300,7 @@ test('rule 4 reads the Forgejo contents API: a 404 breaks the ticket, a file tha
     if (path.endsWith('/labels')) return { ok: true, status: 200, json: async () => [] };
     return { ok: true, status: 200, json: async () => ({ execution_status: 'running', metrics: null, stats: { usage_to_metrics: { default: { accumulated_cost: 0 } } } }) };
   };
-  const config = loadConfig(env({ SPLIT_LABEL: 'ai:plan' }));
+  const config = loadConfig(env({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '2,3,4' }));
   const jobs = new JobStore(join(dir, 'jobs.json'));
   await jobs.load();
   const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
@@ -362,8 +380,9 @@ const OPENAPI_53 = [
   'npm test -- ts-models',
   '```',
 ].join('\n');
-// The default branch of openapi-generator: the files that the ticket lists and that exist there, and src/models.ts which Steps names.
-const OPENAPI_REPO = { 'src/targets/index.ts': true, 'package.json': true, 'src/models.ts': true };
+// The default branch of openapi-generator: the generator files that the ticket names and that exist there, and src/models.ts which Steps names.
+// test/ts-models.test.ts is created by the ticket (Steps say so) and does not exist yet.
+const OPENAPI_REPO = { 'src/targets/typescript/index.ts': true, 'src/targets/typescript/models.ts': true, 'src/targets/index.ts': true, 'package.json': true, 'src/models.ts': true };
 const onOpenapi = async (path) => OPENAPI_REPO[path] ?? false;
 
 const LEVEL_UP_75 = [
@@ -396,11 +415,17 @@ const LEVEL_UP_76 = [
 ].join('\n');
 const nothingExists = async () => false;
 
-test('the openapi-generator#53 ticket passes rule 1 and rule 4: its names are files of the list, code, versions or files of the default branch', async () => {
-  assert.deepEqual(await ticketViolations(OPENAPI_53, onOpenapi), []);
-  // Without the repository only src/models.ts is a name that is neither listed nor code: it is the one file the ticket does not list.
-  assert.deepEqual(rulesOf(await ticketViolations(OPENAPI_53)), [1]);
-  assert.match((await ticketViolations(OPENAPI_53))[0].text, /`src\/models\.ts` is named in Steps but not listed in Files/);
+test('the openapi-generator#53 ticket is not blocked: its names are listed, code, versions or files of the default branch; the new test file is advisory', async () => {
+  const found = await ticketViolations(OPENAPI_53, onOpenapi);
+  assert.deepEqual(rulesOf(found), [4]); // test/ts-models.test.ts: Steps create it, and it is not marked new
+  assert.match(found[0].note, /`test\/ts-models\.test\.ts` is listed in Files but does not exist/);
+  assert.deepEqual(blockingRules(found, [1, 2, 3, 4]), []);
+  // Without the repository only src/models.ts is a name that is neither listed nor code: rule 1, which blocks only when the list has 1.
+  const bare = await ticketViolations(OPENAPI_53);
+  assert.deepEqual(rulesOf(bare), [1]);
+  assert.match(bare[0].text, /`src\/models\.ts` is named in Steps but not listed in Files/);
+  assert.deepEqual(blockingRules(bare), []);
+  assert.deepEqual(blockingRules(bare, [1]), [1]);
 });
 
 test('code, URLs, versions, prose words and fenced code are not paths for rule 1', async () => {
@@ -432,31 +457,35 @@ test('a path inside a fenced block of Steps counts only with a slash', async () 
   assert.match(found[0].text, /`src\/x\.ts`/);
 });
 
-test('the levelUp#75 ticket, whose files are all created, passes rule 4 because Steps say that it creates them', async () => {
-  assert.deepEqual(await ticketViolations(LEVEL_UP_75, nothingExists), []);
+test('the levelUp#75 ticket, whose files are all created, has advisory rule 4 findings only, because Steps say that it creates them', async () => {
+  const found = await ticketViolations(LEVEL_UP_75, nothingExists);
+  assert.deepEqual(rulesOf(found), [4, 4]);
+  assert.deepEqual(blockingRules(found, [2, 3, 4]), []);
 });
 
 test('the levelUp#76 ticket breaks rule 4 for each file when no listed file exists and no step says a file is created', async () => {
   const found = await ticketViolations(LEVEL_UP_76, nothingExists);
   assert.deepEqual(rulesOf(found), [4, 4]);
+  assert.deepEqual(blockingRules(found, [2, 3, 4]), [4, 4]);
   assert.match(found[0].text, /`src\/checks\/level-up\.ts` is listed in Files but does not exist/);
 });
 
-test('the openapi-generator#53 ticket starts with its open pull request #85 and nothing is closed or commented', async () => {
+test('the openapi-generator#53 ticket starts with its open pull request #85 and nothing is closed or commented; its advisory finding is counted', async () => {
   metrics.reset();
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/targets/typescript/index.ts', 'src/targets/typescript/models.ts', 'test/ts-models.test.ts'], [pullOf(85, 1)]);
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['test/ts-models.test.ts'], [pullOf(85, 1)]);
   const result = await dispatcher.enqueue(ticket('ai:ready', OPENAPI_53));
   assert.equal(result.status, 'queued');
   assert.deepEqual(forge.comments, []);
   assert.deepEqual(forge.closed, []);
   assert.deepEqual(forge.added, []);
-  assert.equal(metrics.counters.get('forgehands_preflight_total{result="ok",rule="none"}'), 1);
+  assert.equal(metrics.counters.get('forgehands_preflight_total{result="advised",rule="4"}'), 1);
+  assert.equal(metrics.counters.get('forgehands_preflight_total{result="ok",rule="none"}'), undefined);
 });
 
 test('a rejected ticket with an open pull request is skipped: no comment, no label change, no close call', async () => {
   metrics.reset();
   const broken = ['## Steps', '1. Change `src/b.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/b.ts'], [pullOf(85, 1)]);
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '1,2,3' }, ['ai:ready'], ['src/b.ts'], [pullOf(85, 1)]);
   const result = await dispatcher.enqueue(ticket('ai:ready', broken));
   assert.notEqual(result.status, 'ticket_rejected');
   assert.deepEqual(forge.comments, []);
@@ -489,7 +518,7 @@ test('when the open pull requests cannot be read, a ticket is not rejected', asy
 
 test('a rejected ticket without a pull request is routed to the planner and no pull request is closed', async () => {
   const broken = ['## Steps', '1. Change `src/b.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/b.ts']);
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '1,2,3' }, ['ai:ready'], ['src/b.ts']);
   const result = await dispatcher.enqueue(ticket('ai:ready', broken));
   assert.equal(result.status, 'ticket_rejected');
   assert.deepEqual(forge.added, ['ai:plan']);
@@ -500,7 +529,7 @@ test('the rejection comment names at most six violations and counts the rest', a
   const names = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => '`src/x' + i + '.ts`');
   const broken = ['## Steps', '1. Touch ' + names.join(', ') + '.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
   const missing = names.map((name) => name.slice(1, -1));
-  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], missing);
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan', TICKET_PREFLIGHT_BLOCK: '1,2,3' }, ['ai:ready'], missing);
   const result = await dispatcher.enqueue(ticket('ai:ready', broken));
   assert.equal(result.status, 'ticket_rejected');
   const body = forge.comments[0].body;
@@ -518,4 +547,162 @@ test('the pre-flight counts its results and the rules it rejects', async () => {
   assert.equal(metrics.counters.get('forgehands_preflight_total{result="rejected",rule="2"}'), 1);
   assert.equal(metrics.counters.get('forgehands_preflight_total{result="ok",rule="none"}'), 1);
   assert.equal(metrics.counters.get('forgehands_preflight_total{result="rejected",rule="1"}'), undefined);
+});
+
+// Advisory findings: rule 1 and the weaker rule 4. A worker can do these tickets. The names are what the planner writes about the output of a
+// generator, a helper script read for context, or a file that is read but not changed. None of them is on the default branch.
+
+// openapi-generator: the generator's Steps name the files it emits (commands.ts, models.ts, src/models.ts, dist/index.js, dist/index.d.ts) and a
+// helper script (scripts/update-golden.sh). The ticket changes only the template and the fixture, which are listed.
+const EMITTED = ['commands.ts', 'models.ts', 'src/models.ts', 'dist/index.js', 'dist/index.d.ts', 'scripts/update-golden.sh'];
+const GENERATOR_TICKET = [
+  '## Steps',
+  '1. In `src/generators/typescript/index.ts` render the discriminator of a oneOf schema.',
+  '2. The generated `commands.ts` and `models.ts` are the output of the generator: do not edit them, the golden files show the expected output.',
+  '3. Keep `src/models.ts`, `dist/index.js` and `dist/index.d.ts` in step with the template; `scripts/update-golden.sh` regenerates the golden files.',
+  '4. Add one fixture under `test/golden/oneof/`.',
+  '',
+  '## Files',
+  '- `src/generators/typescript/index.ts`',
+  '- `src/generators/typescript/templates/model.mustache`',
+  '- `test/golden/oneof/spec.yaml` (new)',
+  '',
+  '## Acceptance',
+  '```sh',
+  'npm test -- golden',
+  '```'
+].join('\n');
+
+// homegraf#235: a helper script that the Steps read for the output format; it lives in another repository.
+const HOMEGRAF_235 = [
+  '## Steps',
+  '1. Add the `--check` flag to the smoke runner in `scripts/smoke.sh`.',
+  '2. The report has the format that `factory_smoke.py` prints: read it for the field names, do not change it.',
+  '',
+  '## Files',
+  '- `scripts/smoke.sh`',
+  '- `test/smoke.test.ts`',
+  '',
+  '## Acceptance',
+  '```sh',
+  'npm test -- smoke',
+  '```'
+].join('\n');
+
+// levelUp#61: the CI file and the architecture note are named in Steps; the ticket changes neither.
+const LEVEL_UP_61 = [
+  '## Steps',
+  '1. Implement the level check in `src/checks/level-up.ts`.',
+  '2. The CI job that runs it is in `ci.yaml`: keep its job names, only add the step.',
+  '3. Document the rule in `docs/architecture.md`, section "Checks".',
+  '',
+  '## Files',
+  '- `src/checks/level-up.ts`',
+  '- `test/checks/level-up.test.ts`',
+  '',
+  '## Acceptance',
+  '```sh',
+  'npm test -- level-up',
+  '```'
+].join('\n');
+
+test('openapi-generator tickets: the names of the emitted files and of the helper script are advisory, and the ticket is not rejected', async () => {
+  const found = await ticketViolations(GENERATOR_TICKET, notOnBranch(EMITTED));
+  assert.deepEqual(rulesOf(found), [1, 1, 1, 1, 1, 1]);
+  assert.deepEqual(blockingRules(found), []);
+  assert.deepEqual(blockingRules(found, [1, 2, 3]), [1, 1, 1, 1, 1, 1]);
+});
+
+test('homegraf#235: a helper script read for the output format is advisory, not a rejection', async () => {
+  const found = await ticketViolations(HOMEGRAF_235, notOnBranch(['factory_smoke.py']));
+  assert.deepEqual(rulesOf(found), [1]);
+  assert.match(found[0].note, /the Steps name `factory_smoke\.py`, which the Files list does not contain/);
+  assert.deepEqual(blockingRules(found), []);
+});
+
+test('levelUp#61: the CI file and the architecture note named in Steps are advisory, not a rejection', async () => {
+  const found = await ticketViolations(LEVEL_UP_61, notOnBranch(['ci.yaml', 'docs/architecture.md']));
+  assert.deepEqual(rulesOf(found), [1, 1]);
+  assert.deepEqual(blockingRules(found), []);
+});
+
+test('an advisory finding goes into the worker prompt as one pre-flight note: the run starts, with no comment and no label change', async () => {
+  metrics.reset();
+  const body = ['## Steps', '1. Change `src/a.ts` and emit `commands.ts` from it.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['commands.ts']);
+  const result = await dispatcher.enqueue(ticket('ai:ready', body));
+  await dispatcher.tick();
+  assert.equal(result.status, 'queued');
+  assert.equal(starts().length, 1);
+  const text = starts()[0].body.initial_message.content[0].text;
+  assert.ok(text.includes('Pre-flight notes, not blockers: the Steps name `commands.ts`, which the Files list does not contain. Stay within the Files list unless the step clearly needs it, and say so in the pull request.'), text);
+  assert.ok(text.indexOf('Pre-flight notes, not blockers:') < text.indexOf('<<<UNTRUSTED_ISSUE_TEXT'), 'the note comes before the untrusted ticket text');
+  assert.deepEqual(forge.comments, []);
+  assert.deepEqual(forge.removed, []);
+  assert.deepEqual(forge.added, []);
+  assert.equal(metrics.counters.get('forgehands_preflight_total{result="advised",rule="1"}'), 1);
+  assert.equal(metrics.counters.get('forgehands_preflight_total{result="rejected",rule="1"}'), undefined);
+});
+
+test('rule 1 advises by default on the same ticket as before: the run starts and the prompt names the file', async () => {
+  const broken = ['## Steps', '1. Change `src/b.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/b.ts']);
+  const result = await dispatcher.enqueue(ticket('ai:ready', broken));
+  await dispatcher.tick();
+  assert.equal(result.status, 'queued');
+  assert.equal(starts().length, 1);
+  assert.match(starts()[0].body.initial_message.content[0].text, /Pre-flight notes, not blockers: the Steps name `src\/b\.ts`, which the Files list does not contain\./);
+  assert.deepEqual(forge.comments, []);
+});
+
+test('rule 4 in its strict form starts the run by default, with a note; the note names the missing file', async () => {
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['src/a.ts']);
+  const result = await dispatcher.enqueue(ticket('ai:ready', GOOD));
+  await dispatcher.tick();
+  assert.equal(result.status, 'queued');
+  assert.match(starts()[0].body.initial_message.content[0].text, /Pre-flight notes, not blockers: `src\/a\.ts` is listed in Files but does not exist on the default branch and is not marked new\./);
+  assert.deepEqual(forge.comments, []);
+});
+
+test('rule 2 and rule 3 still block by default: no run starts, and the comment names only the blocking rule', async () => {
+  const noCommand = ['## Steps', '1. Change `src/a.ts` and emit `commands.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', 'Run the tests and read the output.'].join('\n');
+  const placeholder = ['## Steps', '1. Change `src/a.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', '<command>', '```'].join('\n');
+  assert.deepEqual(blockingRules(await ticketViolations(noCommand, notOnBranch(['commands.ts']))), [2]);
+  assert.deepEqual(blockingRules(await ticketViolations(placeholder)), [3]);
+  const { dispatcher, forge } = await build({ SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['commands.ts']);
+  const result = await dispatcher.enqueue(ticket('ai:ready', noCommand));
+  await dispatcher.tick();
+  assert.equal(result.status, 'ticket_rejected');
+  assert.equal(starts().length, 0);
+  assert.equal(forge.comments.length, 1);
+  assert.match(forge.comments[0].body, /- rule 2: the Acceptance section has no fenced command block/);
+  assert.doesNotMatch(forge.comments[0].body, /rule 1/);
+  assert.match(forge.comments[0].body, /rule 2/);
+});
+
+test('TICKET_PREFLIGHT_BLOCK is a comma list of rule numbers from 1 to 4 (default 2,3, or none); anything else is refused', () => {
+  assert.deepEqual(loadConfig(env()).ticketPreflightBlock, [2, 3]);
+  assert.deepEqual(loadConfig(env({ TICKET_PREFLIGHT_BLOCK: '' })).ticketPreflightBlock, [2, 3]);
+  assert.deepEqual(loadConfig(env({ TICKET_PREFLIGHT_BLOCK: ' 4 , 2,2 ' })).ticketPreflightBlock, [2, 4]);
+  assert.deepEqual(loadConfig(env({ TICKET_PREFLIGHT_BLOCK: '1,2,3,4' })).ticketPreflightBlock, [1, 2, 3, 4]);
+  assert.deepEqual(loadConfig(env({ TICKET_PREFLIGHT_BLOCK: 'none' })).ticketPreflightBlock, []);
+  for (const bad of ['5', '0', '2,,3', '2;3', 'two', '1.5', 'none,2', '2,3,']) {
+    assert.throws(() => loadConfig(env({ TICKET_PREFLIGHT_BLOCK: bad })), /TICKET_PREFLIGHT_BLOCK must be a comma list of rule numbers from 1 to 4/, bad);
+  }
+});
+
+test('the pre-flight notes: none for no findings; at most six named, then the count', () => {
+  assert.deepEqual(preflightNoteLines([]), []);
+  const notes = [1, 2, 3, 4, 5, 6, 7].map((i) => 'note ' + i);
+  assert.deepEqual(preflightNoteLines(notes), ['Pre-flight notes, not blockers: note 1; note 2; note 3; note 4; note 5; note 6 (and 1 more). Stay within the Files list unless the step clearly needs it, and say so in the pull request.']);
+});
+
+test('TICKET_PREFLIGHT=0 gives no notes and no rejection: the advisory findings are not read at all', async () => {
+  const { dispatcher, forge } = await build({ TICKET_PREFLIGHT: '0', SPLIT_LABEL: 'ai:plan' }, ['ai:ready'], ['commands.ts']);
+  const body = ['## Steps', '1. Emit `commands.ts`.', '## Files', '- `src/a.ts`', '## Acceptance', '```sh', 'npm test', '```'].join('\n');
+  const result = await dispatcher.enqueue(ticket('ai:ready', body));
+  await dispatcher.tick();
+  assert.equal(result.status, 'queued');
+  assert.doesNotMatch(starts()[0].body.initial_message.content[0].text, /Pre-flight notes/);
+  assert.deepEqual(forge.comments, []);
 });

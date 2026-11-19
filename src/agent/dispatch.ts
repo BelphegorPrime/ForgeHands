@@ -2167,12 +2167,15 @@ export class Dispatcher {
     // CHECKS_FROM_CI: a review run is given the check result of its head, read from the forge now (see agent/checks.ts).
     const checks = this.config.checksFromCi && job.event.ci && (job.event.type === 'ci.success' || job.event.type === 'ci.sensitive')
       ? await checkFacts(this.forge, job.event.repository.full_name, job.event.ci.commit_sha, this.logger, this.config.reviewWithoutCi) : null;
+    // The advisory findings of the ticket pre-flight are given to a worker's prompt as notes (preflight.ts); blocking ones never get here.
+    const notes = !job.event.pull_request && this.config.routes.get(job.label)?.kind === 'issue' && !this.isPlannerLabel(job.label)
+      ? await this.preflight.notesOf(job.event) : [];
     const body: Json = {
       workspace: { working_dir: this.config.workspaceDir },
       agent_profile_id: effective.profile,
       max_iterations: route.maxIterations,
       tags: { source: 'forgehands', ...(job.event.bot ? { bot: 'dependency' } : { issue: String(job.event.issue.number) }), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
-      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks) + handbackLine(job) }] }
+      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks, notes) + handbackLine(job) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
     // Built per start from the environment; never stored in the ledger.
