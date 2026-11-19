@@ -12,6 +12,7 @@ import { JobStore } from '../src/store/jobs.ts';
 import { Dispatcher } from '../src/agent/dispatch.ts';
 import { loadConfig } from '../src/config.ts';
 import { buildPrompt } from '../src/agent/prompt.ts';
+import { metrics } from '../src/metrics.ts';
 
 const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -57,7 +58,7 @@ function fakeForgejo(routes) {
 }
 
 // The forge's view of issue 26 (state, labels, sub-issues) can be changed by a test; OpenHands answers as a running conversation.
-async function build(extra = {}) {
+async function build(extra = {}, logger = quiet) {
   const config = loadConfig(env(extra));
   const jobs = new JobStore(join(dir, 'jobs-' + (counter++) + '.json'));
   await jobs.load();
@@ -76,7 +77,7 @@ async function build(extra = {}) {
     return { ok: true, status: 200, json: async () => ({ execution_status: states[new URL(url).pathname.split('/').pop()] || 'running', stats: { usage_to_metrics: {} } }) };
   };
   const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
-  const dispatcher = new Dispatcher(config, jobs, send, quiet, () => clock);
+  const dispatcher = new Dispatcher(config, jobs, send, logger, () => clock);
   return { config, jobs, dispatcher, issue, forgejo };
 }
 const event = (label, number = 26) => ({
@@ -149,16 +150,106 @@ test('the message of the restarted planner has the line, and a first run has non
   assert.match(answered, /You are started again because the operator commented\. Read ALL comments of the epic first; his answers are binding;/);
 });
 
-test('no restart when the planner created sub-issues, or when it blocks issues', async () => {
+test('no restart when the planner created sub-issues', async () => {
   const t = await build();
   await t.dispatcher.enqueue(event('ai:plan'));
   await endLast(t);
+  assert.deepEqual(t.jobs.list().at(-1).deps_before, [], 'the snapshot of the run: no dependencies when it started');
   t.issue.dependencies = [{ number: 27, state: 'open' }];
   assert.equal(await answer(t, { label: 'ai:plan' }), 'has_sub_issues');
-  t.issue.dependencies = [];
-  t.issue.blocks = [{ number: 28, state: 'open' }];
-  assert.equal(await answer(t, { id: 602, label: 'ai:plan' }), 'has_sub_issues');
   assert.equal(t.jobs.list().length, 1);
+});
+
+test('a planner that blocks other issues, and has dependencies from before it ran, is restarted by the answer', async () => {
+  const t = await build();
+  // #26 depends on two earlier tickets of its epic (closed, so the planner is not held back) and blocks the next ticket and its epic
+  t.issue.dependencies = [{ number: 56, state: 'closed' }, { number: 57, state: 'closed' }];
+  t.issue.blocks = [{ number: 60, state: 'open' }, { number: 47, state: 'open' }];
+  await t.dispatcher.enqueue(event('ai:plan'));
+  assert.equal((await endLast(t)).status, 'done');
+  assert.deepEqual(t.jobs.list().at(-1).deps_before, [56, 57]);
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'queued');
+  await t.dispatcher.tick();
+  assert.equal(starts().length, 2, 'the planner starts again');
+  assert.equal(t.jobs.list().at(-1).event.plan_answer, true);
+});
+
+test('a planner that created sub-issues is not restarted, even with blocks and earlier dependencies', async () => {
+  const t = await build();
+  t.issue.dependencies = [{ number: 56, state: 'closed' }];
+  t.issue.blocks = [{ number: 60, state: 'open' }];
+  await t.dispatcher.enqueue(event('ai:plan'));
+  await endLast(t);
+  t.issue.dependencies = [{ number: 56, state: 'closed' }, { number: 58, state: 'open' }];
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'has_sub_issues');
+  assert.equal(starts().length, 1);
+});
+
+test('every planner run has its own snapshot: a dependency from before the first run does not block the answers to the runs after it', async () => {
+  const t = await build();
+  t.issue.dependencies = [{ number: 56, state: 'closed' }];
+  await t.dispatcher.enqueue(event('ai:plan'));
+  await endLast(t);
+  assert.deepEqual(t.jobs.list().at(-1).deps_before, [56]);
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'queued', 'the first answer restarts the planner');
+  assert.equal(starts().length, 2);
+  await endLast(t);
+  assert.deepEqual(t.jobs.list().at(-1).deps_before, [56], 'the restarted run starts with the same dependencies');
+  assert.equal(await answer(t, { id: 613, label: 'ai:plan' }), 'queued', 'and so does the next answer');
+  assert.equal(starts().length, 3);
+});
+
+test('a job from before the snapshot: dependencies created after its run started count, earlier ones do not', async () => {
+  const t = await build();
+  t.issue.dependencies = [{ number: 56, state: 'closed', created_at: '2026-11-18T11:00:00Z' }];
+  await t.dispatcher.enqueue(event('ai:plan'));
+  await endLast(t);
+  delete t.jobs.list().at(-1).deps_before;
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'queued', 'an earlier dependency is not a sub-issue of this run');
+  await endLast(t); // the restarted run (its snapshot is taken again) ends
+  delete t.jobs.list().at(-1).deps_before;
+  t.issue.dependencies = [{ number: 56, state: 'closed', created_at: '2026-11-18T11:00:00Z' }, { number: 58, state: 'open', created_at: '2026-11-18T13:00:00Z' }];
+  assert.equal(await answer(t, { id: 610, label: 'ai:plan' }), 'has_sub_issues', 'a dependency created after the run started is one');
+  assert.equal(starts().length, 2);
+});
+
+test('a job from before the snapshot without creation times: every dependency counts, blocks do not', async () => {
+  const t = await build();
+  t.issue.dependencies = [{ number: 56, state: 'closed' }];
+  t.issue.blocks = [{ number: 60, state: 'open' }];
+  await t.dispatcher.enqueue(event('ai:plan'));
+  await endLast(t);
+  delete t.jobs.list().at(-1).deps_before;
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'has_sub_issues', 'no time to tell, so the dependency counts as a sub-issue');
+  t.issue.dependencies = [];
+  assert.equal(await answer(t, { id: 611, label: 'ai:plan' }), 'queued', 'blocks alone never stop an answer');
+});
+
+test('an ignored answer after a finished planner is logged in one line and counted by reason', async () => {
+  const lines = [];
+  const logger = { error: (...parts) => lines.push(parts.join(' ')) };
+  const t = await build({}, logger);
+  await t.dispatcher.enqueue(event('ai:plan'));
+  await endLast(t);
+  const count = (reason) => [...metrics.counters].filter(([key]) => key.startsWith('forgehands_comment_ignored_total') && key.includes('reason="' + reason + '"')).reduce((sum, [, value]) => sum + value, 0);
+  const before = count('has_sub_issues');
+  t.issue.dependencies = [{ number: 27, state: 'open' }];
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'has_sub_issues');
+  assert.ok(lines.includes(repo + '#26: marcel commented, not restarting the plan: has_sub_issues'), lines.join('\n'));
+  assert.equal(count('has_sub_issues'), before + 1);
+  // a planner that is gone from the label is logged too
+  t.issue.dependencies = [];
+  t.issue.labels = [];
+  assert.equal(await answer(t, { id: 612, label: 'ai:plan' }), 'label_gone');
+  assert.ok(lines.includes(repo + '#26: marcel commented, not restarting the plan: label_gone'));
+  assert.equal(starts().length, 1);
+});
+
+test('a comment with no finished planner (the usual case) is not logged as an ignored answer', async () => {
+  const lines = [];
+  const t = await build({}, { error: (...parts) => lines.push(parts.join(' ')) });
+  assert.equal(await answer(t, { label: 'ai:plan' }), 'no_failed_run');
+  assert.equal(lines.filter((line) => line.includes('not restarting the plan')).length, 0);
 });
 
 test('no restart while the planner runs or waits, nor when the planner is queued', async () => {

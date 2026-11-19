@@ -479,9 +479,10 @@ export class Dispatcher {
 
   // PLAN_ANSWER_RESTARTS: a planner that finished without sub-issues asked the operator questions (its prompt says so), and his comment answers
   // them: the planner starts again. Only when the newest run of a planner label is done, the issue is open and still carries that label, and it
-  // has no sub-issues (its dependencies and the issues it blocks are both empty). A planner that is still running is not restarted (the active
-  // check in onComment); an unreadable forge or an unclear answer means nothing happens. Once per comment, and at most N times per ticket and label,
-  // then one notice on the issue.
+  // has created no sub-issues: no dependency of the issue that was not there when the planner run started (Job.deps_before). Issues it blocks say
+  // nothing about the planner and never stop an answer (see plannerCreated). A planner that is still running is not restarted (the active check in
+  // onComment); an unreadable forge or an unclear answer means nothing happens. Once per comment, and at most N times per ticket and label, then one
+  // notice on the issue. An answer that starts nothing after a finished planner is logged and counted (ignoredAnswer).
   async planAnswer(event: ForgeEvent, runs: Job[], commentKey: string): Promise<string> {
     const limit = this.config.planAnswerRestarts;
     if (!limit) return 'plan_answers_off';
@@ -489,24 +490,24 @@ export class Dispatcher {
     const number = event.issue.number;
     const ticket = this.issueKey(event);
     const planner = runs.filter((job) => this.isPlannerLabel(job.label));
-    const label = planner.at(-1)?.label;
+    const last = planner.at(-1);
+    const label = last?.label;
     // No finished planner is the answer a comment has always got when nothing failed ('no_failed_run').
-    if (!label || planner.at(-1)!.status !== 'done') return 'no_failed_run';
-    let issue: Json; let dependencies: unknown; let blocks: unknown;
+    if (!label || last!.status !== 'done') return 'no_failed_run';
+    let issue: Json; let dependencies: unknown;
     try {
       issue = await this.forge.getIssue(repository, number);
       dependencies = await this.forge.dependencies(repository, number);
-      blocks = await this.forge.blocks(repository, number);
     } catch (error) {
       this.logger.error('could not read #' + number + ' after a comment, not restarting its plan:', error.message);
-      return 'issue_unreadable';
+      return this.ignoredAnswer(event, 'issue_unreadable');
     }
-    if (!issue || issue.state !== 'open' || issue.pull_request) return 'not_open';
+    if (!issue || issue.state !== 'open' || issue.pull_request) return this.ignoredAnswer(event, 'not_open');
     const labels: string[] = (Array.isArray(issue.labels) ? issue.labels : []).map((entry: Json) => entry?.name).filter((name: unknown): name is string => typeof name === 'string');
-    if (!labels.includes(label)) return 'label_gone';
+    if (!labels.includes(label)) return this.ignoredAnswer(event, 'label_gone');
     // A read that does not give a list is unknown, and unknown means nothing happens.
-    if (!Array.isArray(dependencies) || !Array.isArray(blocks)) return 'links_unknown';
-    if (dependencies.length || blocks.length) return 'has_sub_issues';
+    if (!Array.isArray(dependencies)) return this.ignoredAnswer(event, 'links_unknown');
+    if (this.plannerCreated(last!, dependencies).length) return this.ignoredAnswer(event, 'has_sub_issues');
     const now = this.now();
     const restarts = planner.filter((job) => job.label === label && job.event?.plan_answer).length;
     if (restarts >= limit) {
@@ -522,7 +523,7 @@ export class Dispatcher {
       }
       this.jobs.note(commentKey, now);
       await this.jobs.persist(now);
-      return 'plan_answers_used_up';
+      return this.ignoredAnswer(event, 'plan_answers_used_up');
     }
     // The comment is the trigger, not part of the run: the COMMENT_RESTARTS line and its count do not apply to it.
     const { comment: answer, ...rest } = event;
@@ -533,6 +534,26 @@ export class Dispatcher {
     metrics.inc('forgehands_plan_answer_restarts_total');
     this.logger.error(repository + '#' + number + ': ' + answer!.login + ' commented on a plan without sub-issues, running ' + label + ' again');
     return result.status;
+  }
+
+  // The sub-issues the planner run created: the dependencies that were not there when it started. A job without the snapshot (before it existed)
+  // counts the dependencies created after the run started, when the forge gives their creation time; without one, every dependency counts.
+  plannerCreated(planner: Job, dependencies: Json[]): Json[] {
+    const before = planner.deps_before;
+    if (Array.isArray(before)) return dependencies.filter((issue) => !before.includes(issue?.number));
+    const started = planner.started;
+    return dependencies.filter((issue) => {
+      const created = typeof issue?.created_at === 'string' ? Date.parse(issue.created_at) : NaN;
+      if (!started || Number.isNaN(created)) return true;
+      return created >= started;
+    });
+  }
+
+  // An answer that starts nothing is said once in the log and counted (forgehands_comment_ignored_total{reason}), so that a silent ignore is visible.
+  ignoredAnswer(event: ForgeEvent, reason: string): string {
+    metrics.inc('forgehands_comment_ignored_total', { reason });
+    this.logger.error(event.repository.full_name + '#' + event.issue.number + ': ' + event.comment?.login + ' commented, not restarting the plan: ' + reason);
+    return reason;
   }
 
   // The notice that PLAN_ANSWER_RESTARTS is used up: one comment on the issue and a notification, as COMMENT_RESTARTS does.
@@ -2131,6 +2152,17 @@ export class Dispatcher {
     const { route: effective, fellBack } = this.effectiveRoute(job, now);
     job.fell_back = fellBack;
     if (fellBack) this.logger.error(job.key + ': the tier of its route is out of quota, starting with the fallback route ' + fellBack);
+    // PLAN_ANSWER_RESTARTS: a planner run records the dependencies it starts with; an answer later counts only the sub-issues created since (planAnswer).
+    // Without a readable forge the snapshot stays out, and planAnswer falls back to the creation dates.
+    delete job.deps_before;
+    if (this.isPlannerLabel(job.label) && !job.event.pull_request && this.config.forgejo) {
+      try {
+        const before = await this.forge.dependencies(job.event.repository.full_name, job.event.issue.number);
+        if (Array.isArray(before)) job.deps_before = before.map((issue: Json) => issue.number).filter((number: unknown) => Number.isInteger(number)).sort((a: number, b: number) => a - b);
+      } catch (error) {
+        this.logger.error('could not read the dependencies of #' + job.event.issue.number + ' before its planner run:', error.message);
+      }
+    }
     // CHECKS_FROM_CI: a review run is given the check result of its head, read from the forge now (see agent/checks.ts).
     const checks = this.config.checksFromCi && job.event.ci && (job.event.type === 'ci.success' || job.event.type === 'ci.sensitive')
       ? await checkFacts(this.forge, job.event.repository.full_name, job.event.ci.commit_sha, this.logger, this.config.reviewWithoutCi) : null;
