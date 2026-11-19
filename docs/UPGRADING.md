@@ -222,6 +222,15 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **The webhook answer.** With `COMMENT_RESTARTS=0` a comment now reaches the dispatcher when `PLAN_ANSWER_RESTARTS` is on, so the webhook answers `comment_restarts_off` where it used to answer `ignored`. Nothing starts in either case.
 - **Rollback.** Set `PLAN_ANSWER_RESTARTS=0`, or go back to the previous version. The ledger gains `plan_answer` on a job; the previous version ignores it.
 
+# Upgrading to the version after 0.9.10: blocks do not hold back an answer to a planner
+
+**Fix.** A comment of `HUMAN_LOGIN` on a planner's issue was ignored (`has_sub_issues`, silently) when that issue blocked other issues or had dependencies from before the planner ran, so a plan that asked its questions got no answer. Now only the sub-issues created by the planner run count (README, "A comment answers a planner without sub-issues").
+
+- **Nothing to set.** `PLAN_ANSWER_RESTARTS` keeps its meaning and default.
+- **What you see.** An answer that starts nothing after a finished planner is logged as `<repo>#<n>: <login> commented, not restarting the plan: <reason>` and counted by `forgehands_comment_ignored_total{reason}`. Watch this counter after the upgrade: a `has_sub_issues` on a ticket whose planner created no sub-issues is a bug to report.
+- **Existing jobs.** A planner run that started before this version has no record of its dependencies. Its answers count only the dependencies created after the run started, when Forgejo gives creation times, and every dependency otherwise (as before).
+- **Rollback.** Go back to the previous version. The ledger gains `deps_before` on planner jobs; the previous version ignores it.
+
 # Upgrading to the version after 0.8.1: tickets deleted in the forge leave the queue
 
 **Fix.** A ticket deleted in Forgejo kept its waiting jobs in the ledger: the dependency read answered 404 on every look, the log repeated the same line, and when its dependencies resolved a run would have started for a ticket that no longer exists. From this version a 404 of the ticket itself (not of its dependency list) drops its waiting and queued jobs.

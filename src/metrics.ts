@@ -43,7 +43,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_stuck_pr_blocks_total: 'Agent pull requests the stuck-PR watchdog blocked for a human, by reason (stuck_rounds, stuck_verdict; STUCK_PR_MINUTES).',
   forgehands_epic_gaps_total: 'Epics the epic review found still open, by action: replanned (sent back to the planner, EPIC_GAP_REPLAN) or handed (the human was called).',
   forgehands_merges_reverted_total: 'Merges ForgeHands made whose revert pull request was merged, by repository (counted once per merge).',
-  forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.'
+  forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.',
+  forgehands_comment_ignored_total: 'Answers of HUMAN_LOGIN to a planner that started nothing, by reason (has_sub_issues, not_open, label_gone, links_unknown, issue_unreadable, plan_answers_used_up).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -136,7 +137,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total', 'forgehands_comment_ignored_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 

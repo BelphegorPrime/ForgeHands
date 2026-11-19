@@ -40,6 +40,8 @@ export interface Issue {
   html_url?: string | null;
   comments?: number;
   labels?: Label[];
+  /** ISO time of creation, when the forge gives it (Forgejo does). */
+  created_at?: string;
   /** Set when the "issue" is a pull request. */
   pull_request?: unknown;
 }

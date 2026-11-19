@@ -416,6 +416,9 @@ export interface Job {
   waiting_for_run?: boolean;
   conversation_id?: string;
   started?: number;
+  /** A planner run's dependencies when it started (sorted issue numbers). An answer to the plan counts the sub-issues created since (Dispatcher.planAnswer);
+   * a job without it comes from before the snapshot existed. */
+  deps_before?: number[];
   finished?: number;
   result?: string;
   error?: string;
