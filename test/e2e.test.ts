@@ -13,6 +13,7 @@ import { loadConfig } from '../src/config.ts';
 import { parseScenario, type Scenario } from '../src/e2e/format.ts';
 import { E2eController } from '../src/e2e/controller.ts';
 import { cleanup, runScenario, runSuite, restoreBranch } from '../src/e2e/runner.ts';
+import { ForgejoForge } from '../src/forge/forgejo/index.ts';
 import { SCENARIO_NAMES, SCENARIOS, selectScenarios } from '../src/e2e/scenarios.ts';
 import { PREFLIGHT_REJECTION, ticketViolations } from '../src/agent/preflight.ts';
 import { JobStore } from '../src/store/jobs.ts';
@@ -255,19 +256,19 @@ test('cleanup after a failing step closes the pull request and the ticket, delet
   assert.equal(result.ok, false);
   assert.equal(result.cleanup, 'ok', result.cleanup_reason);
   // restoreBranch changes nothing when main already has the tree of the start.
-  assert.equal(await restoreBranch(forge, 'owner/hello', 'main', baseline), 0, 'main has the tree of the start');
+  assert.equal((await restoreBranch(forge, 'owner/hello', 'main', baseline)).changed, 0, 'main has the tree of the start');
   assert.equal(forge.readFile(null, 'e2e/stray.txt', 'main'), null);
   assert.equal([...forge.pulls.values()].every((pr) => pr.state === 'closed'), true);
   assert.equal([...forge.branches.keys()].filter((name) => name.startsWith('ai/')).length, 0);
 });
 
-test('a cleanup that cannot delete a branch makes the scenario fail, even when its steps held', async () => {
+test('a cleanup that cannot delete a branch fails the cleanup, not the scenario: the steps held and say so', async () => {
   const forge = new FakeForge();
   forge.progress = forgeHands();
   forge.deleteBranch = () => { throw new Error('DELETE branch -> HTTP 500'); };
   const result = await runScenario(scenario([ticketStep, { do: 'wait', for: { findPull: 'ai/issue-$ticket' } }]), runOptions(forge));
   assert.equal(result.reason, null, 'the steps held');
-  assert.equal(result.ok, false);
+  assert.equal(result.ok, true, 'ok is the steps');
   assert.equal(result.cleanup, 'failed');
   assert.match(result.cleanup_reason, /delete branch ai\/issue-\d+: DELETE branch -> HTTP 500/);
 });
@@ -390,14 +391,107 @@ test('the cleanup of a delivery under another ticket closes the sub-issue and it
   forge.mergePull(pr.number);
   assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main') !== null, true, 'the delivery is on main');
 
-  const problem = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline });
+  const { problem, note } = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline });
   assert.equal(problem, null);
+  assert.equal(note, null);
   assert.equal(sub.state, 'closed', 'the sub-issue is closed');
   assert.equal(ticket.state, 'closed', 'the run ticket is closed');
   assert.equal(forge.pulls.get(pr.number).merged, true, 'the merged pull request stays as it is');
   assert.deepEqual([...forge.branches.keys()].filter((name) => name.startsWith('ai/')), [], 'the branch of the sub-issue is deleted');
   assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main'), null, 'main has the tree of the start again');
-  assert.equal(await restoreBranch(forge, 'owner/hello', 'main', baseline), 0);
+  assert.equal((await restoreBranch(forge, 'owner/hello', 'main', baseline)).changed, 0);
+});
+
+// A file the fake cannot read as a regular file (a symlink, a submodule): the real Forgejo readFile throws for those.
+function linkEntries(forge) {
+  const readFile = forge.readFile.bind(forge);
+  forge.readFile = (repository, path, ref) => {
+    const text = forge.snapshotOf(ref).get(path);
+    if (text === '@@link') throw new Error('GET /contents/' + path + ' at ' + ref.slice(0, 8) + ': not a regular file (symlink)');
+    return readFile(repository, path, ref);
+  };
+}
+
+test('restore: a commit that lands while the restore runs is caught by the next pass and put back', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/delivery.txt': 'delivered', 'e2e/red.marker': '' });
+  let landed = false;
+  // Another commit lands on main while the first write of the restore is on its way: after the compare of the pass.
+  forge.progress = (f, name) => {
+    if ((name === 'writeFile' || name === 'deleteFile') && !landed) { landed = true; f.commitOn('main', 'main', { 'e2e/late.txt': 'late' }); }
+  };
+  const touched = new Set(['e2e/delivery.txt', 'e2e/red.marker', 'e2e/late.txt']);
+  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched, sleep: async () => {}, waitMs: 0 });
+  assert.equal(landed, true);
+  assert.equal(result.changed >= 3, true, 'the delivery, the marker and the late file are restored');
+  assert.deepEqual(result.untouched, []);
+  assert.equal(forge.readFile(null, 'e2e/late.txt', 'main'), null);
+  assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main'), null);
+});
+
+test('restore: a path the restore cannot read is left alone when the run did not touch it, and fails the restore when it did', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/link': '@@link' });
+  linkEntries(forge);
+  const relaxed = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(), sleep: async () => {}, waitMs: 0 });
+  assert.deepEqual(relaxed.untouched, ['e2e/link'], 'a difference of the run only is the run\'s concern');
+  await assert.rejects(restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/link']), sleep: async () => {}, waitMs: 0 }),
+    /main still differs from \S+ in 1 file\(s\) of the run: e2e\/link$/);
+  // Without a set of the run's paths every difference counts.
+  await assert.rejects(restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: null, sleep: async () => {}, waitMs: 0 }), /e2e\/link/);
+});
+
+test('restore: a trailing newline, a deleted file and a file that did not exist at the start are all put back, the contents exactly', async () => {
+  const forge = new FakeForge();
+  forge.commitOn('main', 'main', { 'e2e/keep.txt': 'keep' });
+  const baseline = forge.branches.get('main');
+  // The run: a trailing newline added to README, the kept file deleted, a new file created.
+  forge.commitOn('main', 'main', { 'README.md': 'hello\n' });
+  const snapshot = new Map(forge.snapshotOf('main'));
+  snapshot.delete('e2e/keep.txt');
+  snapshot.set('e2e/new.txt', 'created');
+  forge.branches.set('main', forge.commit(snapshot));
+  const touched = new Set(['README.md', 'e2e/keep.txt', 'e2e/new.txt']);
+  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched, sleep: async () => {} });
+  assert.equal(result.changed, 3);
+  assert.equal(forge.readFile(null, 'README.md', 'main').content, b64('hello'), 'the bytes of the start, no newline added or lost');
+  assert.equal(forge.readFile(null, 'e2e/keep.txt', 'main').content, b64('keep'), 'the deleted file is written back');
+  assert.equal(forge.readFile(null, 'e2e/new.txt', 'main'), null);
+  assert.equal((await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched })).changed, 0);
+});
+
+test('cleanup: a stray the run did not touch is left alone with a note; the same stray in a path the run touched fails the cleanup and names it', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const ticket = forge.createIssue('owner/hello', 'E2E normal delivery', 'B');
+  // The run's branch changes e2e/delivery.txt; a stray on main has an unreadable entry at e2e/link.
+  forge.commitOn('ai/issue-' + ticket.number, 'main', { 'e2e/delivery.txt': 'delivered' });
+  forge.commitOn('main', 'main', { 'e2e/link': '@@link' });
+  linkEntries(forge);
+  const relaxed = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline }, { sleep: async () => {} });
+  assert.equal(relaxed.problem, null, 'the cleanup holds');
+  assert.match(relaxed.note, /main still differs from \S+ in 1 file\(s\) the run did not touch, left alone: e2e\/link/);
+
+  const again = new FakeForge();
+  const base2 = again.branches.get('main');
+  const ticket2 = again.createIssue('owner/hello', 'E2E normal delivery', 'B');
+  again.commitOn('ai/issue-' + ticket2.number, 'main', { 'e2e/link': '@@link' });
+  again.commitOn('main', 'main', { 'e2e/link': '@@link' });
+  linkEntries(again);
+  const failed = await cleanup('owner/hello', again, { tickets: [ticket2.number], defaultBranch: 'main', baseline: base2 }, { sleep: async () => {} });
+  assert.match(failed.problem, /^reset main: main still differs from \S+ in 1 file\(s\) of the run: e2e\/link$/);
+  assert.equal(failed.note, null);
+});
+
+test('forgejo readFile: a regular file reads, a missing one is null, while a symlink or a file without content throws (never written back as "")', async () => {
+  const answer = (entry) => new ForgejoForge(async () => entry);
+  const missing = new ForgejoForge(async () => { throw new Error('GET /contents/x -> HTTP 404'); });
+  assert.equal(await missing.readFile('owner/hello', 'x', 'main'), null);
+  assert.deepEqual(await answer({ type: 'file', sha: 'abc', content: 'aGk=' }).readFile('owner/hello', 'x', 'main'), { sha: 'abc', content: 'aGk=' });
+  await assert.rejects(answer({ type: 'symlink', sha: 'abc', content: '' }).readFile('owner/hello', 'x', 'main'), /not a regular file \(symlink\)/);
+  await assert.rejects(answer({ type: 'file', sha: 'abc' }).readFile('owner/hello', 'x', 'main'), /no content/);
 });
 
 // A controller over a ledger file of its own, for the trigger tests.
@@ -456,10 +550,14 @@ test('a failing scenario sends a notification of kind failed, and the gauge show
     assert.equal(messages[0].repository, 'owner/hello');
     assert.match(messages[0].message.text, /expected red/);
     const samples = controller.gauges();
-    assert.deepEqual(samples.map((sample) => [sample.labels.scenario, sample.value]), [['smoke', 1], ['broken', 0]]);
+    assert.deepEqual(samples.filter((sample) => sample.name === 'forgehands_e2e_scenario_ok').map((sample) => [sample.labels.scenario, sample.value]),
+      [['smoke', 1], ['broken', 0]]);
+    assert.deepEqual(samples.filter((sample) => sample.name === 'forgehands_e2e_cleanup_ok').map((sample) => [sample.labels.scenario, sample.value]),
+      [['smoke', 1], ['broken', 1]]);
     const page = metrics.render(samples);
     assert.match(page, /forgehands_e2e_scenario_ok\{scenario="smoke"\} 1/);
     assert.match(page, /forgehands_e2e_scenario_ok\{scenario="broken"\} 0/);
+    assert.match(page, /forgehands_e2e_cleanup_ok\{scenario="broken"\} 1/);
     const state = controller.state();
     assert.equal(state.running, null);
     assert.equal(state.last.trigger, 'manual');
@@ -469,6 +567,28 @@ test('a failing scenario sends a notification of kind failed, and the gauge show
     await reloaded.load();
     assert.equal(reloaded.meta.e2e.results.length, 2);
     assert.equal(jobs.meta.e2e.results[1].ok, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed cleanup with held steps: scenario_ok stays 1, cleanup_ok is 0, and the notification says the cleanup failed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'e2e-cleanup-gauge-'));
+  try {
+    const sent = [];
+    // A ticket, so that the cleanup has a branch to delete (and fails to).
+    const scenarios = [scenario([ticketStep, { do: 'wait', for: { findPull: 'ai/issue-$ticket' } }], { name: 'smoke' })];
+    const { controller, forge } = await controllerFor(withE2e(), '1.0.0', { scenarios, file: join(dir, 'jobs.json'), sent });
+    forge.deleteBranch = () => { throw new Error('DELETE branch -> HTTP 500'); };
+    await controller.start('manual').done;
+    const samples = controller.gauges();
+    assert.deepEqual(samples.map((sample) => [sample.name, sample.value]), [['forgehands_e2e_scenario_ok', 1], ['forgehands_e2e_cleanup_ok', 0]]);
+    const messages = sent.filter((entry) => entry.message.kind === 'failed');
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].message.subject, '[e2e] smoke: cleanup failed');
+    assert.match(messages[0].message.text, /held on owner\/hello .*but its cleanup did not hold: delete branch ai\/issue-\d+: DELETE branch -> HTTP 500/);
+    const state = controller.state();
+    assert.deepEqual(state.last.results.map((result) => [result.ok, result.cleanup]), [[true, 'failed']]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
