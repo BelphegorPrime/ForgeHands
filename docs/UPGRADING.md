@@ -329,3 +329,10 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Epics that were already left open are not picked up.** The new decision is taken when an epic review run finishes. An epic whose review ran before the upgrade has no record and no run of its own, so nothing starts for it: a human has to close it, add its sub-issues or change its criteria.
 - **Rollback.** `EPIC_GAP_REPLAN=0` calls the human at once instead of trying the planner first. Running the previous version restores the former silence. The ledger gains `epic_gaps`, which the previous version ignores.
 - **Metric.** `forgehands_epic_gaps_total{action}` (`replanned`, `handed`) is new.
+
+# Upgrading to the next version: the notice about an empty issue run names the escalation
+
+**Fix.** An issue run that stays empty after its escalation was reported as if nothing had been tried: "the run for ai:ready finished twice without a pull request and without a comment". The escalation is read from the route the ticket was started with (`job.label`), not from the route the run happened to start on, so a run that fell back to a `fallback_to` route is escalated as before. The notice to the human now says what happened: after two empty runs and the escalation, "finished twice without a pull request and without a comment, and once more after `ai:escalate`"; after a hand-back that escalated the run, "was handed back by a comment, and the run after it on `ai:escalate` finished without a pull request and without a comment". Routes without `escalate_to`, or with `FAILURE_ESCALATE=0`, get the notice as before.
+
+- Nothing to set. Behaviour is unchanged; only the text of the comment and the `no_delivery` notice differs.
+- Rollback: go back to the previous version.

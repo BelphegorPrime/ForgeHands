@@ -505,7 +505,7 @@ async function buildWatched(extra) {
 
 // A worker run that "finishes" without delivering anything is not a delivery.
 let deliveryRuns = 0;
-async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready', routes = {}, logger = quiet, extra = {} } = {}) {
+async function buildDelivery({ pulls = [], comments = [], issueState = 'open', labels = [], label = 'ai:ready', routes = {}, logger = quiet, extra = {}, hold = null } = {}) {
   const config = loadConfig(env({ HUMAN_LOGIN: 'marcel', ...extra }));
   const jobs = new JobStore(join(dir, 'delivery-' + (deliveryRuns++) + '.json'));
   await jobs.load();
@@ -520,6 +520,7 @@ async function buildDelivery({ pulls = [], comments = [], issueState = 'open', l
   const api = fakeApi();
   const send = (url, request) => String(url).startsWith('https://forge.example/') ? forgejo.send(url, request) : api(url, request);
   const dispatcher = new Dispatcher(config, jobs, send, logger, () => clock);
+  if (hold) dispatcher.cooldowns.set(hold, clock + 24 * 3600000); // the tier of the route is out of quota: the job starts on its fallback
   await dispatcher.enqueue(event(label, 26));
   await dispatcher.tick();
   const job = jobs.list()[0];
@@ -563,7 +564,54 @@ test('an issue run that finishes twice without a delivery starts once more on th
   assert.equal(t.job.status, 'failed');
   assert.equal(t.job.result, 'no_delivery');
   assert.equal(starts().length, 3, 'no third run');
-  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, so nothing was delivered\./);
+  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, and once more after ai:escalate, so nothing was delivered\./);
+});
+
+// A job that started on the fallback route (its tier was out of quota) keeps the escalate_to of the route its ticket was started with: the
+// fallback route has none, so the escalation must not be read from it.
+const FALLBACK_FREE = '55555555-5555-4555-8555-555555555555';
+const FALLBACK_ROUTES = JSON.stringify({
+  'ai:ready': { profile: WORKER, tier: 'cheap', fallback_to: 'ai:ready-free', escalate_to: 'ai:escalate' },
+  'ai:ready-free': { profile: FALLBACK_FREE, tier: 'free' },
+  'ai:escalate': { profile: ESCALATE, tier: 'strong' }
+});
+
+test('a job that fell back to the free route still escalates after two empty runs, and the human is called after the escalated run too', async () => {
+  const t = await buildDelivery({ hold: 'cheap', extra: { LABEL_ROUTES: FALLBACK_ROUTES } });
+  assert.equal(t.job.fell_back, 'ai:ready-free');
+  assert.equal(t.job.label, 'ai:ready', 'the ticket was started with ai:ready, the fallback does not change its label');
+  await t.end();
+  assert.equal(t.job.delivery_retry, 1);
+  assert.equal(starts().at(-1).body.agent_profile_id, FALLBACK_FREE, 'once more on the fallback');
+  await t.end();
+  assert.equal(t.job.escalated, true, 'the second empty run escalates although it ran on the fallback');
+  assert.equal(t.job.escalated_after, 'no_delivery');
+  assert.equal(t.job.status, 'running');
+  assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE, 'the escalated run uses the profile of ai:escalate');
+  assert.equal(t.dispatcher.tierOf(t.job), 'strong');
+  assert.deepEqual(t.comments(), [], 'no notice yet');
+  await t.end();
+  assert.equal(t.job.status, 'failed');
+  assert.equal(t.job.result, 'no_delivery');
+  assert.equal(starts().length, 3, 'no fourth run');
+  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready finished twice without a pull request and without a comment, and once more after ai:escalate, so nothing was delivered\./);
+});
+
+// A worker that hands its ticket back by a blocker comment escalates at once (handback.ts); when that escalated run is empty too the human is
+// called at once, and the notice says that the escalation happened (and that a comment had been written before it).
+test('a blocker comment escalates the run, and an empty escalated run calls the human with the escalation named', async () => {
+  const blocker = [];
+  const t = await buildDelivery({ comments: blocker, extra: { LABEL_ROUTES: DELIVERY_ROUTES } });
+  blocker.push({ id: 1, body: 'I am blocked: the API key is missing.', created_at: new Date(clock).toISOString() });
+  await t.end();
+  assert.equal(t.job.escalated, true);
+  assert.equal(t.job.escalated_after, 'handback');
+  assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE);
+  await t.end();
+  assert.equal(t.job.status, 'failed');
+  assert.equal(t.job.result, 'no_delivery');
+  assert.equal(starts().length, 2, 'no third run');
+  assert.match(t.comments()[0], /^@marcel ForgeHands: the run for ai:ready was handed back by a comment, and the run after it on ai:escalate finished without a pull request and without a comment, so nothing was delivered\./);
 });
 
 test('a pull request opened by the escalated run is its delivery', async () => {

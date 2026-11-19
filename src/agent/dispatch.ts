@@ -1352,6 +1352,7 @@ export class Dispatcher {
   // ticket: a fresh run, `escalated` and `escalated_after` no_delivery. It is counted as the escalation and the target's tier like any escalated
   // run. The escalated run keeps delivery_retry, so when it also ends empty the human is called at once (no third run). Returns true when queued.
   escalateDelivery(job: Job): boolean {
+    // The route the ticket was started with (job.label): a run on the fallback route (job.fell_back) escalates like any other.
     const route = this.config.routes.get(job.label);
     if (!this.config.failureEscalate || !route?.escalateTo || job.escalated) return false;
     Object.assign(job, { status: 'queued', escalated: true, failure_escalation: true, escalated_after: 'no_delivery', started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
@@ -2563,6 +2564,16 @@ export class Dispatcher {
     return true;
   }
 
+  // What the human is told about an issue run that delivered nothing. It names the escalation when one happened (the same route's escalate_to, read
+  // from job.label: a run on the fallback route of its tier is still escalated by that route), so the notice does not claim that nothing was tried.
+  deliveryNotice(job: Job): string {
+    const run = 'the run for ' + job.label;
+    const target = this.config.routes.get(job.label)?.escalateTo;
+    if (job.escalated && target && job.escalated_after === 'no_delivery') return run + ' finished twice without a pull request and without a comment, and once more after ' + target + ', so nothing was delivered';
+    if (job.escalated && target && job.escalated_after === 'handback') return run + ' was handed back by a comment, and the run after it on ' + target + ' finished without a pull request and without a comment, so nothing was delivered';
+    return run + ' finished twice without a pull request and without a comment, so nothing was delivered';
+  }
+
   // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (max_iterations,
   // stuck, timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. A paused run is an interruption and is
   // never split. Everything else is handed to the human, on the pull request (label and mention) or, without one, as a comment on the issue.
@@ -2572,7 +2583,7 @@ export class Dispatcher {
     if (!this.config.forgejo || !event || state === 'deleted' || state === 'finished') return;
     const kind = this.config.routes.get(job.label)?.kind;
     const what = state === 'no_delivery'
-      ? 'the run for ' + job.label + ' finished twice without a pull request and without a comment, so nothing was delivered'
+      ? this.deliveryNotice(job)
       : 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
     try {
       const exhausted = state === 'max_iterations' || state === 'stuck' || state === 'timeout';
