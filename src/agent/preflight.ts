@@ -1,20 +1,26 @@
 import { createHash } from 'node:crypto';
 import { isDry } from '../dry.ts';
+import { metrics } from '../metrics.ts';
 import { mentionOf } from '../notify/index.ts';
 import type { Facts } from '../notify/texts.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../types/forge.ts';
 import type { DirectConfig, ForgeEvent, Logger } from '../types.ts';
+import { pullBranch } from './bot.ts';
 
 // The ticket pre-flight (TICKET_PREFLIGHT, on by default): a broken worker ticket starts no run. The rules are checks of the ticket's text and
 // one read of the repository. The comment names the rule; the README says what each one means.
-//   1. every path named in Steps is listed in Files;
+//   1. every path named in Steps is listed in Files (or is a file that exists on the default branch);
 //   2. Acceptance has a fenced block that holds a command;
 //   3. that command is not a placeholder and its quotes close (a static check: running it on the default branch needs a checkout, which
 //      ForgeHands does not have, so it is not done here);
-//   4. every path listed in Files exists on the default branch, unless its line says "new".
+//   4. the files listed in Files exist on the default branch, unless the ticket says it creates them (a line says "new", or Steps has a
+//      creating verb, or one listed file exists). Only when none of them exists and nothing says they are created is the ticket broken.
 // Headings are read: Steps, Files (or "Exact files", the heading of WAIT_FOR_SAME_FILES) and Acceptance. A forge that cannot read files
 // makes rule 4 unknown, and unknown counts as no violation.
+// The pre-flight is skipped for a ticket that was worked on before (an issue run in the ledger) or whose pull request branch (ai/issue-<n>)
+// is open: such a ticket was workable once, and its rounds follow their own rules. A skipped ticket is never closed or sent back, so the
+// pre-flight never closes a pull request.
 
 export interface Violation { rule: 1 | 2 | 3 | 4; text: string }
 
@@ -30,6 +36,21 @@ const FENCE = /^\s{0,3}(`{3,}|~{3,})(.*)$/;
 // and folders do not match, so they are not checked.
 const PATH = /^(?:\.\/)?[\w@+.-]+(?:\/[\w@+.-]+)*\.[A-Za-z][A-Za-z0-9]*$/;
 const PLACEHOLDER = /^(?:\.\.\.|…|<[^>]*>|todo|tbd|command|your command here)$/i;
+// A name in Steps counts as a file only when its extension is a file type of a repository. `import.meta.url`, `process.env.X` or `Array.isArray`
+// end in no such extension, so they are code, not paths.
+const FILE_EXTENSIONS = new Set(['ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs', 'json', 'jsonc', 'yaml', 'yml', 'toml', 'md', 'mdx', 'txt', 'py',
+  'go', 'rs', 'rb', 'java', 'kt', 'kts', 'swift', 'c', 'h', 'cc', 'cpp', 'hpp', 'cs', 'php', 'sh', 'bash', 'ps1', 'sql', 'html', 'htm', 'css', 'scss',
+  'less', 'xml', 'proto', 'graphql', 'gql', 'lock', 'ini', 'cfg', 'conf', 'tf', 'hcl', 'vue', 'svelte', 'lua', 'ex', 'exs', 'hs', 'scala', 'dart',
+  'zig', 'nix', 'gradle', 'properties', 'csv', 'tsv', 'svg', 'png', 'jpg', 'gif', 'pem', 'mk', 'cmake']);
+// Words that say a file is created: "Create `x`", "add the file", "a new module", "emit", "write", "generate".
+const CREATES = /\b(create|creates|created|creating|add|adds|added|adding|new|emit|emits|emitted|emitting|write|writes|written|writing|generate|generates|generated|generating|introduce|introduces|introduced|scaffold|scaffolds)\b/i;
+// The first segment of a URL-like path (forge.example/owner/repo): a host, not a folder.
+const HOST = /\.(com|org|net|io|dev|codes|local|example|app|de|eu)$/i;
+// The most violations a rejection comment names; the rest is counted ("and N more").
+const LIST_LIMIT = 6;
+// Pull requests read per page, and the pages read when a ticket's pull request is looked for.
+const PULL_PAGE = 50;
+const PULL_PAGES = 5;
 
 interface Heading { index: number; level: number; title: string }
 
@@ -97,6 +118,46 @@ function pathsIn(text: string): string[] {
   return [...found];
 }
 
+// One token of Steps as the file it names, or null when it is code, a URL, a version, a glob or a prose word. A file name needs a file extension
+// of FILE_EXTENSIONS; a bare name (no slash) also needs a stem that is all lower case or all capitals (README, Makefile), so "Node.js" is prose.
+// A version number in the name (users-3.1.yaml) is no file name. `fenced` tokens count only with a slash.
+function stepPath(token: string, fenced: boolean): string | null {
+  let path = token.trim().replace(/:\d+$/, '').replace(/\.+$/, '').replace(/^\.\//, '');
+  if (!path || (fenced && !path.includes('/'))) return null;
+  if (path.includes('://') || /^www\./i.test(path) || /[\s()=[\]{}<>*"'`$,;|&]/.test(path)) return null;
+  if (!PATH.test(path)) return null;
+  const segments = path.split('/');
+  const base = segments[segments.length - 1];
+  const dot = base.lastIndexOf('.');
+  const extension = base.slice(dot + 1).toLowerCase();
+  const stem = base.slice(0, dot);
+  if (!FILE_EXTENSIONS.has(extension) || /\d+\.\d+/.test(base)) return null;
+  if (segments.length > 1 && HOST.test(segments[0])) return null;
+  if (segments.length === 1 && !/^[a-z0-9_.@+-]+$/.test(stem) && !/^[A-Z0-9_.@+-]+$/.test(stem)) return null;
+  return path;
+}
+
+// The files a Steps section names: its code spans and bare words, and in a fenced block only the tokens with a slash.
+function stepPaths(lines: string[]): Set<string> {
+  const found = new Set<string>();
+  const add = (token: string, fenced: boolean) => { const path = stepPath(token, fenced); if (path) found.add(path); };
+  let fence: string | null = null;
+  for (const line of lines) {
+    const open = FENCE.exec(line);
+    if (fence !== null) {
+      if (open && open[1][0] === fence[0] && open[1].length >= fence.length && !open[2].trim()) fence = null;
+      else for (const token of line.split(/[\s,;()<>"'|`]+/)) add(token, true);
+      continue;
+    }
+    if (open) { fence = open[1]; continue; }
+    for (const span of line.matchAll(/`([^`\n]+)`/g)) add(span[1], false);
+    for (const word of line.replace(/`[^`\n]*`/g, ' ').split(/[\s,;()<>"'|]+/)) add(word, false);
+  }
+  return found;
+}
+
+const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
+
 // The files of the Files section, each with whether its line says "new".
 function filesOf(lines: string[]): Map<string, boolean> {
   const files = new Map<string, boolean>();
@@ -139,8 +200,15 @@ export async function ticketViolations(body: string, exists?: Exists): Promise<V
   const violations: Violation[] = [];
 
   if (steps.found) {
-    for (const path of pathsIn(steps.lines.join('\n'))) {
-      if (!files.has(path)) violations.push({ rule: 1, text: '`' + path + '` is named in Steps but not listed in Files' });
+    // A name is listed when Files has it, or a bare name is the basename of a listed file, or a path is the end of a listed one. Otherwise it
+    // breaks the rule unless it is a file of the default branch (the exists function says so).
+    const listed = [...files.keys()];
+    const names = new Set(listed.map(baseName));
+    const unlisted = [...stepPaths(steps.lines)].filter((path) => !files.has(path)
+      && !(path.includes('/') ? listed.some((item) => item.endsWith('/' + path)) : names.has(path)));
+    for (const path of unlisted) {
+      if (exists && (await exists(path)) === true) continue;
+      violations.push({ rule: 1, text: '`' + path + '` is named in Steps but not listed in Files' });
     }
   }
 
@@ -154,12 +222,21 @@ export async function ticketViolations(body: string, exists?: Exists): Promise<V
     }
   }
 
-  if (exists) {
-    for (const [path, isNew] of files) {
-      if (isNew) continue;
-      if ((await exists(path)) === false) {
-        violations.push({ rule: 4, text: '`' + path + '` is listed in Files but does not exist on the default branch (mark it new if the ticket creates it)' });
-      }
+  // A listed file that does not exist is taken as new when the ticket says so: a line says "new", Steps has a creating verb, or one listed file
+  // exists (the planner's lists are mixed). Only when no listed file exists and nothing says a file is created is the ticket unworkable.
+  // An unknown answer (null) counts as no violation.
+  if (exists && files.size && ![...files.values()].some(Boolean) && !CREATES.test(steps.lines.join('\n'))) {
+    const missing: string[] = [];
+    let unknown = false;
+    let someExists = false;
+    for (const path of files.keys()) {
+      const here = await exists(path);
+      if (here === true) { someExists = true; break; }
+      if (here === false) missing.push(path);
+      else unknown = true;
+    }
+    if (!someExists && !unknown) {
+      for (const path of missing) violations.push({ rule: 4, text: '`' + path + '` is listed in Files but does not exist on the default branch (mark it new if the ticket creates it)' });
     }
   }
   return violations;
@@ -197,6 +274,35 @@ export class TicketPreflight {
     this.tell = deps.tell;
   }
 
+  // Why the pre-flight does not apply to this ticket, or null when it does: a worker run of the ticket finished before (an issue run in the
+  // ledger), or its pull request branch ai/issue-<n> is open. When the forge cannot say whether a pull request is open, the ticket is not
+  // rejected (the rejection sends it to the planner, whose route closes an open pull request).
+  async skipReason(repository: string, number: number): Promise<string | null> {
+    const ticket = repository.toLowerCase() + '#' + number + ':';
+    const worked = this.jobs.list().some((job) => job.key.startsWith(ticket) && this.config.routes.get(job.label)?.kind === 'issue'
+      && (job.status === 'done' || job.status === 'failed' || job.finished !== undefined));
+    if (worked) return 'the ticket was worked on before';
+    try {
+      if (await this.hasOpenPull(repository, number)) return 'its pull request is open';
+    } catch (error) {
+      this.logger.error(repository + '#' + number + ': could not read the open pull requests, the pre-flight is skipped:', (error as Error).message);
+      return 'the open pull requests are unknown';
+    }
+    return null;
+  }
+
+  // Is the pull request of branch ai/issue-<n> open? Up to PULL_PAGES pages of PULL_PAGE open pull requests are read.
+  async hasOpenPull(repository: string, number: number): Promise<boolean> {
+    const branch = 'ai/issue-' + number;
+    for (let page = 1; page <= PULL_PAGES; page++) {
+      const pulls = await this.forge.listPulls(repository, { state: 'open', limit: PULL_PAGE, page });
+      const list = Array.isArray(pulls) ? pulls : [];
+      if (list.some((pull) => pullBranch(pull) === branch)) return true;
+      if (list.length < PULL_PAGE) return false;
+    }
+    return false;
+  }
+
   // True when the run this event asks for must not start because the ticket breaks a rule. A passing ticket, or TICKET_PREFLIGHT=0: false.
   // A rejected ticket is commented once per revision; every time it is rejected, its trigger label goes and the planner (SPLIT_LABEL) or the
   // human (BLOCKED_LABEL) gets it. In a dry run the once-per-revision mark is not kept, as nothing was written.
@@ -213,7 +319,17 @@ export class TicketPreflight {
       }
     });
     const violations = await ticketViolations(event.issue.body, exists);
-    if (!violations.length) return false;
+    if (!violations.length) {
+      metrics.inc('forgehands_preflight_total', { result: 'ok', rule: 'none' });
+      return false;
+    }
+    const why = await this.skipReason(repository, number);
+    if (why) {
+      metrics.inc('forgehands_preflight_total', { result: 'skipped', rule: 'none' });
+      this.logger.error(repository + '#' + number + ': the pre-flight is skipped (' + why + '), the ticket is not checked');
+      return false;
+    }
+    for (const rule of new Set(violations.map((violation) => violation.rule))) metrics.inc('forgehands_preflight_total', { result: 'rejected', rule: String(rule) });
 
     const dry = isDry(this.config, repository);
     const key = 'preflight:' + repository.toLowerCase() + '#' + number + ':' + ticketRevision(event.issue.title, event.issue.body);
@@ -223,7 +339,9 @@ export class TicketPreflight {
     this.logger.error(repository + '#' + number + ': the ticket breaks the pre-flight (' + violations.map((v) => 'rule ' + v.rule).join(', ') + '), no worker starts');
 
     if (fresh) {
-      const rules = violations.map((v) => '- rule ' + v.rule + ': ' + v.text).join('\n');
+      const shown = violations.slice(0, LIST_LIMIT).map((v) => '- rule ' + v.rule + ': ' + v.text);
+      if (violations.length > LIST_LIMIT) shown.push('- and ' + (violations.length - LIST_LIMIT) + ' more');
+      const rules = shown.join('\n');
       const next = split ? 'It goes back to the planner (' + split + ') to be written again.' : 'A human has to fix the ticket and set its label again.';
       try {
         await this.forge.addComment(repository, number, (split ? '' : mentionOf(this.config)) + PREFLIGHT_REJECTION + ', so no worker starts on it:\n'

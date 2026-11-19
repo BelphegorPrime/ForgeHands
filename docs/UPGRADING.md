@@ -345,3 +345,17 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 
 - Nothing to set. Behaviour is unchanged; only the text of the comment and the `no_delivery` notice differs.
 - Rollback: go back to the previous version.
+
+# Upgrading to the next version: the ticket pre-flight stops rejecting real tickets
+
+**Fixes to the pre-flight of 0.9.8.** In ten hours it rejected three tickets written by the planner that were workable: openapi-generator#53 (its pull request #85 was open, with finished rounds, and the planner re-route closed it) and levelUp#75 and #76. The causes were false positives. A name in `Steps` that is code (`import.meta.url`, `process.env.X`, `Array.isArray`), a version (`users-3.1.yaml`), a URL, or a bare file name that a listed file has (`models.ts`, `index.ts`) was read as a missing path. Rule 4 read files that a ticket creates, which the planner does not always mark `new`.
+
+- **Rule 1 is narrower.** A name in `Steps` counts as a file only with a file extension of a repository and not as code. A bare name is listed when a listed file has its basename. A file that exists on the default branch is no violation.
+- **Rule 4 is taken as new** when a line says `new`, when `Steps` has a creating word (create, add, new, emit, write, generate), or when one listed file exists. A ticket is broken only when no listed file exists and nothing says a file is created.
+- **A ticket with an open pull request is not checked.** Nor is one that was worked on before (a finished worker run in the ledger). Its rounds follow their own rules. So the pre-flight never sends such a ticket to the planner, and never closes its pull request. If the forge cannot list the open pull requests, the ticket is not rejected.
+- **The rejection comment** names at most six violations and says `and N more`.
+- **Metric.** `forgehands_preflight_total{result,rule}` (`ok`, `skipped`, `rejected` by rule `1` to `4`) is new.
+
+- Nothing to set. A ticket that the previous version rejected for one of these reasons now starts a run. A ticket that really breaks a rule is still rejected.
+- Check `forgehands_preflight_total{result="rejected"}` after the upgrade: a rise in rule 1 or rule 4 rejections of tickets that look right is a bug to report.
+- Rollback: `TICKET_PREFLIGHT=0` turns the check off, as in the section above.
