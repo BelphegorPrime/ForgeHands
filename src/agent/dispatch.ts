@@ -286,7 +286,15 @@ export class Dispatcher {
   // the first one; the others are the same event under their own label.
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
     if (event.type === 'ci.main_failure') return this.onMainFailure(event);
-    if (event.type !== 'ci.success') return this.enqueueOne(event);
+    if (event.type !== 'ci.success') {
+      const result = await this.enqueueOne(event);
+      // An approval label on a pull request that did not start the merge (the event was taken for a round, or it was a duplicate): said once, so that
+      // a silent drop shows in the log and on the status page. A label change that adds the approval reaches approve() (see normalizePullRequest).
+      if (event.type === 'pull_request.labeled' && event.pull_request && !event.ci && event.issue.labels.includes(this.config.approvedLabel)) {
+        this.merger.report(event.repository.full_name, event.pull_request.number, result.status === 'queued' ? 'round_started' : result.status, null);
+      }
+      return result;
+    }
     const labels = [...this.config.routes].filter(([, entry]) => entry.kind === 'ci_success').map(([label]) => label);
     const results: { status: string }[] = [];
     for (const label of labels) results.push(await this.enqueueOne({ ...event, label }));
@@ -695,7 +703,10 @@ export class Dispatcher {
 
   // The reviewer approved the pull request (label): merge it when the operator's policy for the repository allows.
   async approve(event: ForgeEvent): Promise<string> {
-    if (Array.isArray(event.previous_labels) && event.previous_labels.includes(this.config.approvedLabel)) return 'already_approved';
+    if (Array.isArray(event.previous_labels) && event.previous_labels.includes(this.config.approvedLabel)) {
+      this.merger.report(event.repository.full_name, event.pull_request?.number ?? 0, 'already_approved', null);
+      return 'already_approved';
+    }
     return this.merger.handle(event);
   }
 

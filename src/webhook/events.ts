@@ -18,6 +18,8 @@ export interface NormalizeOptions {
   comments?: { human: string };
   /** HUMAN_REVIEW_ROUNDS in comment mode: the native reviews of this login are events (approved, rejected and comment); nobody else's are. */
   humanReviews?: { human: string };
+  /** The labels of the pull request before this event (the label memory of the dispatcher), or null when none is known. */
+  previousLabels?: string[] | null;
 }
 
 // Keep the bridge intentionally small. Agent execution and git writes belong in OpenHands.
@@ -25,7 +27,7 @@ export interface NormalizeOptions {
 // With `labelEvents`, a label change on an existing issue is accepted too. Forgejo reports it as an `issues` event with
 // action `label_updated` (captured from a real instance; `issue_label` is accepted as well). It carries the current
 // labels but not which one was added, so the event is flagged and the dispatcher must not start a second run.
-export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots, comments, humanReviews }: NormalizeOptions = {}): NormalizedEvent | null {
+export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<string>, labels: string[] = ['ai:ready'], { labelEvents = false, prLabels = [], ci = {}, approved = '', pushes = false, branchPushes = false, reviews = false, bots, comments, humanReviews, previousLabels }: NormalizeOptions = {}): NormalizedEvent | null {
   if (event === 'push') return (pushes ? normalizePush(payload, allowedRepos) : null) ?? (branchPushes ? normalizeBranchPush(payload, allowedRepos, bots) : null);
   if (event === 'issue_comment') return comments ? normalizeComment(payload, allowedRepos, comments.human) : null;
   if (event === 'pull_request' && branchPushes && HEAD_ACTIONS.has(String(payload?.action))) return normalizeBranchPull(payload, allowedRepos, bots);
@@ -33,7 +35,7 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
   if (reviews && REVIEW_EVENTS[String(event)] && REVIEW_EVENTS[String(event)] !== 'comment') return normalizeReview(String(event), payload, allowedRepos, bots);
   // Comment mode with HUMAN_REVIEW_ROUNDS: only the reviews of HUMAN_LOGIN are events, whatever their verdict (see the dispatcher).
   if (humanReviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots, humanReviews.human);
-  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots);
+  if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots, previousLabels);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
   if (event === 'action_run_failure' || event === 'action_run_success') return normalizeCiRun(event, payload, allowedRepos, ci, bots);
   if ((event !== 'issues' && event !== 'issue_label') || !payload || typeof payload !== 'object') return null;
@@ -142,7 +144,7 @@ function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>
 // A label on the pull request of an agent issue (branch ai/issue-<n>) starts a follow-up round for that issue. As with issues,
 // Forgejo reports a label change as action `label_updated` with the current labels only, so the event is flagged and the
 // dispatcher compares it with the labels it saw before. `labeled` (with the added label) is accepted as well.
-function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string, bots?: NormalizeOptions['bots']): ForgeEvent | null {
+function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: string[], approved: string, bots?: NormalizeOptions['bots'], previousLabels?: string[] | null): ForgeEvent | null {
   const pr = payload?.pull_request;
   if (!pr || typeof pr !== 'object' || (!labels.length && !approved)) return null;
   if (payload.action !== 'label_updated' && payload.action !== 'labeled') return null;
@@ -160,10 +162,14 @@ function normalizePullRequest(payload: Json, allowedRepos: Set<string>, labels: 
     : [];
   const isLabelEvent = payload.action === 'label_updated';
   let matched: string | undefined;
-  if (isLabelEvent) matched = labels.find((name) => present.includes(name));
+  let type = 'pull_request.labeled';
+  // A label change does not say which label was added. The approval is the event when it was added just now (the label memory knows the
+  // labels before): a stale round label (a leftover changes label) must not hide it, or nothing merges the approved pull request.
+  const approvalAdded = isLabelEvent && !!approved && present.includes(approved) && Array.isArray(previousLabels) && !previousLabels.includes(approved);
+  if (approvalAdded) { matched = approved; type = 'pull_request.approved'; }
+  else if (isLabelEvent) matched = labels.find((name) => present.includes(name));
   else matched = labels.includes(payload.label?.name) && present.includes(payload.label.name) ? payload.label.name : undefined;
   // The approval label asks ForgeHands to merge (a round label takes precedence when both are there).
-  let type = 'pull_request.labeled';
   if (!matched && approved) {
     if (isLabelEvent ? present.includes(approved) : payload.label?.name === approved && present.includes(approved)) { matched = approved; type = 'pull_request.approved'; }
   }

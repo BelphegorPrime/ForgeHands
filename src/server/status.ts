@@ -41,7 +41,8 @@ export interface Status {
   summary: Record<string, { last_7_days: Summary; last_30_days: Summary; tiers: Record<string, { last_7_days: TierStats; last_30_days: TierStats; tokens: TierTokens }> }>;
   // blocked_by_stuck: the issues of the blocked pull requests this ticket waits behind (directly or through other tickets); state says so too.
   // blocked_by_epic_gaps: the same for the epics the epic review found open (see epic-gaps.ts).
-  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; blocked_by_epic_gaps: number[]; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  // merge_decision: on an open pull request, the last decision of the merger on it (why an approved pull request waits; see Merger.report).
+  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; blocked_by_epic_gaps: number[]; merge_decision?: { reason: string; at: string }; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them; epics the review found open wait too (pr: null).
@@ -220,7 +221,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
 }
 
 export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
-  options: { all?: boolean; idle?: IdleState | null } = {}): Status {
+  options: { all?: boolean; idle?: IdleState | null; decisions?: Map<string, { reason: string; at: number }> } = {}): Status {
   const byIssue = new Map<string, { key: string; title: string; issueUrl: string | null; prUrl: string | null; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -265,6 +266,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const issueNumber = entry.key.includes('#') ? Number(entry.key.slice(entry.key.lastIndexOf('#') + 1)) : 0;
     const chain = closed.has(entry.key) ? [] : behind.get(entry.key) ?? [];
     const gaps = closed.has(entry.key) ? [] : behindGaps.get(entry.key) ?? [];
+    // The last merge decision of an open pull request (the merger keeps it by "repo#<pr>"; a merged one leaves it).
+    const decision = pr && !closed.has(entry.key) ? options.decisions?.get(entry.key.split(/[#!]/)[0].toLowerCase() + '#' + pr) : undefined;
     const base = deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
     // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
     const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ')
@@ -276,6 +279,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       pr,
       pr_url: entry.prUrl || (pr ? forgeItemUrl(config, entry.key.split(/[#!]/)[0], 'pr', pr) : null),
       rounds, state, blocked_by_stuck: chain, blocked_by_epic_gaps: gaps,
+      ...(decision ? { merge_decision: { reason: decision.reason, at: new Date(decision.at).toISOString() } } : {}),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
       last: entry.last
@@ -366,7 +370,7 @@ function renderWorkspace(status: Status): string {
 
 export function renderStatus(status: Status): string {
   const line = (issue: Status['issues'][number]) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
-    + escape(issue.state) + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
+    + escape(issue.state) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
   const head = '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n';
   const closedIssues = status.issues.filter((issue) => issue.closed);
   const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';

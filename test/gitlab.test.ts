@@ -113,6 +113,16 @@ test('a Merge Request Hook with a new approval or round label on an agent merge 
   assert.equal(round.label, 'ai:changes');
 });
 
+test('a Merge Request Hook that adds the approval while a leftover round label is on the merge request is the approval (the round label does not hide it)', () => {
+  const both = { labels: [{ title: 'ai:approved' }, { title: 'ai:changes' }], changes: { labels: { previous: [{ title: 'ai:changes' }], current: [{ title: 'ai:changes' }, { title: 'ai:approved' }] } } };
+  const event = norm('Merge Request Hook', mrHook(both), { approved: 'ai:approved', prLabels: ['ai:changes'] });
+  assert.equal(event.type, 'pull_request.approved');
+  assert.equal(event.label, 'ai:approved');
+  // A round label added to a merge request that was approved before stays a round.
+  const round = { labels: [{ title: 'ai:approved' }, { title: 'ai:changes' }], changes: { labels: { previous: [{ title: 'ai:approved' }], current: [{ title: 'ai:approved' }, { title: 'ai:changes' }] } } };
+  assert.equal(norm('Merge Request Hook', mrHook(round), { approved: 'ai:approved', prLabels: ['ai:changes'] }).type, 'pull_request.labeled');
+});
+
 test('a Merge Request Hook is ignored for another branch, a closed merge request, an approval that was already there, or no label change', () => {
   const options = { approved: 'ai:approved' };
   assert.equal(norm('Merge Request Hook', mrHook({}, { source_branch: 'feature/x' }), options), null);

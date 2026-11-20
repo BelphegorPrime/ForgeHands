@@ -83,7 +83,7 @@ export function createApp(
       dispatcher!.dry,
       [...dispatcher!.reminder.waiting.values()],
       dispatcher!.workspace.state(),
-      { all, idle: dispatcher!.idleState() },
+      { all, idle: dispatcher!.idleState(), decisions: dispatcher!.merger.decisions },
     ),
     e2e: e2e?.state() ?? null,
   });
@@ -297,6 +297,7 @@ export function createApp(
           direct && config.humanLogin && (config.commentRestarts || config.planAnswerRestarts)
             ? { human: config.humanLogin }
             : undefined,
+        previousLabels: direct && !isComment ? previousLabels : undefined,
       },
     );
     if (!normalized) {
@@ -318,6 +319,9 @@ export function createApp(
         String(normalized.sender.login || "").toLowerCase(),
       )
     ) {
+      // An approval label of a sender that ALLOWED_SENDERS does not list never reaches the merger: said once (the reviewer's login belongs there).
+      if (normalized.type === "pull_request.approved")
+        dispatcher?.merger.report(normalized.repository.full_name, (normalized as ForgeEvent).pull_request?.number ?? 0, "sender_not_allowed", null);
       remember();
       delivered("ignored");
       return json(res, 202, { status: "ignored" });

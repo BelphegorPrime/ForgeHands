@@ -15,6 +15,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_runs_finished_total: 'Agent runs that ended, by route kind and end state (finished, error, stuck, paused, deleted, timeout).',
   forgehands_merges_total: 'Pull requests merged by ForgeHands, by repository.',
   forgehands_merge_refusals_total: 'Merges ForgeHands did not do, by reason (protected_paths, no_valid_review, ci_not_green, not_mergeable, blocked, merge_failed).',
+  forgehands_merge_decisions_total: 'Decisions on pull requests with an approval signal (label ai:approved, a review, a finished review run, the review sweep), by result (merged, not_merged) and reason (the reason of a refusal, or merged).',
   forgehands_blocks_total: 'Tickets handed to a human, by reason.',
   forgehands_error_retries_total: 'Runs started again after they ended in an error.',
   forgehands_branch_updates_total: 'Pull request branches brought up to date with the default branch.',

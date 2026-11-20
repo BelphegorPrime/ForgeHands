@@ -401,3 +401,14 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **A later commit of someone else is a note.** If another ticket's commit lands on main after the restore and changes a path of the run, `cleanup_note` says `main moved on after the restore` with the paths, and the cleanup holds. A commit on any other path is ignored.
 - **What to check.** After the first run on the new version, `/status.json` (`e2e.last.results`) should show `cleanup: ok`. A `cleanup_reason` that still names paths means the difference is real on the test repository: look at those paths on main, not at the timing.
 - **Rollback.** Go back to the previous version. The record of the last run (`meta.e2e`) keeps its format, so nothing in the ledger needs changing.
+
+# Upgrading to the next version: every merge decision is logged
+
+**Nothing changes in the forge.** The merge rules are the same; what changes is what ForgeHands says about an approved pull request, and one label event that used to be lost.
+
+- **An approval label is no longer hidden by a leftover round label.** A label change that adds `APPROVED_LABEL` while `ai:changes` (or another round label) is still on the pull request used to be read as a round, and the approval never reached the merger. It is the approval now when the label memory says the approval was not there before. A label event without that memory keeps the old reading.
+- **Every decision after an approval is logged.** One line `<repo>#<pr>: not merged: <reason>` for each refusal (once an hour per head commit and reason) and `<repo>#<pr>: merged (<sha7>)` for each merge. Look for these lines first when an approved pull request waits.
+- **The approval safety net.** The review sweep hands an approved, green pull request with an OK verdict to the merger once per head and 30 minutes, when it is not merged. A held, blocked, protected or drafted pull request is still left alone.
+- **New metric and status field.** `forgehands_merge_decisions_total{result,reason}`; `merge_decision: {reason, at}` on the ticket of an open pull request in `/status.json`.
+- **What to check.** After the first approval on the new version, the log shows `merged (<sha7>)` for the head, or a `not merged` line that names the reason. An approved pull request without either for an hour is a bug to report.
+- **Rollback.** Go back to the previous version. Nothing in the ledger changes; the decisions live in memory only.
