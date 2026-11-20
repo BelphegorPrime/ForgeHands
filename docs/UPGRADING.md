@@ -412,3 +412,14 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **New metric and status field.** `forgehands_merge_decisions_total{result,reason}`; `merge_decision: {reason, at}` on the ticket of an open pull request in `/status.json`.
 - **What to check.** After the first approval on the new version, the log shows `merged (<sha7>)` for the head, or a `not merged` line that names the reason. An approved pull request without either for an hour is a bug to report.
 - **Rollback.** Go back to the previous version. Nothing in the ledger changes; the decisions live in memory only.
+
+# Upgrading to the next version: a deleted issue leaves the status page
+
+**Behaviour change, no switch.** Issues deleted in the forge used to stay on the status page as open for ever (`worker done, waiting for the next event`), and every pass of the sweep of closed tickets wrote `could not read #n of <repo>: ... HTTP 404`.
+
+- **A deleted issue is marked deleted in the forge.** The ledger sync (`LEDGER_SYNC_HOURS`) reads each issue of the ledger; an issue whose own read answers 404 is counted, and marked deleted on the second pass that finds it missing. A read that finds it again, or fails for another reason, does not count. The count and the mark are kept in `jobs.json` (new keys `deleted_in_forge` and `gone_checks`; the file stays version 2, an older ForgeHands ignores them).
+- **On the status page** the ticket has the state `deleted in the forge` and `closed: true` in `/status.json`, so it leaves the open list. Its waiting and queued jobs are dropped as `deleted`, and a ticket that waited for it is released from that wait (also when the dependency list still names it as open).
+- **The log.** One line per deleted issue: `<repo>#<n>: deleted in the forge, removed from the status page`. The sweep of closed tickets no longer logs a 404; the repeated `could not read #n` lines stop.
+- **Pull requests are unchanged.** A pull request answering 404 still drops its queued jobs at once.
+- **What to check.** After the first pass on the new version, the eight tickets that were deleted (openapi-generator and levelUp in the v0.9.16 report) should read `deleted in the forge` on the second pass, with one log line each, and the `could not read` lines should be gone. A ticket that is open in the forge but shows `deleted in the forge` is a bug to report: look at the `could not read` line of the sweep, if any, and the forge's answer to `GET /issues/<n>`.
+- **Rollback.** Go back to the previous version. It ignores the new keys, but the jobs of a deleted issue keep their `archived_view` flag (a closed ticket on the status page), so the ticket stays closed there, and its waiting jobs stay `deleted`.

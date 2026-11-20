@@ -113,3 +113,99 @@ test('the ledger sync never throws: a failing forge ends the pass and is logged'
     assert.ok(logs.some((line) => line.includes('boom')));
   } finally { await rm(t.base, { recursive: true, force: true }); }
 });
+
+const notFound = () => new Error('GET /api/v1/repos/owner/hello/issues/1 -> HTTP 404');
+const captured = (t) => { const lines = []; t.sync.logger = { error: (...args) => lines.push(args.join(' ')) }; return lines; };
+
+test('an issue the forge answers 404 for on two passes is marked deleted once: one log line, out of the open list, and not read again', async () => {
+  const state = { '#1': notFound() };
+  const t = await setup([[repo + '#1']], state);
+  const lines = captured(t);
+  try {
+    await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), false, 'one 404 is not a deletion');
+    assert.equal(t.jobs.list()[0].archived_view, undefined);
+    await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), true);
+    assert.equal(t.jobs.list()[0].archived_view, true, 'the ticket leaves the open list of the status page');
+    assert.deepEqual(lines, [repo + '#1: deleted in the forge, removed from the status page']);
+    const reads = t.reads.length;
+    await t.sync.run();
+    await t.sync.run();
+    assert.equal(t.reads.length, reads, 'a deleted ticket is not read again');
+    assert.equal(lines.length, 1, 'still one line');
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});
+
+test('a 404 once, then a read that finds the issue, is not a deletion; the count starts again', async () => {
+  const state = { '#1': notFound() };
+  const t = await setup([[repo + '#1']], state);
+  const lines = captured(t);
+  try {
+    await t.sync.run();
+    state['#1'] = { state: 'open' };
+    await t.sync.run();
+    assert.equal(t.jobs.goneChecks.has(repo + '#1'), false, 'the count is forgotten');
+    state['#1'] = notFound();
+    await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), false);
+    assert.deepEqual(lines, []);
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});
+
+test('a 500 is unknown: the ticket is not counted, not marked deleted, and its jobs stay as they are', async () => {
+  const t = await setup([[repo + '#1', 'waiting']], { '#1': new Error('GET /issues/1 -> HTTP 500') });
+  const lines = captured(t);
+  try {
+    for (let pass = 0; pass < 3; pass++) await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), false);
+    assert.equal(t.jobs.goneChecks.size, 0);
+    assert.equal(t.jobs.list()[0].status, 'waiting');
+    assert.ok(lines.every((line) => !line.includes('deleted in the forge')));
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});
+
+test('the 404 is confirmed by ticketGone: a look that finds the issue does not count, and a failed look changes nothing', async () => {
+  const t = await setup([[repo + '#1']], { '#1': notFound() });
+  const lines = captured(t);
+  let answer = async () => false;
+  t.sync.gone = (...args) => answer(...args);
+  try {
+    await t.sync.run();
+    await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), false, 'ticketGone found the issue: not gone');
+    answer = async () => { throw new Error('GET /issues/1 -> HTTP 503'); };
+    await t.sync.run();
+    await t.sync.run();
+    assert.equal(t.jobs.isDeletedInForge(repo + '#1'), false, 'a failed look is unknown');
+    assert.ok(lines.some((line) => line.includes('could not read')));
+    assert.ok(lines.every((line) => !line.includes('deleted in the forge')));
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});
+
+test('a deleted issue is remembered in the ledger file: a restart finds it deleted and does not read it', async () => {
+  const t = await setup([[repo + '#1']], { '#1': notFound() });
+  try {
+    await t.sync.run();
+    await t.sync.run();
+    const again = new JobStore(join(t.base, 'jobs.json'));
+    await again.load();
+    assert.equal(again.isDeletedInForge(repo + '#1'), true);
+    assert.equal(again.list()[0].archived_view, true);
+    assert.equal(again.goneChecks.size, 0);
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});
+
+test('a pull request answering 404 is not marked deleted in the forge (its queued jobs go at once, through the deleted callback)', async () => {
+  const t = await setup([[repo + '!pr3', 'queued']], { '!pr3': notFound() });
+  const lines = captured(t);
+  const dropped = [];
+  t.sync.deleted = async (ticket) => { dropped.push(ticket); return false; };
+  try {
+    await t.sync.run();
+    await t.sync.run();
+    assert.deepEqual(dropped, [repo + '!pr3', repo + '!pr3']);
+    assert.equal(t.jobs.isDeletedInForge(repo + '!pr3'), false);
+    assert.ok(lines.every((line) => !line.includes('deleted in the forge')));
+  } finally { await rm(t.base, { recursive: true, force: true }); }
+});

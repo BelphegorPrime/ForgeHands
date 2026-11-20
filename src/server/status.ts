@@ -268,7 +268,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const gaps = closed.has(entry.key) ? [] : behindGaps.get(entry.key) ?? [];
     // The last merge decision of an open pull request (the merger keeps it by "repo#<pr>"; a merged one leaves it).
     const decision = pr && !closed.has(entry.key) ? options.decisions?.get(entry.key.split(/[#!]/)[0].toLowerCase() + '#' + pr) : undefined;
-    const base = deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
+    const base = jobs.isDeletedInForge(entry.key) ? 'deleted in the forge' : deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
     // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
     const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ')
       : gaps.length && base.startsWith('waiting for') ? 'waiting behind epic with gaps ' + gaps.map((number) => '#' + number).join(', ') : base;

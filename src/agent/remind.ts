@@ -80,7 +80,8 @@ export class Reminder {
     for (const job of waiting) {
       try {
         const dependencies = await this.forge.dependencies(job.event.repository.full_name, job.event.issue.number);
-        if (!Array.isArray(dependencies) || dependencies.some((issue: Json) => issue.state === 'open')) continue;
+        const repository = job.event.repository.full_name;
+        if (!Array.isArray(dependencies) || dependencies.some((issue: Json) => issue.state === 'open' && !this.jobs.isDeletedInForge(repository + '#' + issue.number))) continue;
         job.status = 'queued';
         delete job.waiting_for;
         changed = true;
