@@ -229,8 +229,10 @@ export interface Forge {
   deleteBranch?(repository: string, branch: string): Promise<void>;
   /** The file at a ref, or null when the ref has no such file. */
   readFile?(repository: string, path: string, ref: string): Promise<FileAt | null>;
-  writeFile?(repository: string, path: string, change: FileWrite): Promise<void>;
-  deleteFile?(repository: string, path: string, change: FileDelete): Promise<void>;
+  /** Resolves to the id of the commit the write made (null when the forge did not name one). */
+  writeFile?(repository: string, path: string, change: FileWrite): Promise<string | null>;
+  /** Resolves to the id of the commit the deletion made (null when the forge did not name one). */
+  deleteFile?(repository: string, path: string, change: FileDelete): Promise<string | null>;
 }
 
 /** One call to the forge's API: the lowest layer, where DRY_RUN stops writes and API errors are counted. */
