@@ -382,3 +382,12 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **The cleanup judges only its own run.** Pull requests, branches and touched paths count only for run branches (`ai/issue-<n>`, `ai/revert-<n>`) with a number from the first ticket of the run. A delivery of an earlier ticket that lands during a run is left alone. The default branch is read at each commit's id, and a remaining difference is looked at once more after three seconds before the cleanup fails.
 - **What to check.** After the first run on the new version, `/status.json` (`e2e.last.results`) should show `cleanup: ok` for each scenario, and `cleanup_note` names anything left alone on the test repository.
 - **Rollback.** Go back to the previous version. The record of the last run (`meta.e2e`) keeps its format, so nothing in the ledger needs changing.
+
+# Upgrading to the next version: a WIP title is not a conflict
+
+**Behaviour change, no switch.** Forgejo reports `mergeable: false` for every pull request titled `WIP:`, even when its branch merges cleanly. Two places took that for a conflict; neither does now.
+
+- **The stuck-PR watchdog** (`STUCK_PR_MINUTES`) blocked an agent pull request that had a NOT OK verdict as `stuck_conflict`, and the human was told it conflicts with the default branch. Now a WIP-titled pull request with a NOT OK (or changes-requested) verdict is blocked as `stuck_verdict`, with the verdict's reason. A conflict is reported only for a pull request whose title is clean. Expect `forgehands_stuck_pr_blocks_total{reason="stuck_conflict"}` to fall for the pull requests of a WIP title.
+- **The merge after the WIP marker is removed.** Forgejo may still say `mergeable: false` on the first read after the title change. ForgeHands now reads the pull request again up to four times, two seconds apart, and refuses with `not_mergeable` only when the flag stays false. An approved, green pull request therefore waits up to eight seconds more before it is merged or refused.
+- **What to check.** A WIP-titled pull request that the watchdog blocks should carry the verdict's reason in its comment, not `conflicts with`. A `conflict` mail for a pull request that merges cleanly is a bug to report.
+- **Rollback.** Go back to the previous version. Nothing in the ledger changes.

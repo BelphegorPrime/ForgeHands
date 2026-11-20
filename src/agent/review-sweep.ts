@@ -164,6 +164,12 @@ export class ReviewSweep {
     return pr.draft === true && !this.forge.isWip(String(pr.title || ''));
   }
 
+  // Forgejo reports `mergeable: false` for a pull request titled with the WIP marker, whatever its branch (dispatch.ts and merge.ts know this too).
+  // So a conflict is only one when the title is clean. The draft needs no test of its own here: a draft without the marker is skipped before this.
+  conflicts(pr: Json): boolean {
+    return pr.mergeable === false && !this.forge.isWip(String(pr.title || ''));
+  }
+
   // Busy: a job of this pull request (or of its issue) is waiting, queued or running; or the head already has a review or a security review in the
   // ledger, whatever its state (a failed one is the retry logic's business, not the sweep's).
   busy(repository: string, number: number, candidate: { issue: number; bot: boolean }, sha: string): boolean {
@@ -285,7 +291,7 @@ export class ReviewSweep {
 
   // Why the pull request is stuck now, or null. A run queued, waiting or running on it (or on its ticket) says it moves on. Otherwise, in this order:
   // (a) the rounds are used up and the latest verdict on the head is not OK (`stuck_rounds`); (b) Forgejo reports a merge conflict with the default
-  // branch and no conflict round is on its way (`stuck_conflict`); (c) the latest verdict says NOT OK or asks for changes (`stuck_verdict`).
+  // branch and no conflict round is on its way (`stuck_conflict`, never for a WIP title: see `conflicts`); (c) the latest verdict says NOT OK or asks for changes (`stuck_verdict`).
   // No verdict and no conflict says nothing was decided, so the pull request is left alone. An approval that is not merged yet is the merger's business.
   async stuckReason(repository: string, pr: Json, event: ForgeEvent, sha: string): Promise<'stuck_rounds' | 'stuck_verdict' | 'stuck_conflict' | null> {
     const name = repository.toLowerCase();
@@ -294,7 +300,7 @@ export class ReviewSweep {
     const verdict = await this.merger.reviewOf(repository, pr.number, sha);
     const decided = !verdict.ok && !!verdict.reason && verdict.reason !== 'none';
     if (decided && this.hooks.rounds(event) >= this.config.maxRounds) return 'stuck_rounds';
-    if (pr.mergeable === false) return 'stuck_conflict';
+    if (this.conflicts(pr)) return 'stuck_conflict';
     return decided && (verdict.reason === 'not_ok' || verdict.reason === 'changes_requested') ? 'stuck_verdict' : null;
   }
 
