@@ -51,7 +51,7 @@ const answer = (value) => value && value.__status ? { ok: false, status: value._
 
 // A fake Forgejo (pulls, commit statuses, workflow folders, labels) and a fake OpenHands; `world` is changed by the tests.
 function freshWorld() {
-  return { pulls: [], statuses: {}, status: { state: 'pending', total_count: 0 }, workflows: {}, pullsStatus: null, calls: [] };
+  return { pulls: [], statuses: {}, status: { state: 'pending', total_count: 0 }, workflows: {}, pullsStatus: null, calls: [], routes: {} };
 }
 async function send(url, request) {
   const u = new URL(url);
@@ -61,6 +61,9 @@ async function send(url, request) {
   }
   const path = u.pathname.replace(API, '');
   world.calls.push(request.method + ' ' + path);
+  // Routes a test adds (the approval safety net reads the comments, the files and the commit time, and merges).
+  const extra = world.routes?.[request.method + ' ' + path];
+  if (extra) return answer(typeof extra === 'function' ? extra(request) : extra);
   if (request.method === 'GET') {
     if (path === '/pulls') return world.pullsStatus ? { ok: false, status: world.pullsStatus } : answer(world.pulls);
     const one = /^\/pulls\/(\d+)$/.exec(path);
@@ -261,4 +264,78 @@ test('a late webhook for the same commit does not start a second review', async 
   const late = t.dispatcher.sweep.eventOf(repo, world.pulls[0], t.dispatcher.sweep.candidate(repo, world.pulls[0]), NEW, 'ci:success', 'no_ci');
   assert.equal((await t.dispatcher.enqueue(late)).status, 'duplicate_job');
   assert.equal(t.jobs.list().filter((job) => job.event.ci?.commit_sha === NEW).length, 1);
+});
+
+// The approval safety net (sweepApproved): an approved, green, OK-verdict pull request that is not merged is handed to the merger once per head and 30 minutes.
+const APPROVAL_ENV = { MERGE_POLICY: JSON.stringify({ [repo]: { deny: ['compose.yaml'] } }) };
+const VERDICT = '## Verdict: OK\n' + 'Evidence: criterion met at src/a.mjs line 12, check bash validate.sh exit 0. '.repeat(8);
+// An approved agent pull request with an OK verdict on NEW, green CI and the given files; the merge calls are recorded in `merges`.
+function approvedWorld(files = ['src/a.mjs'], labels = ['ai:approved']) {
+  const merges = [];
+  world.pulls = [pull(34, NEW, { labels: labels.map((name) => ({ name })) })];
+  world.statuses[NEW] = { state: 'success', total_count: 2 };
+  world.routes = {
+    ['GET /issues/34/comments']: [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'reviewer' }, body: VERDICT }],
+    ['GET /git/commits/' + NEW]: { created: '2026-11-15T10:00:00Z' },
+    ['GET /pulls/34/files']: files.map((filename) => ({ filename })),
+    ['POST /pulls/34/merge']: () => { merges.push(clock); return {}; }
+  };
+  return merges;
+}
+
+test('approval safety net: an approved, green pull request with an OK verdict that is not merged is handed to the merger; the merge follows', async () => {
+  const t = await build(APPROVAL_ENV);
+  const merges = approvedWorld();
+  await t.dispatcher.sweep.run();
+  assert.equal(merges.length, 1, 'the pull request is merged');
+  assert.ok(logs.some((line) => line === 'owner/hello#34: approved and green at head ' + NEW.slice(0, 7) + ' but not merged, the approval sweep hands it to the merger'));
+  assert.ok(logs.includes('owner/hello#34: merged (' + NEW.slice(0, 7) + ')'));
+  assert.equal(reviews().length, 0, 'an approved pull request starts no review');
+});
+
+test('approval safety net: once per head per 30 minutes; the next look comes after that', async () => {
+  const t = await build(APPROVAL_ENV);
+  const merges = approvedWorld(['src/a.mjs']);
+  world.routes['POST /pulls/34/merge'] = () => { merges.push(clock); return { __status: 405 }; };
+  await t.dispatcher.sweep.run();
+  clock += 10 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.equal(merges.length, 1, 'no second hand-over within 30 minutes');
+  clock += 25 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.equal(merges.length, 2, 'after 30 minutes the head is looked at again');
+});
+
+test('approval safety net: a held, blocked, protected or unverdicted pull request is not merged', async () => {
+  for (const labels of [['ai:approved', 'ai:hold'], ['ai:approved', 'ai:blocked']]) {
+    const t = await build(APPROVAL_ENV);
+    const merges = approvedWorld(['src/a.mjs'], labels);
+    await t.dispatcher.sweep.run();
+    assert.equal(merges.length, 0, labels.join(' '));
+  }
+  const protectedTest = await build(APPROVAL_ENV);
+  const protectedMerges = approvedWorld(['compose.yaml']);
+  await protectedTest.dispatcher.sweep.run();
+  assert.equal(protectedMerges.length, 0, 'a protected path is handed over by the dispatcher, never merged by the sweep');
+  assert.ok(!world.calls.includes('POST /issues/34/comments'), 'and no hand-over comment is written by the sweep');
+  const unverdicted = await build(APPROVAL_ENV);
+  const noVerdict = approvedWorld(['src/a.mjs']);
+  world.routes['GET /issues/34/comments'] = [];
+  await unverdicted.dispatcher.sweep.run();
+  assert.equal(noVerdict.length, 0, 'no OK verdict for the head: nothing is merged');
+});
+
+test('approval safety net: a pull request whose ledger hold is running is left to the hold timer', async () => {
+  const t = await build(APPROVAL_ENV);
+  const merges = approvedWorld(['src/a.mjs']);
+  t.jobs.holds.set('owner/hello#pr34', { repository: repo, number: 34, sha: NEW, since: clock - MINUTE, merge_after: clock + HOUR, check_at: clock + HOUR });
+  await t.dispatcher.sweep.run();
+  assert.equal(merges.length, 0);
+});
+
+test('approval safety net: a dry run starts nothing and merges nothing', async () => {
+  const t = await build({ ...APPROVAL_ENV, DRY_RUN: '1' });
+  const merges = approvedWorld(['src/a.mjs']);
+  await t.dispatcher.sweep.run();
+  assert.equal(merges.length, 0);
 });

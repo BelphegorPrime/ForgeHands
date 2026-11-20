@@ -70,11 +70,12 @@ function normalizeMergeRequest(payload: Json, allowedRepos: Set<string>, labels:
   const match = /^ai\/issue-(\d+)$/.exec(String(mr.source_branch || ''));
   if (!change || !match || !positive(Number(match[1]))) return null;
   const present = names(payload.labels ?? mr.labels);
-  // Like Forgejo's `label_updated`, the dispatcher compares with the labels it saw before: the first matching round label counts, and the
-  // approval label counts when it is new in this change (the approval merges, so it must not fire again for an unrelated change).
-  let matched = labels.find((name) => present.includes(name));
+  // Like Forgejo's `label_updated`, the dispatcher compares with the labels it saw before. The approval label counts when it is new in this change
+  // (the approval merges, so it must not fire again for an unrelated change), and it comes first: a leftover round label must not hide it.
+  let matched: string | undefined;
   let type = 'pull_request.labeled';
-  if (!matched && approved && present.includes(approved) && !change.previous.includes(approved)) { matched = approved; type = 'pull_request.approved'; }
+  if (approved && present.includes(approved) && !change.previous.includes(approved)) { matched = approved; type = 'pull_request.approved'; }
+  else matched = labels.find((name) => present.includes(name));
   if (!matched) return null;
   return {
     type,

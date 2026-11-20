@@ -6,6 +6,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/agent/dispatch.ts';
+import { buildStatus } from '../src/server/status.ts';
+import { metrics } from '../src/metrics.ts';
 import { holdKey } from '../src/agent/merge.ts';
 import { loadConfig } from '../src/config.ts';
 import { JobStore } from '../src/store/jobs.ts';
@@ -84,7 +86,7 @@ function forge(state) {
   return { calls, send, wrote, comments, starts };
 }
 
-function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security = true, labels = ['ai:approved'] } = {}) {
+function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security = true, labels = ['ai:approved'], logger = quiet } = {}) {
   const state = {
     pr: { head: { sha: 'cafe0000cafe' }, labels },
     files,
@@ -96,7 +98,7 @@ function harness(extra = {}, { files = ['seed/infra/tests/a.test.ts'], security 
   const fake = forge(state);
   const config = loadConfig(env(extra));
   const jobs = new JobStore(join(dir, 'jobs.json'));
-  const dispatcher = new Dispatcher(config, jobs, fake.send, quiet, () => clock);
+  const dispatcher = new Dispatcher(config, jobs, fake.send, logger, () => clock);
   return { config, jobs, dispatcher, state, ...fake };
 }
 const approved = () => ({ type: 'pull_request.approved', repository: { full_name: repo }, pull_request: { number: 34, head_ref: 'ai/issue-26' }, issue: { number: 26 }, sender: { login: 'openhands' } });
@@ -404,4 +406,92 @@ test('revert on red: a revert pull request that reports refs/pull/<n>/head is st
   assert.ok(!h.wrote().some((line) => line.startsWith('PATCH /issues/')), 'no ticket is closed for a revert');
   assert.equal(h.jobs.holds.size, 0);
   assert.equal(h.jobs.merges.at(-1).branch, 'ai/revert-34', 'the ledger keeps the branch name, not the pull request ref');
+});
+
+// Merge decisions (the log line of each decision after an approval signal, the counter, the status field) and the approval that a leftover round
+// label must not hide (a label event with ai:approved and ai:changes on the pull request).
+const decisionLines = (lines) => lines.filter((line) => /^owner\/hello#34: (not merged|merged)/.test(line));
+const counterValue = (series) => {
+  const line = metrics.render().split('\n').find((entry) => entry.startsWith(series + ' '));
+  return line ? Number(line.slice(series.length + 1)) : 0;
+};
+const labelEvent = (labels, extra = {}) => ({
+  action: 'label_updated', repository: { full_name: repo, clone_url: 'https://forge.example/owner/hello.git', default_branch: 'main', html_url: 'https://forge.example/owner/hello' },
+  sender: { login: 'reviewer' }, pull_request: { number: 34, state: 'open', merged: false, title: 'Fix it', body: 'b', html_url: 'https://forge.example/owner/hello/pulls/34',
+    head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: labels.map((name) => ({ name })) },
+  ...extra
+});
+const normalizePR = (h, payload, previous) => normalizeEvent('pull_request', payload, new Set([repo]), ['ai:ready'], {
+  labelEvents: true, prLabels: ['ai:changes'], approved: 'ai:approved', previousLabels: previous
+});
+
+test('approval fixture: ai:approved and a leftover ai:changes on the pull request, verdict OK for the head, CI green, mergeable -> the approval merges', async () => {
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved', 'ai:changes'] });
+  const event = normalizePR(h, labelEvent(['ai:approved', 'ai:changes']), ['ai:changes']);
+  assert.equal(event.type, 'pull_request.approved', 'the approval that was just added is the event, not the stale round label');
+  event.previous_labels = ['ai:changes'];
+  assert.equal(await h.dispatcher.approve(event), 'merged');
+  assert.ok(merged(h), 'the pull request is merged');
+});
+
+test('approval fixture: the approval was already on the pull request before this event: a round label is still a round, no merge', async () => {
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved', 'ai:changes'] });
+  const event = normalizePR(h, labelEvent(['ai:approved', 'ai:changes']), ['ai:approved', 'ai:changes']);
+  assert.equal(event.type, 'pull_request.labeled');
+  event.previous_labels = ['ai:approved', 'ai:changes'];
+  assert.equal((await h.dispatcher.enqueue(event)).status, 'duplicate_job');
+  assert.ok(!merged(h));
+});
+
+test('approval fixture: without a label memory the event keeps the old precedence (no approval guessed)', async () => {
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved', 'ai:changes'] });
+  assert.equal(normalizePR(h, labelEvent(['ai:approved', 'ai:changes']), null).type, 'pull_request.labeled');
+});
+
+test('decisions: a refusal is one line "not merged: <reason>" and a merge one line "merged (<sha7>)"; the same refusal again in the hour is not repeated', async () => {
+  const lines = [];
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved'], logger: { error: (...args) => lines.push(args.join(' ')) } });
+  h.state.comments = [];
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'no_valid_review');
+  assert.deepEqual(decisionLines(lines), ['owner/hello#34: not merged: no_valid_review']);
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'no_valid_review');
+  assert.equal(decisionLines(lines).length, 1, 'once per pull request, head commit and reason in an hour');
+  clock += HOUR;
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'no_valid_review');
+  assert.equal(decisionLines(lines).length, 2, 'the hour is over: the line is written again');
+  h.state.comments = [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, SECURITY_OK()];
+  h.state.files = ['src/a.mjs'];
+  assert.equal(await h.dispatcher.merger.handle(approved()), 'merged');
+  assert.equal(decisionLines(lines).at(-1), 'owner/hello#34: merged (cafe000)');
+});
+
+test('decisions: the counter counts every decision by result and reason; the status field shows the last decision of an open pull request', async () => {
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved'], logger: { error() {} } });
+  h.state.comments = [];
+  const series = 'forgehands_merge_decisions_total{reason="no_valid_review",result="not_merged"}';
+  const before = counterValue(series);
+  await h.dispatcher.merger.handle(approved());
+  await h.dispatcher.merger.handle(approved());
+  assert.equal(counterValue(series) - before, 2, 'a counter counts each decision, the log line is rate-limited');
+  assert.equal(h.dispatcher.merger.decisions.get('owner/hello#34').reason, 'no_valid_review');
+  h.jobs.add({ key: 'owner/hello#26:ai:ready', label: 'ai:ready', status: 'done', created: clock - HOUR, started: clock - HOUR, finished: clock - HOUR / 2, attempts: 0,
+    event: { type: 'issues.labeled', label: 'ai:ready', repository: { full_name: repo }, issue: { number: 26, title: 'T', body: '', labels: [] }, pull_request: { number: 34, head_ref: 'ai/issue-26' }, sender: { login: 'marcel' } } });
+  const status = buildStatus(h.config, h.jobs, clock, undefined, [], null, { decisions: h.dispatcher.merger.decisions });
+  const issue = status.issues.find((entry) => entry.issue === 'owner/hello#26');
+  assert.equal(issue.pr, 34);
+  assert.deepEqual(issue.merge_decision, { reason: 'no_valid_review', at: new Date(clock).toISOString() });
+  const merged34Status = buildStatus(h.config, h.jobs, clock, undefined, [], null, { decisions: new Map() });
+  assert.equal(merged34Status.issues.find((entry) => entry.issue === 'owner/hello#26').merge_decision, undefined);
+});
+
+test('decisions: an approval the dispatcher takes for a round or a duplicate, and an approval of a sender that ALLOWED_SENDERS does not list, are said once', async () => {
+  const lines = [];
+  const h = harness({}, { files: ['src/a.mjs'], labels: ['ai:approved', 'ai:changes'], logger: { error: (...args) => lines.push(args.join(' ')) } });
+  const event = normalizePR(h, labelEvent(['ai:approved', 'ai:changes']), ['ai:approved', 'ai:changes']);
+  event.previous_labels = ['ai:approved', 'ai:changes'];
+  assert.equal((await h.dispatcher.enqueue(event)).status, 'duplicate_job');
+  assert.ok(decisionLines(lines).includes('owner/hello#34: not merged: duplicate_job'), lines.join('\n'));
+  const approvedAgain = { ...approved(), previous_labels: ['ai:approved'] };
+  assert.equal(await h.dispatcher.approve(approvedAgain), 'already_approved');
+  assert.ok(decisionLines(lines).includes('owner/hello#34: not merged: already_approved'));
 });

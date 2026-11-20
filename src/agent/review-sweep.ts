@@ -2,6 +2,7 @@ import { isBotPull, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { stuckKey } from './stuck.ts';
 import { isDry } from '../dry.ts';
 import { metrics } from '../metrics.ts';
+import { holdKey } from './merge.ts';
 import type { Merger } from './merge.ts';
 import type { Forge } from '../types/forge.ts';
 import type { DirectConfig, ForgeEvent, Json, Job, Logger } from '../types.ts';
@@ -15,6 +16,8 @@ const DAY_MS = 86400000;
 const MAX_STARTS = 5;
 // The same commit is tried at most once an hour, even when the enqueue answers `deferred` and nothing is in the ledger.
 const COOLDOWN_MS = HOUR_MS;
+// An approved pull request whose head is not merged is looked at again by Merger.handle this often (the approval safety net, see sweepApproved).
+const APPROVAL_RECHECK_MS = 30 * MINUTE_MS;
 // A pull request older than this is not swept: it is a forgotten one, not a lost event.
 const MAX_AGE_MS = 30 * DAY_MS;
 const PULLS_PER_REPOSITORY = 50;
@@ -45,6 +48,7 @@ export class ReviewSweep {
   hooks: StuckHooks;
   running: Promise<number> | null = null;
   cooldown = new Map<string, number>(); // repository#pr@sha -> until when it is not tried again
+  approvalCooldown = new Map<string, number>(); // repository#pr@sha -> until when the approval is not handed to the merger again
   timer: NodeJS.Timeout | undefined;
   firstTimer: NodeJS.Timeout | undefined;
 
@@ -93,6 +97,7 @@ export class ReviewSweep {
   async pass(): Promise<number> {
     const now = this.now();
     for (const [key, until] of [...this.cooldown]) if (until <= now) this.cooldown.delete(key);
+    for (const [key, until] of [...this.approvalCooldown]) if (until <= now) this.approvalCooldown.delete(key);
     const label = [...this.config.routes].find(([, route]) => route.kind === 'ci_success')?.[0];
     if (!label) return 0;
     let starts = 0;
@@ -107,6 +112,7 @@ export class ReviewSweep {
       }
       if (!Array.isArray(pulls)) continue;
       if (this.config.stuckPrMinutes) await this.watchStuck(repository, pulls, now);
+      await this.sweepApproved(repository, pulls, now);
       for (const pr of pulls) {
         if (starts >= MAX_STARTS) break;
         const candidate = this.candidate(repository, pr);
@@ -326,6 +332,68 @@ export class ReviewSweep {
     }
     return 'ForgeHands: this pull request is stuck: ' + why + '.\n' + quote + 'A human has to look at it. Pushing a commit, or removing ' + this.config.blockedLabel
       + ', lets ForgeHands look at it again.';
+  }
+
+  // The approval safety net: an open pull request that carries the approval label, whose head has an OK verdict and green CI and is not merged, is
+  // handed to Merger.handle once per head and APPROVAL_RECHECK_MS. A lost or early webhook cannot strand it. Never merged here: a blocked or
+  // held pull request (BLOCKED_LABEL, HOLD_LABEL, a two-key hold in the ledger), a draft, a pull request that touches a protected path (the
+  // merge policy's deny list, the hand-over is the dispatcher's), a pull request with a job of its own running or queued. Returns the number handled.
+  async sweepApproved(repository: string, pulls: Json[], now: number): Promise<number> {
+    if (!this.config.forgejo || !this.config.mergePolicy.get(repository.toLowerCase())) return 0;
+    let handled = 0;
+    for (const pr of pulls) {
+      const ref = this.approvedCandidate(repository, pr);
+      if (!ref) continue;
+      const sha = String(pr.head.sha).toLowerCase();
+      const key = repository + '#' + pr.number + '@' + sha;
+      if ((this.approvalCooldown.get(key) || 0) > now) continue;
+      if (this.activeOn(repository, pr.number, ref.issueKey) || this.merger.ledger?.holds.has(holdKey(repository, pr.number))) continue;
+      try {
+        if (!(await this.merger.reviewOf(repository, pr.number, sha)).ok) continue;
+        if (!(await this.merger.ciGreen(repository, sha))) continue;
+        const policy = this.config.mergePolicy.get(repository.toLowerCase())!;
+        if ((await this.merger.changedFiles(repository, pr.number)).some((name) => policy.deny.some((pattern) => pattern.test(name)))) continue;
+      } catch (error) {
+        this.logger.error('approval sweep: could not read ' + repository + '#' + pr.number + ':', error.message);
+        continue;
+      }
+      this.approvalCooldown.set(key, now + APPROVAL_RECHECK_MS);
+      this.logger.error(repository + '#' + pr.number + ': approved and green at head ' + sha.slice(0, 7) + ' but not merged, the approval sweep hands it to the merger');
+      handled += 1;
+      await this.merger.handle(this.approvalEvent(repository, pr, ref.issue));
+    }
+    return handled;
+  }
+
+  // The candidates of sweepApproved: an open agent, revert or listed bot pull request in this repository, with the approval label, no label that
+  // holds it back, not a draft, from the repository itself; `issueKey` is its ledger key ("repo#<issue>" or "repo!pr<n>").
+  approvedCandidate(repository: string, pr: Json): { issue: number; issueKey: string } | null {
+    if (!pr || pr.state !== 'open' || pr.merged || this.isDraft(pr) || typeof pr.head?.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(pr.head.sha)) return null;
+    if (!Number.isSafeInteger(pr.number) || pr.number <= 0) return null;
+    if (typeof pr.head?.repo?.full_name === 'string' && pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()) return null;
+    const labels = (Array.isArray(pr.labels) ? pr.labels : []).map((label: Json) => label?.name);
+    if (!labels.includes(this.config.approvedLabel) || [this.config.blockedLabel, this.config.holdLabel].some((name) => labels.includes(name))) return null;
+    const created = Date.parse(pr.created_at || '');
+    if (!Number.isFinite(created) || this.now() - created > MAX_AGE_MS) return null;
+    const ref = pullBranch(pr);
+    const agent = /^ai\/issue-(\d+)$/.exec(ref);
+    const name = repository.toLowerCase();
+    if (agent) return { issue: Number(agent[1]), issueKey: name + '#' + Number(agent[1]) };
+    const bots = { authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos };
+    if (REVERT_BRANCH.test(ref) || isBotPull(bots, pr, repository)) return { issue: pr.number, issueKey: name + '!pr' + pr.number };
+    return null;
+  }
+
+  // The event the approval safety net hands to Merger.handle: the pull request, as the approval label event carries it (the merger reads the rest).
+  approvalEvent(repository: string, pr: Json, issue: number): ForgeEvent {
+    const base = pr.base?.repo || {};
+    return {
+      type: 'pull_request.approved', source: this.forge.kind, action: 'sweep', label: this.config.approvedLabel,
+      repository: { full_name: repository, clone_url: base.clone_url || null, html_url: base.html_url || null, default_branch: base.default_branch || null },
+      issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: '', html_url: pr.html_url || null, comments: 0, labels: [] },
+      pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
+      sender: { login: null }
+    } as ForgeEvent;
   }
 
   // The event the watchdog hands to the dispatcher: the pull request and its ticket, as a sweep event carries them (no run is started by it).

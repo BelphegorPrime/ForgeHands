@@ -21,6 +21,9 @@ const DAY_MS = 24 * 60 * 60000;
 // After the WIP marker is removed Forgejo works out `mergeable` again, a moment later: a false that is read right after is read again this often.
 const MERGEABLE_REREADS = 4;
 const MERGEABLE_WAIT_MS = 2000;
+// A 'not merged' line is written once per pull request, head commit and reason in this span (a hold or a wait is looked at again every few minutes).
+const DECISION_LOG_MS = 60 * 60000;
+const DECISION_KEEP_MS = 7 * DAY_MS;
 
 // The ledger key of a pull request's hold: "repo#pr<n>" (lower case), the same form as the ledger keys of bot pull requests.
 export const holdKey = (repository: string, number: number): string => repository.toLowerCase() + '#pr' + number;
@@ -36,6 +39,10 @@ export class Merger {
   forge: Forge;
   // The wire: what every call of this merger passes through. A test replaces it; the paths stay the forge's.
   transport: ReturnType<typeof createTransport>;
+  // The last merge decision per pull request ("repo#<pr>", lower case): the reason it was not merged (or 'merged'), and when. The status page shows it.
+  decisions = new Map<string, { reason: string; at: number }>();
+  // When a 'not merged' line was last written, per "repo#<pr>@<sha>:<reason>" (see report).
+  decisionLogged = new Map<string, number>();
   // Set by the dispatcher: is a security review of this commit still queued or running? Then the hand-over waits for it.
   securityPending: (repository: string, number: number, sha: string) => boolean = () => false;
   // Tells the ledger that ForgeHands merged a ticket or handed it to a human (ticket: "repo#issue" or "repo!pr<n>"); the dispatcher sets it, see Dispatcher.noteTicket.
@@ -117,8 +124,39 @@ export class Merger {
     this.notifier.notify(immediateMessage(this.config.notify.language, kind, { repository, number, link: pullUrl(this.config, repository, number, htmlUrl), ...facts }), repository);
   }
 
-  // Returns the outcome as a status string; nothing here throws.
+  // Returns the outcome as a status string; nothing here throws. Every outcome is reported (see report): a merge, or the reason it did not merge.
   async handle(event: ForgeEvent, regraced = false): Promise<string> {
+    const seen: { sha: string | null } = { sha: null };
+    const outcome = await this.decide(event, regraced, seen);
+    this.report(event.repository.full_name, event.pull_request?.number ?? 0, outcome, seen.sha);
+    return outcome;
+  }
+
+  // Writes the decision of a pull request that had an approval signal: one line for a merge, one for a refusal (`not merged: <reason>`, at most
+  // once per head commit and reason per hour), a counter for both, and the last decision for the status page. Called by handle, and by the
+  // dispatcher for an approval that never reached handle (see Dispatcher.approve, enqueue). Never throws.
+  report(repository: string, number: number, outcome: string, sha: string | null): void {
+    const name = repository.toLowerCase() + '#' + number;
+    const now = this.now();
+    if (outcome === 'merged') {
+      this.decisions.delete(name);
+      metrics.inc('forgehands_merge_decisions_total', { result: 'merged', reason: 'merged' });
+      this.logger.error(repository + '#' + number + ': merged (' + String(sha || '').slice(0, 7) + ')');
+      return;
+    }
+    metrics.inc('forgehands_merge_decisions_total', { result: 'not_merged', reason: outcome });
+    this.decisions.set(name, { reason: outcome, at: now });
+    for (const [key, entry] of [...this.decisions]) if (now - entry.at > DECISION_KEEP_MS) this.decisions.delete(key);
+    const logKey = name + '@' + String(sha || '') + ':' + outcome;
+    const last = this.decisionLogged.get(logKey);
+    if (last !== undefined && now - last < DECISION_LOG_MS) return;
+    this.decisionLogged.set(logKey, now);
+    if (this.decisionLogged.size > 1000) for (const [key, at] of [...this.decisionLogged]) if (now - at >= DECISION_LOG_MS) this.decisionLogged.delete(key);
+    this.logger.error(repository + '#' + number + ': not merged: ' + outcome);
+  }
+
+  // The decision of handle, without the report. `seen.sha` is set once the head commit is known.
+  async decide(event: ForgeEvent, regraced: boolean, seen: { sha: string | null }): Promise<string> {
     const repository = event.repository.full_name;
     const policy = this.config.mergePolicy.get(repository.toLowerCase());
     if (!policy || !this.config.forgejo) return 'no_merge_policy';
@@ -130,6 +168,7 @@ export class Merger {
       const bot = isBotPull({ authors: this.config.botAuthors, prefixes: this.config.botBranchPrefixes, repos: this.config.botRepos }, pr, repository);
       if (!bot && !/^ai\/issue-\d+$/.test(pullBranch(pr))) return 'not_an_agent_branch';
       const sha = pr.head.sha;
+      seen.sha = sha;
       // A revert pull request (REVERT_ON_RED) is an agent pull request as any other, but skips the hold and the daily limit.
       const revert = REVERT_BRANCH.test(pullBranch(pr));
       const labels = (pr.labels || []).map((label: Json) => label.name);
