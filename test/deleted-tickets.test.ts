@@ -140,18 +140,66 @@ test('a running job of a deleted ticket is left alone; only its waiting and queu
   assert.equal(deletedLines().length, 1);
 });
 
-test('the ledger sync reads waiting and queued tickets too: a 404 on the ticket drops them, a running ticket is not read', async () => {
+test('the ledger sync reads waiting and queued tickets too: a 404 on the ticket drops them on the second pass, a running ticket is not read', async () => {
   const t = await setup();
   t.fg.gone.add(20);
   const waiting = addJob(t, 20, 'waiting', { waiting_for: [5] });
   const running = t.jobs.add({ key: repo + '#21:ai:ready', label: 'ai:ready', event: eventOf('ai:ready', 21), status: 'running', created: clock, started: clock, conversation_id: 'conv-y', attempts: 0 });
   const queued = addJob(t, 22, 'queued');
   await t.dispatcher.ledgerSync.run();
+  assert.equal(waiting.status, 'waiting', 'one 404 is not a deletion (a proxy can answer it)');
+  await t.dispatcher.ledgerSync.run();
   assert.equal(waiting.status, 'deleted');
   assert.equal(queued.status, 'queued', 'an open ticket is read and left as it is');
   assert.equal(running.status, 'running');
   assert.equal(deletedLines().length, 1);
+  assert.equal(deletedLines()[0], repo + '#20: deleted in the forge, removed from the status page');
   assert.equal(droppedCount(), 1);
+});
+
+test('a ticket the forge deleted with only finished jobs (a ghost) leaves the open list on the second pass: state `deleted in the forge`, one line, no more reads', async () => {
+  const t = await setup();
+  const done = addJob(t, 30, 'done', { finished: clock, result: 'finished' });
+  t.fg.gone.add(30);
+  await t.dispatcher.ledgerSync.run();
+  assert.notEqual(buildStatus(t.config, t.jobs, clock).issues.find((issue) => issue.issue === repo + '#30').state, 'deleted in the forge', 'one 404: not yet');
+  await t.dispatcher.ledgerSync.run();
+  const ticket = buildStatus(t.config, t.jobs, clock).issues.find((issue) => issue.issue === repo + '#30');
+  assert.equal(ticket.state, 'deleted in the forge');
+  assert.equal(ticket.closed, true, 'out of the open list, in the closed list');
+  assert.equal(done.archived_view, true);
+  assert.equal(deletedLines().length, 1);
+  const reads = t.fg.writes.length;
+  await t.dispatcher.ledgerSync.run();
+  await t.dispatcher.ledgerSync.run();
+  assert.equal(deletedLines().length, 1, 'no more lines on the next passes');
+  assert.equal(t.fg.writes.length, reads);
+  assert.equal(droppedCount(), 1);
+});
+
+test('a waiting ticket is released when the issue it waits for is deleted in the forge, even if the dependency list still names it as open', async () => {
+  const t = await setup();
+  t.fg.gone.add(5);
+  t.fg.deps[20] = [{ number: 5, state: 'open' }];
+  addJob(t, 5, 'done', { finished: clock, result: 'finished' });
+  const waiting = addJob(t, 20, 'waiting', { waiting_for: [5] });
+  await t.dispatcher.ledgerSync.run();
+  await t.dispatcher.ledgerSync.run();
+  assert.equal(t.jobs.isDeletedInForge(repo + '#5'), true);
+  assert.equal(waiting.waiting_for, undefined, 'nothing is waited for any more');
+  assert.equal(waiting.status, 'queued');
+  await t.dispatcher.tick();
+  assert.equal(waiting.status, 'running', 'the dependent starts: it does not wait forever');
+  assert.equal(t.oh.started, 1);
+});
+
+test('the sweep of closed tickets does not log a 404 again and again: the ledger sync decides it', async () => {
+  const t = await setup();
+  addJob(t, 40, 'failed', { finished: clock, result: 'error' });
+  t.fg.gone.add(40);
+  await t.dispatcher.sweepClosed(clock);
+  await t.dispatcher.sweepClosed(clock + 2 * 86400000);
+  assert.equal(logs.filter((line) => line.includes('could not read #40')).length, 0);
 });
 
 test('the ledger sync drops the queued jobs that name a deleted pull request, and leaves the open ticket alone', async () => {

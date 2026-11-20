@@ -184,7 +184,8 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
-    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket));
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket),
+      (repository, number) => this.ticketGone(repository, number));
     this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
     // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
@@ -717,7 +718,9 @@ export class Dispatcher {
     if (!this.config.forgejo) return [];
     try {
       const dependencies = await this.forge.dependencies(event.repository.full_name, number);
-      return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => issue.number);
+      // An issue marked deleted in the forge (see LedgerSync) cannot be waited for, whatever the dependency list still says.
+      return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open' && !this.jobs.isDeletedInForge(event.repository.full_name + '#' + issue.number))
+        .map((issue) => issue.number);
     } catch (error) {
       if (/HTTP 404\b/.test(error.message) && !('pull_request' in event && event.pull_request)) {
         await this.checkAndDropDeleted(event.repository.full_name, number);
@@ -1927,6 +1930,8 @@ export class Dispatcher {
         if (issue.state === 'closed') { if (await this.markClosed(ticket)) changed = true; }
         else this.closedChecked.set(ticket, now);
       } catch (error) {
+        // A 404 is the ledger sync's to decide (it marks an issue deleted in the forge after two passes): the sweep does not log it again and again.
+        if (/HTTP 404\b/.test(error.message)) { this.closedChecked.set(ticket, now); continue; }
         this.logger.error('could not read #' + number + ' of ' + repository + ':', error.message);
       }
     }

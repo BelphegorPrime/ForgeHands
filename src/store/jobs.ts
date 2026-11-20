@@ -32,6 +32,10 @@ export class JobStore {
   findings: FindingRecord[] = [];
   /** The ticket filed for a recurring reason, per "repo|reason". Kept: a reason has one ticket while it is open. */
   filedFindings = new Map<string, FiledFinding>();
+  /** Issues ("repo#n", lower case) the forge answered 404 for on two passes of the ledger sync, with the time they were marked (see LedgerSync). */
+  deletedInForge = new Map<string, number>();
+  /** Passes of the ledger sync that found an issue missing (404, confirmed by ticketGone), by "repo#n" (lower case). Reset by a read that finds it. */
+  goneChecks = new Map<string, number>();
   writes: Promise<void> = Promise.resolve();
 
   constructor(file: string) {
@@ -65,6 +69,12 @@ export class JobStore {
       }
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
+      }
+      for (const [key, value] of Object.entries((content?.deleted_in_forge || {}) as Record<string, number>)) {
+        if (typeof value === 'number') this.deletedInForge.set(key, value);
+      }
+      for (const [key, value] of Object.entries((content?.gone_checks || {}) as Record<string, number>)) {
+        if (typeof value === 'number') this.goneChecks.set(key, value);
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -118,6 +128,39 @@ export class JobStore {
   noteChecked(ticket: string, now: number): void {
     for (const job of this.list().filter((entry) => entry.key.startsWith(ticket + ':'))) job.synced_at = now;
   }
+  // The issue ("repo#n") is deleted in the forge (see LedgerSync): it leaves the status page's open list, as closed.
+  isDeletedInForge(ticket: string): boolean {
+    return this.deletedInForge.has(ticket.toLowerCase());
+  }
+  // Marks an issue deleted in the forge: its waiting and queued jobs end as `deleted` (no comment, no hand-over), its other jobs are closed for the
+  // status page, and the jobs that wait for it are released from it (a deleted issue cannot be waited for). Returns the number of jobs dropped.
+  markDeletedInForge(ticket: string, now: number): number {
+    const name = ticket.toLowerCase();
+    const number = Number(name.slice(name.lastIndexOf('#') + 1));
+    const repository = name.slice(0, name.lastIndexOf('#'));
+    this.deletedInForge.set(name, now);
+    this.goneChecks.delete(name);
+    let dropped = 0;
+    for (const job of this.jobs.values()) {
+      if (job.key.toLowerCase().split(':')[0] !== name || (job.status !== 'waiting' && job.status !== 'queued')) continue;
+      Object.assign(job, { status: 'deleted', finished: now, result: 'deleted' });
+      delete job.waiting_for; delete job.waiting_for_files;
+      dropped += 1;
+    }
+    this.markClosed(ticket);
+    for (const job of this.jobs.values()) {
+      if (job.status !== 'waiting' || job.waiting_for_run || job.event?.repository?.full_name?.toLowerCase() !== repository) continue;
+      const waitingFor = job.waiting_for ?? [];
+      const waitingFiles = job.waiting_for_files ?? [];
+      if (!waitingFor.includes(number) && !waitingFiles.includes(number)) continue;
+      const left = waitingFor.filter((n) => n !== number);
+      const leftFiles = waitingFiles.filter((n) => n !== number);
+      if (left.length) job.waiting_for = left; else delete job.waiting_for;
+      if (leftFiles.length) job.waiting_for_files = leftFiles; else delete job.waiting_for_files;
+      if (!left.length && !leftFiles.length) job.status = 'queued';
+    }
+    return dropped;
+  }
   add(job: NewJob): Job {
     const record: Job = { id: randomUUID(), attempts: 0, ...job };
     this.jobs.set(record.id, record);
@@ -131,6 +174,10 @@ export class JobStore {
       for (const [id, job] of this.jobs) {
         if (!ACTIVE.has(job.status) && (job.finished || job.created) < now - KEEP_MS) this.jobs.delete(id);
       }
+      // A deleted issue and a missing-issue count are kept while the ledger still holds a job of the issue.
+      const held = new Set([...this.jobs.values()].map((job) => job.key.toLowerCase().split(':')[0]));
+      for (const ticket of this.deletedInForge.keys()) if (!held.has(ticket)) this.deletedInForge.delete(ticket);
+      for (const ticket of this.goneChecks.keys()) if (!held.has(ticket)) this.goneChecks.delete(ticket);
       for (const [key, value] of this.labels) if (value.seen < now - KEEP_MS) this.labels.delete(key);
       for (const [key, seen] of this.dedupe) if (seen < now - KEEP_MS) this.dedupe.delete(key);
       this.merges = this.merges.filter((entry) => entry.merged_at >= now - KEEP_MS);
@@ -138,7 +185,7 @@ export class JobStore {
       this.findings = this.findings.filter((entry) => entry.at >= now - KEEP_MS);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), epic_gaps: Object.fromEntries(this.epicGaps), merges: this.merges, reverts: this.reverts, findings: this.findings, filed_findings: Object.fromEntries(this.filedFindings) }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), deleted_in_forge: Object.fromEntries(this.deletedInForge), gone_checks: Object.fromEntries(this.goneChecks), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), epic_gaps: Object.fromEntries(this.epicGaps), merges: this.merges, reverts: this.reverts, findings: this.findings, filed_findings: Object.fromEntries(this.filedFindings) }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;
