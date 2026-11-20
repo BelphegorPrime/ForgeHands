@@ -130,7 +130,8 @@ export class E2eController {
     let error: string | null = null;
     try {
       results = await runSuite(scenarios, { repository, forge, ledger, timeoutMs: config.e2e.timeoutMinutes * 60000, pollMs: this.deps.pollMs ?? 30000,
-        queueMs: config.e2e.queueMinutes * 60000, now: this.deps.now, sleep: this.deps.sleep });
+        queueMs: config.e2e.queueMinutes * 60000, now: this.deps.now, sleep: this.deps.sleep,
+        log: (line) => logger.log?.('e2e: ' + line) });
     } catch (caught) {
       error = String((caught as Error)?.message || caught).slice(0, 600);
       logger.error('e2e: the suite could not run:', error);

@@ -23,6 +23,8 @@ export interface RunOptions {
   leftoverMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Receives the path names of the cleanup's restore retries (never contents). */
+  log?: (line: string) => void;
 }
 
 export interface ScenarioResult {
@@ -64,11 +66,13 @@ export interface RestoreOptions {
   /** The wait between two passes. */
   waitMs?: number;
   /**
-   * The wait before the last look at a branch that still differs. The forge answers the compare and the contents of a commit that was just
-   * written a little later than the write: a difference that is only there in that window is not a difference (default 3 seconds).
+   * The waits before the verdict on a difference that survives the passes, in milliseconds. Each wait is followed by a fresh read of the
+   * branch and another restore of what still differs. Default 2, 4, 8, 16 and 30 seconds: about a minute in all.
    */
-  settleMs?: number;
+  settle?: number[];
   sleep?: (ms: number) => Promise<void>;
+  /** Receives path names and counts for the retries (never contents). Default: nothing. */
+  log?: (line: string) => void;
 }
 
 export interface RestoreResult {
@@ -76,7 +80,12 @@ export interface RestoreResult {
   changed: number;
   /** The paths that still differ and that the run did not touch (the restore cannot write them: a symlink, a mode change). */
   untouched: string[];
+  /** Paths of the run that a commit of someone else changed after the restore: a note, not a failure. */
+  moved: string[];
 }
+
+/** The waits of the settle schedule (see RestoreOptions.settle). */
+const SETTLE_MS = [2000, 4000, 8000, 16000, 30000];
 
 // The paths a compare lists, the old name of a renamed file included.
 function pathsOf(diff: { files?: { filename: string; previous_filename?: string }[] }): string[] {
@@ -91,64 +100,120 @@ function listOf(paths: string[]): string {
 
 // Makes the file at `path` of `branch` equal to its content at `sha`: a commit writes it back, or deletes it when it did not exist then.
 // `tip` is the commit the branch has now: the file is read at that commit, not at the branch name (a name can be answered from a cache).
-// Returns 1 when a commit was made, 0 when the file already is as it should be. A file the contents API cannot read throws.
-async function restorePath(forge: E2eForge, repository: string, branch: string, tip: string, sha: string, path: string): Promise<number> {
+// Returns the commit the write made (null when the forge named none), or null when the file already is as it should be. A file the contents
+// API cannot read throws.
+async function restorePath(forge: E2eForge, repository: string, branch: string, tip: string, sha: string, path: string): Promise<{ commit: string | null } | null> {
   const before = await forge.readFile(repository, path, sha);
   const now = await forge.readFile(repository, path, tip);
-  if (!before && !now) return 0;
+  if (!before && !now) return null;
   // Base64 of the same bytes is the same text, so this compares the bytes; the line breaks of the encoding do not count.
-  if (before && now && before.content.replace(/\s+/g, '') === now.content.replace(/\s+/g, '')) return 0;
+  if (before && now && before.content.replace(/\s+/g, '') === now.content.replace(/\s+/g, '')) return null;
   const message = 'e2e: restore ' + path + ' as of ' + sha.slice(0, 8);
-  if (before) await forge.writeFile(repository, path, { message, branch, content: before.content, ...(now ? { sha: now.sha } : {}) });
-  else if (now) await forge.deleteFile(repository, path, { message, branch, sha: now.sha });
-  return 1;
+  if (before) return { commit: await forge.writeFile(repository, path, { message, branch, content: before.content, ...(now ? { sha: now.sha } : {}) }) ?? null };
+  if (now) return { commit: await forge.deleteFile(repository, path, { message, branch, sha: now.sha }) ?? null };
+  return null;
+}
+
+// Whether `path` differs between the commits `sha` and `at`, read at both commit ids. A read that throws is a difference: it cannot be shown
+// to be the same.
+async function differsAt(forge: E2eForge, repository: string, sha: string, at: string, path: string): Promise<boolean> {
+  try {
+    const before = await forge.readFile(repository, path, sha);
+    const now = await forge.readFile(repository, path, at);
+    if (!before || !now) return Boolean(before) !== Boolean(now);
+    return before.content.replace(/\s+/g, '') !== now.content.replace(/\s+/g, '');
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * What commit `at` still differs from `sha` in. The candidates are the paths the compare lists and the paths of the run; every candidate is
+ * then read at `at` itself, so a compare that answers late cannot make a difference (or hide one of the run's paths).
+ */
+async function verdictAt(forge: E2eForge, repository: string, sha: string, at: string, touched: ReadonlySet<string> | null | undefined):
+  Promise<{ mine: string[]; untouched: string[] }> {
+  const listed = at === sha ? [] : pathsOf(await forge.compare(repository, sha, at));
+  const candidates = [...new Set([...listed, ...(touched ?? [])])];
+  const mine: string[] = [];
+  const untouched: string[] = [];
+  for (const path of candidates) {
+    if (!(await differsAt(forge, repository, sha, at, path))) continue;
+    if (!touched || touched.has(path)) mine.push(path);
+    else untouched.push(path);
+  }
+  return { mine, untouched };
 }
 
 /**
  * Puts a branch back to the tree of `sha`. The forge's API cannot move a branch pointer, so every file that differs between `sha` and the
- * tip gets a commit of its own (written back, or deleted). A pass that leaves something (a commit that landed meanwhile, a file the API
- * refused) is followed by another, up to `attempts`. Throws when a path the run touched still differs; the others are returned.
+ * tip gets a commit of its own (written back, or deleted). The verdict is taken at the commit the restore wrote last (its id, from the write's
+ * answer), not at the branch: a read of the branch or a compare right after a commit can still show the state before it. A verdict that
+ * still differs in the paths of the run is looked at again after the settle waits (a fresh read of the branch, another restore). Throws when
+ * a path the run touched still differs after all of that; the others are returned. Commits of someone else after the restore are not judged
+ * except for the paths of the run, which come back as `moved`.
  */
 export async function restoreBranch(forge: E2eForge, repository: string, branch: string, sha: string, options: RestoreOptions = {}): Promise<RestoreResult> {
   const attempts = Math.max(1, options.attempts ?? 3);
   const sleep = options.sleep ?? pause;
   const waitMs = options.waitMs ?? 2000;
-  const settleMs = options.settleMs ?? 3000;
-  // The differences between `sha` and the tip the branch has now, read by the commit's id each time.
+  const settle = options.settle ?? SETTLE_MS;
+  const log = options.log ?? (() => {});
+  const touched = options.touched;
+  // Every tip read and every commit the restore made: a tip outside this set is a commit of someone else that landed after the restore.
+  const seen = new Set<string>([sha]);
   const tipOf = async (): Promise<string> => {
     const tip = await forge.branchTip(repository, branch);
     if (!tip) throw new Error('branch ' + branch + ' does not exist');
+    seen.add(tip);
     return tip;
   };
-  const leftAt = async (): Promise<string[]> => {
-    const tip = await tipOf();
-    return tip === sha ? [] : pathsOf(await forge.compare(repository, sha, tip));
-  };
   let changed = 0;
-  let left: string[] = [];
-  for (let pass = 1; ; pass++) {
+  // One pass: every path that differs between `sha` and the tip read now is restored. Returns the commit to judge: the last commit the pass
+  // made, or else the tip it read.
+  const pass = async (): Promise<string> => {
     const tip = await tipOf();
-    if (tip !== sha) {
-      for (const path of pathsOf(await forge.compare(repository, sha, tip))) {
-        // A path the API refuses now is looked at again by the next pass; the last pass reports it as left.
-        try { changed += await restorePath(forge, repository, branch, tip, sha, path); }
-        catch { /* see above */ }
+    if (tip === sha) return tip;
+    let last: string | null | undefined;
+    for (const path of pathsOf(await forge.compare(repository, sha, tip))) {
+      // A path the API refuses now is judged again by the verdict; a path that stays different is reported there.
+      try {
+        const made = await restorePath(forge, repository, branch, tip, sha, path);
+        if (!made) continue;
+        changed += 1;
+        last = made.commit;
+        if (made.commit) seen.add(made.commit);
+      } catch (error) {
+        log('restore of ' + path + ' failed: ' + String(error?.message || error).slice(0, 200));
       }
     }
-    left = await leftAt();
-    if (!left.length) break;
-    if (pass >= attempts) {
-      // The last look is not taken at once: a difference that is still there after a settle is one, one that is gone was a stale answer.
-      await sleep(settleMs);
-      left = await leftAt();
-      break;
-    }
+    return last ?? tip;
+  };
+  let target = await pass();
+  let verdict = await verdictAt(forge, repository, sha, target, touched);
+  for (let round = 1; verdict.mine.length && round < attempts; round++) {
+    log('restore: ' + listOf(verdict.mine) + ' still differ, another pass');
     await sleep(waitMs);
+    target = await pass();
+    verdict = await verdictAt(forge, repository, sha, target, touched);
   }
-  const touched = options.touched;
-  const mine = left.filter((path) => !touched || touched.has(path));
-  if (mine.length) throw new Error(branch + ' still differs from ' + sha.slice(0, 8) + ' in ' + mine.length + ' file(s) of the run: ' + listOf(mine));
-  return { changed, untouched: left };
+  // The settle waits: a difference that is still there after each of them is looked at again, with the branch read afresh.
+  for (const wait of settle) {
+    if (!verdict.mine.length) break;
+    log('restore: ' + listOf(verdict.mine) + ' still differ, looking again in ' + Math.round(wait / 1000) + ' s');
+    await sleep(wait);
+    target = await pass();
+    verdict = await verdictAt(forge, repository, sha, target, touched);
+  }
+  if (verdict.mine.length) throw new Error(branch + ' still differs from ' + sha.slice(0, 8) + ' in ' + verdict.mine.length + ' file(s) of the run: ' + listOf(verdict.mine));
+  // A commit of someone else that landed after the restore: its changes to the paths of the run are reported, not repaired.
+  let moved: string[] = [];
+  let latest: string | null = null;
+  try { latest = await forge.branchTip(repository, branch); } catch { latest = null; }
+  if (latest && !seen.has(latest) && latest !== target) {
+    moved = pathsOf(await forge.compare(repository, target, latest)).filter((path) => !touched || touched.has(path));
+  }
+  return { changed, untouched: verdict.untouched, moved };
 }
 
 /** Where the clock of a run-dependent wait stands: the run is going, a run waits in the queue, or no run is active (the wait's own clock). */
@@ -296,7 +361,7 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
   }
 
   const outcome = await cleanup(repository, forge, { tickets, defaultBranch, baseline },
-    { sleep, ledger: options.ledger, pollMs: options.pollMs, leftoverMs: options.leftoverMs })
+    { sleep, ledger: options.ledger, pollMs: options.pollMs, leftoverMs: options.leftoverMs, log: options.log })
     .catch((error): CleanupOutcome => ({ problem: String(error?.message || error).slice(0, 600), note: null }));
   return {
     scenario: scenario.name,
@@ -362,6 +427,8 @@ export interface CleanupPacing {
   pollMs?: number;
   /** How long it waits for them (default 30 minutes). */
   leftoverMs?: number;
+  /** Receives the path names of the restore's retries (never contents). */
+  log?: (line: string) => void;
 }
 
 export async function cleanup(repository: string, forge: E2eForge, created: Created, pacing: CleanupPacing = {}): Promise<CleanupOutcome> {
@@ -436,11 +503,17 @@ export async function cleanup(repository: string, forge: E2eForge, created: Crea
   if (created.baseline && created.defaultBranch) {
     const baseline = created.baseline;
     await attempt('reset ' + created.defaultBranch, async () => {
-      const result = await restoreBranch(forge, repository, created.defaultBranch, baseline, { touched, sleep: pacing.sleep });
+      const result = await restoreBranch(forge, repository, created.defaultBranch, baseline, { touched, sleep: pacing.sleep, log: pacing.log });
+      const notes: string[] = [];
       if (result.untouched.length) {
-        note = created.defaultBranch + ' still differs from ' + baseline.slice(0, 8) + ' in ' + result.untouched.length
-          + ' file(s) the run did not touch, left alone: ' + listOf(result.untouched);
+        notes.push(created.defaultBranch + ' still differs from ' + baseline.slice(0, 8) + ' in ' + result.untouched.length
+          + ' file(s) the run did not touch, left alone: ' + listOf(result.untouched));
       }
+      if (result.moved.length) {
+        notes.push(created.defaultBranch + ' moved on after the restore: a commit of someone else changed ' + result.moved.length
+          + ' file(s) of the run, left alone: ' + listOf(result.moved));
+      }
+      if (notes.length) note = notes.join('; ');
     });
   }
   return { problem: problems.length ? problems.join('; ') : null, note };

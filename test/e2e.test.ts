@@ -156,6 +156,7 @@ class FakeForge {
     if (!sha && current !== undefined) throw new Error('POST ' + path + ' -> HTTP 422');
     snapshot.set(path, unb64(content));
     this.branches.set(branch, this.commit(snapshot));
+    return this.lastCommit;
   }
   deleteFile(_, path, { branch, sha }) {
     this.tick('deleteFile');
@@ -163,6 +164,7 @@ class FakeForge {
     if (!snapshot.has(path) || 'blob:' + snapshot.get(path) !== sha) throw new Error('DELETE ' + path + ' -> HTTP 409');
     snapshot.delete(path);
     this.branches.set(branch, this.commit(snapshot));
+    return this.lastCommit;
   }
 }
 
@@ -518,6 +520,16 @@ test('forgejo readFile: a regular file reads, a missing one is null, while a sym
   await assert.rejects(answer({ type: 'file', sha: 'abc' }).readFile('owner/hello', 'x', 'main'), /no content/);
 });
 
+test('forgejo writeFile and deleteFile answer the id of the commit they made (the restore verifies at that commit), null when the answer names none', async () => {
+  const methods = [];
+  const forge = new ForgejoForge(async (_, method) => { methods.push(method); return { content: null, commit: { sha: 'c9f0e1' } }; });
+  assert.equal(await forge.writeFile('owner/hello', 'e2e/a.txt', { message: 'm', branch: 'main', content: 'aGk=' }), 'c9f0e1');
+  assert.equal(await forge.writeFile('owner/hello', 'e2e/a.txt', { message: 'm', branch: 'main', content: 'aGk=', sha: 'abc' }), 'c9f0e1');
+  assert.equal(await forge.deleteFile('owner/hello', 'e2e/a.txt', { message: 'm', branch: 'main', sha: 'abc' }), 'c9f0e1');
+  assert.deepEqual(methods, ['POST', 'PUT', 'DELETE']);
+  assert.equal(await new ForgejoForge(async () => ({})).deleteFile('owner/hello', 'e2e/a.txt', { message: 'm', branch: 'main', sha: 'abc' }), null);
+});
+
 // A controller over a ledger file of its own, for the trigger tests.
 async function controllerFor(env, version, { scenarios, file, sent = [] } = {}) {
   const config = loadConfig(env, quiet);
@@ -786,25 +798,107 @@ test('the dispatcher drops the queued runs of a closed ticket and leaves its run
   }
 });
 
-test('the pull request of a stale compare is not a difference: the restore looks once more after a settle before it fails', async () => {
+test('restore: the verdict is taken at the commit the restore wrote, so a stale branch read or compare after it is not a difference', async () => {
   const forge = new FakeForge();
   const baseline = forge.branches.get('main');
   forge.commitOn('main', 'main', { 'e2e/red.marker': 'red' });
-  // The compare answers a difference that is gone once after the restore wrote the file back (a cache that is still behind).
+  // After the restore's write the branch read still shows the old tip twice, and the compare shows a difference that is gone.
+  const branchTip = forge.branchTip.bind(forge);
   const compare = forge.compare.bind(forge);
-  let stale = true;
+  let staleTips = 0;
+  let staleCompares = 0;
+  let before = null;
+  forge.progress = (f, name) => { if (name === 'deleteFile' && !before) { before = f.branches.get('main'); staleTips = 2; staleCompares = 2; } };
+  forge.branchTip = (repository, branch) => (staleTips > 0 && before ? (staleTips -= 1, before) : branchTip(repository, branch));
   forge.compare = (repository, from, to) => {
     const answer = compare(repository, from, to);
-    if (stale && answer.files.length === 0 && to !== from) { stale = false; return { files: [{ filename: 'e2e/red.marker' }] }; }
+    if (staleCompares > 0 && answer.files.length === 0 && to !== from) { staleCompares -= 1; return { files: [{ filename: 'e2e/red.marker' }] }; }
     return answer;
   };
-  let slept = 0;
-  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), attempts: 1,
-    sleep: async () => { slept += 1; }, waitMs: 0, settleMs: 3000 });
+  const slept = [];
+  const logged = [];
+  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), sleep: async (ms) => { slept.push(ms); },
+    waitMs: 0, log: (line) => logged.push(line) });
   assert.deepEqual(result.untouched, []);
-  assert.equal(slept, 1, 'one settle before the verdict');
-  assert.equal(stale, false, 'the stale answer was given');
+  assert.deepEqual(result.moved, [], 'the stale tip is a commit the restore already saw, not one of someone else');
+  assert.equal(staleTips, 1, 'the stale tip read after the write was given (the moved check reads the branch once)');
+  assert.equal(staleCompares, 1, 'the stale compare answer after the write was given (the verdict reads the compare once)');
+  assert.deepEqual(slept, [], 'no settle wait: the commit the restore wrote answers at once');
+  assert.deepEqual(logged, []);
   assert.equal(forge.readFile(null, 'e2e/red.marker', 'main'), null);
+});
+
+test('restore: stale reads of the commit the restore wrote are looked at again on a later pass, and the third read is the verdict', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/red.marker': 'red' });
+  // The forge answers the contents of the commit the restore wrote with the old file for two reads after the write.
+  const readFile = forge.readFile.bind(forge);
+  let stale = 0;
+  forge.progress = (_, name) => { if (name === 'deleteFile') stale = 2; };
+  forge.readFile = (repository, path, ref) => {
+    if (stale > 0 && path === 'e2e/red.marker' && ref !== baseline) { stale -= 1; return { sha: 'blob:red', content: b64('red') }; }
+    return readFile(repository, path, ref);
+  };
+  const slept = [];
+  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), sleep: async (ms) => { slept.push(ms); }, waitMs: 0 });
+  assert.equal(stale, 0, 'both stale reads were given');
+  assert.deepEqual(result.untouched, []);
+  assert.deepEqual(slept, [0, 0], 'two more passes (the first verdict and the second one saw the stale file), no settle wait');
+  assert.equal(forge.readFile(null, 'e2e/red.marker', 'main'), null);
+});
+
+test('restore: a difference that stays in a path of the run fails after the settle schedule (2, 4, 8, 16, 30 s), and the cleanup names the path', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/red.marker': 'red' });
+  // The forge accepts the write and answers a commit id, but the branch does not change: the difference stays for every look.
+  forge.writeFile = (_, __, { branch }) => { forge.tick('writeFile'); return forge.branches.get(branch); };
+  forge.deleteFile = (_, __, { branch }) => { forge.tick('deleteFile'); return forge.branches.get(branch); };
+  const slept = [];
+  await assert.rejects(restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), sleep: async (ms) => { slept.push(ms); }, waitMs: 0 }),
+    /main still differs from \S+ in 1 file\(s\) of the run: e2e\/red.marker$/);
+  assert.deepEqual(slept, [0, 0, 2000, 4000, 8000, 16000, 30000], 'two passes more, then the settle schedule, about a minute in all');
+
+  const ticket = forge.createIssue('owner/hello', 'E2E red', 'B');
+  forge.commitOn('ai/issue-' + ticket.number, 'main', { 'e2e/red.marker': 'red' });
+  const failed = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline }, { sleep: async () => {} });
+  assert.match(failed.problem, /^reset main: main still differs from \S+ in 1 file\(s\) of the run: e2e\/red.marker$/);
+});
+
+test('restore: a path of the run that another commit changes after the restore is a note, not a failure; a commit on an unrelated path is ignored', async () => {
+  for (const [file, moved] of [['e2e/delivery.txt', ['e2e/delivery.txt']], ['e2e/other.txt', []]]) {
+    const forge = new FakeForge();
+    const baseline = forge.branches.get('main');
+    const ticket = forge.createIssue('owner/hello', 'E2E normal delivery', 'B');
+    forge.commitOn('ai/issue-' + ticket.number, 'main', { 'e2e/delivery.txt': 'delivered' });
+    forge.commitOn('main', 'main', { 'e2e/delivery.txt': 'delivered' });
+    // Right after the restore's write, another ticket's commit lands on main (the first branch read after it).
+    let wrote = false;
+    let landed = false;
+    forge.progress = (f, name) => {
+      if (name === 'deleteFile') wrote = true;
+      if (name === 'branchTip' && wrote && !landed) { landed = true; f.commitOn('main', 'main', { [file]: 'foreign' }); }
+    };
+    const outcome = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline }, { sleep: async () => {} });
+    assert.equal(landed, true, 'the foreign commit landed');
+    assert.equal(outcome.problem, null, 'the cleanup holds');
+    if (moved.length) assert.match(outcome.note, /^main moved on after the restore: a commit of someone else changed 1 file\(s\) of the run, left alone: e2e\/delivery.txt$/);
+    else assert.equal(outcome.note, null, 'an unrelated path is not the run\'s concern');
+  }
+});
+
+test('restore: the retries and the verdicts log path names, never contents', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/red.marker': 'SECRET-CONTENT' });
+  // The forge accepts the deletion but the branch does not change, so every look sees the difference.
+  forge.deleteFile = (_, __, { branch }) => { forge.tick('deleteFile'); return forge.branches.get(branch); };
+  const logged = [];
+  await assert.rejects(restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), sleep: async () => {}, waitMs: 0, log: (line) => logged.push(line) }));
+  assert.equal(logged.length > 0, true, 'the retries are logged');
+  assert.equal(logged.every((line) => line.includes('e2e/red.marker')), true, 'every line names the path');
+  assert.equal(logged.some((line) => line.includes('SECRET-CONTENT')), false, 'no contents');
 });
 
 test('restore reads each path at the commit the branch has, not at the branch name', async () => {

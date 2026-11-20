@@ -391,3 +391,13 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **The merge after the WIP marker is removed.** Forgejo may still say `mergeable: false` on the first read after the title change. ForgeHands now reads the pull request again up to four times, two seconds apart, and refuses with `not_mergeable` only when the flag stays false. An approved, green pull request therefore waits up to eight seconds more before it is merged or refused.
 - **What to check.** A WIP-titled pull request that the watchdog blocks should carry the verdict's reason in its comment, not `conflicts with`. A `conflict` mail for a pull request that merges cleanly is a bug to report.
 - **Rollback.** Go back to the previous version. Nothing in the ledger changes.
+
+# Upgrading to the next version: the end-to-end cleanup judges the commit it wrote
+
+**Nothing changes in production.** The changes are in the end-to-end suite (off unless `E2E_REPO` is set). A ticket outside the suite is dispatched and delivered as before.
+
+- **The verdict of the cleanup's restore is taken at the commit the restore wrote last**, not at the branch. The v0.9.14 cleanup read the branch right after its last commit, and a stale answer there failed two runs whose main was already correct (`reset main: main still differs from <sha> in 1 file(s) of the run`). The contents API now names the commit of each write, and the paths of the run are read at that commit.
+- **A difference that survives the passes waits longer before it fails.** The settle schedule is 2, 4, 8, 16 and 30 seconds (about a minute), with a fresh read of the branch and another restore before each look. The retries log the path names, never the contents. Only a difference that survives all of it fails the cleanup.
+- **A later commit of someone else is a note.** If another ticket's commit lands on main after the restore and changes a path of the run, `cleanup_note` says `main moved on after the restore` with the paths, and the cleanup holds. A commit on any other path is ignored.
+- **What to check.** After the first run on the new version, `/status.json` (`e2e.last.results`) should show `cleanup: ok`. A `cleanup_reason` that still names paths means the difference is real on the test repository: look at those paths on main, not at the timing.
+- **Rollback.** Go back to the previous version. The record of the last run (`meta.e2e`) keeps its format, so nothing in the ledger needs changing.

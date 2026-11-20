@@ -213,15 +213,21 @@ export class ForgejoForge implements Forge {
     if (typeof entry.content !== 'string' || typeof entry.sha !== 'string') throw new Error('GET /contents/' + path + ': no content in the answer');
     return { sha: entry.sha, content: entry.content };
   }
-  // Create (POST) when there is no blob id, update (PUT) when there is one.
-  async writeFile(repository: string, path: string, { message, branch, content, sha }: FileWrite): Promise<void> {
+  // Create (POST) when there is no blob id, update (PUT) when there is one. The answer names the commit the write made.
+  async writeFile(repository: string, path: string, { message, branch, content, sha }: FileWrite): Promise<string | null> {
     const body = { content, message, branch, ...(sha ? { sha } : {}) };
-    await this.call(repository, sha ? 'PUT' : 'POST', '/contents/' + encodePath(path), body);
+    return commitIdOf(await this.call(repository, sha ? 'PUT' : 'POST', '/contents/' + encodePath(path), body));
   }
-  async deleteFile(repository: string, path: string, { message, branch, sha }: FileDelete): Promise<void> {
-    await this.call(repository, 'DELETE', '/contents/' + encodePath(path), { message, branch, sha });
+  async deleteFile(repository: string, path: string, { message, branch, sha }: FileDelete): Promise<string | null> {
+    return commitIdOf(await this.call(repository, 'DELETE', '/contents/' + encodePath(path), { message, branch, sha }));
   }
 }
 
 // Each segment of a repository path is encoded, the slashes between them are kept.
 function encodePath(path: string): string { return path.split('/').map((segment) => encodeURIComponent(segment)).join('/'); }
+
+// The commit a contents write answers with (`commit.sha`); null when the answer names none.
+function commitIdOf(answer: Json): string | null {
+  const sha = (answer as { commit?: { sha?: unknown } } | null)?.commit?.sha;
+  return typeof sha === 'string' && sha ? sha : null;
+}
