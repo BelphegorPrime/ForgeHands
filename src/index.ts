@@ -16,7 +16,7 @@ if (config.dryRun) console.error('WARNING: DRY RUN. Events are judged as usual, 
   + (config.dryRunRepos.size ? 'only for ' + [...config.dryRunRepos].join(', ') : 'all repositories') + ').');
 const store = new DeliveryStore(config.dataFile);
 await store.load();
-let dispatcher = null;
+let dispatcher: Dispatcher | null = null;
 let e2e: E2eController | null = null;
 if (config.mode === 'direct') {
   const jobs = new JobStore(config.jobsFile);
@@ -30,7 +30,8 @@ if (config.mode === 'direct') {
   dispatcher = new Dispatcher(config, jobs);
   dispatcher.start().catch((error) => console.error('dispatcher start failed:', error.message));
   // The end-to-end suite (E2E_REPO): off unless a test repository is named. It drives the test repository through the same forge client.
-  if (config.e2e.repository) e2e = new E2eController({ config, forge: createForge(config, createTransport(config, fetch)), jobs, notifier: dispatcher.notifier, version, logger: console });
+  if (config.e2e.repository) e2e = new E2eController({ config, forge: createForge(config, createTransport(config, fetch)), jobs, notifier: dispatcher.notifier, version, logger: console,
+    dropQueued: (repository, number) => (dispatcher ? dispatcher.dropQueuedOf(repository, number) : Promise.resolve(0)) });
 }
 const server = createApp(config, store, fetch, console, dispatcher, e2e);
 

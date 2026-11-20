@@ -226,8 +226,10 @@ export interface E2eConfig {
   onStart: boolean;
   /** E2E_SCENARIOS: the names to run; null means every scenario that is not experimental. */
   scenarios: string[] | null;
-  /** E2E_TIMEOUT_MINUTES: the time one scenario may take, cleanup not included. */
+  /** E2E_TIMEOUT_MINUTES: the time one scenario may take, cleanup not included. A wait for a run counts it from the start of the run. */
   timeoutMinutes: number;
+  /** E2E_QUEUE_MINUTES: how long a run of the suite's ticket may wait in the queue before the wait fails (queued_too_long). */
+  queueMinutes: number;
 }
 
 export type Config = WebhookConfig | DirectConfig;

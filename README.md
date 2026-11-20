@@ -393,7 +393,8 @@ Off unless `E2E_REPO` names a dedicated test repository. See [End-to-end suite](
 | `E2E_REPO` | unset (off) | The test repository (`owner/name`, one of `ALLOWED_REPOS`); its scenarios run against it through the forge. Needs direct mode and `FORGE_URL`, `FORGE_TOKEN`. |
 | `E2E_ON_START` | `0` | `1`: after a start whose version has no e2e run in the ledger, the suite runs once in the background. Needs `E2E_REPO`. |
 | `E2E_SCENARIOS` | all non-experimental | Comma separated scenario names, run in the order given (`normal-delivery`, `revert-on-red`, `empty-runs`, `stuck-pull-request`, `conflict-round`). |
-| `E2E_TIMEOUT_MINUTES` | `90` | The time one scenario may take, cleanup not included (1 to 1440). |
+| `E2E_TIMEOUT_MINUTES` | `90` | The time one scenario may take, cleanup not included (1 to 1440). A wait for a run counts from the start of the run. |
+| `E2E_QUEUE_MINUTES` | `60` | How long a run of a suite ticket may wait queued before its wait fails (`queued_too_long`), 1 to 1440. |
 
 ## Behaviour in detail
 
@@ -807,7 +808,7 @@ scrape_configs:
 
 ## End-to-end suite
 
-After each deploy (`E2E_ON_START=1`) or on demand (`POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>`; without `STATUS_TOKEN` the endpoint answers `403`), ForgeHands runs scenarios against a test repository: a ticket gets its run, the pull request is reviewed and merged, and a change that turns the default branch red is reverted, reopened and started again once. Each scenario cleans up after itself (tickets, pull requests, branches, the default branch). A failed scenario sends a notification of kind `failed` (`NOTIFY_IMMEDIATE`), and `forgehands_e2e_scenario_ok{scenario}` and the status page show the result. The scenarios' tickets must pass the ticket pre-flight. The test repository must be dedicated to this: see [docs/e2e.md](docs/e2e.md) for its setup, the CI step, the scenarios and their preconditions. Forgejo and Gitea only.
+After each deploy (`E2E_ON_START=1`) or on demand (`POST /e2e/run` with `Authorization: Bearer <STATUS_TOKEN>`; without `STATUS_TOKEN` the endpoint answers `403`), ForgeHands runs scenarios against a test repository: a ticket gets its run, the pull request is reviewed and merged, and a change that turns the default branch red is reverted, reopened and started again once. Each scenario cleans up after itself (tickets, pull requests, the queued runs of its tickets, branches, the default branch); the runs still going are waited for. A wait for a run counts from the start of the run, and a queued one has `E2E_QUEUE_MINUTES`. A failed scenario sends a notification of kind `failed` (`NOTIFY_IMMEDIATE`), and `forgehands_e2e_scenario_ok{scenario}` and the status page show the result. The scenarios' tickets must pass the ticket pre-flight. The test repository must be dedicated to this: see [docs/e2e.md](docs/e2e.md) for its setup, the CI step, the scenarios and their preconditions. Forgejo and Gitea only.
 
 ## Dry run
 
