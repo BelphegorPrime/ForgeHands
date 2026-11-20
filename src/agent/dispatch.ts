@@ -762,6 +762,25 @@ export class Dispatcher {
     return true;
   }
 
+  // The runs of an issue ("repo#n") that wait or are queued are dropped: the end-to-end suite closes its tickets this way, and a closed ticket's
+  // queued run would otherwise start later. A running run is left alone (it cannot be stopped from here). Dry runs change nothing.
+  // Returns how many were dropped.
+  async dropQueuedOf(repository: string, number: number): Promise<number> {
+    if (isDry(this.config, repository)) return 0;
+    const ticket = repository.toLowerCase() + '#' + number;
+    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued') && job.key.toLowerCase().split(':')[0] === ticket);
+    if (!jobs.length) return 0;
+    const now = this.now();
+    for (const job of jobs) {
+      Object.assign(job, { status: 'deleted', finished: now, result: 'dropped: the ticket was closed before the run started' });
+      delete job.waiting_for; delete job.waiting_for_files;
+    }
+    this.jobs.markClosed(ticket);
+    this.logger.error(ticket + ': closed while its runs were queued, ' + jobs.length + ' queued run(s) dropped');
+    await this.jobs.persist(now);
+    return jobs.length;
+  }
+
   // The same for a ticket of the ledger ("repo#n" or "repo!pr<n>"), as the ledger sync names it.
   async dropDeletedTicket(ticket: string): Promise<boolean> {
     const match = /^(.+?)([#!])(?:pr)?(\d+)$/.exec(ticket);

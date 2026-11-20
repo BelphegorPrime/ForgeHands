@@ -41,9 +41,10 @@ export const SCENARIOS: Scenario[] = [
       { do: 'wait', as: 'revert', timeoutMinutes: 45, for: { findPull: 'ai/revert-$pr', state: 'merged' } },
       { do: 'wait', timeoutMinutes: 10, for: { issue: '$ticket', state: 'open' } },
       { do: 'wait', timeoutMinutes: 5, for: { issue: '$ticket', comment: { contains: 'was reverted by #$revert', min: 1, max: 1 } } },
-      { do: 'wait', timeoutMinutes: 15, for: { runs: '$ticket', label: 'ai:ready', atLeast: 2 } },
+      // The restart runs under ai:escalate (the route of the revert's hand-over), not ai:ready: the runs count across the issue routes.
+      { do: 'wait', timeoutMinutes: 15, for: { runs: '$ticket', atLeast: 2 } },
       { do: 'settle', seconds: 180 },
-      { do: 'assert', that: { runs: '$ticket', label: 'ai:ready', exactly: 2 }, message: 'the ticket was started again more than once' },
+      { do: 'assert', that: { runs: '$ticket', exactly: 2 }, message: 'the ticket was started again more than once' },
       { do: 'assert', that: { issue: '$ticket', comment: { contains: 'was reverted by #$revert', min: 1, max: 1 } }, message: 'the cause was not commented exactly once' },
       { do: 'wait', timeoutMinutes: 20, for: { branch: 'default', status: 'success' } },
     ],

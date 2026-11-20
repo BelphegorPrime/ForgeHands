@@ -12,7 +12,9 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { parseScenario, type Scenario } from '../src/e2e/format.ts';
 import { E2eController } from '../src/e2e/controller.ts';
-import { cleanup, runScenario, runSuite, restoreBranch } from '../src/e2e/runner.ts';
+import { cleanup, runClockOf, runScenario, runSuite, restoreBranch } from '../src/e2e/runner.ts';
+import { ledgerOf } from '../src/e2e/controller.ts';
+import { runTicketOf } from '../src/e2e/predicates.ts';
 import { ForgejoForge } from '../src/forge/forgejo/index.ts';
 import { SCENARIO_NAMES, SCENARIOS, selectScenarios } from '../src/e2e/scenarios.ts';
 import { PREFLIGHT_REJECTION, ticketViolations } from '../src/agent/preflight.ts';
@@ -76,7 +78,8 @@ class FakeForge {
   }
   openPull(head, title, issue) {
     const number = this.nextNumber();
-    const pr = { number, title, body: 'Closes #' + issue, state: 'open', merged: false, merged_at: null, merge_commit_sha: null,
+    // pull_request is set as Forgejo sets it: its issue endpoint answers for pull requests too.
+    const pr = { number, title, body: 'Closes #' + issue, state: 'open', merged: false, merged_at: null, merge_commit_sha: null, pull_request: {},
       head: { ref: head, sha: this.branches.get(head) }, labels: [], comments: [], updated_at: new Date().toISOString() };
     this.pulls.set(number, pr);
     return pr;
@@ -188,7 +191,26 @@ function forgeHands(text = 'delivered', file = 'e2e/delivery.txt') {
 }
 
 // No real sleeping: the fake answers at once, so a poll or a settle only has to yield.
-const runOptions = (forge, extra = {}) => ({ repository: 'owner/hello', forge, ledger: { runsOf: () => 0 }, timeoutMs: 5000, pollMs: 1, sleep: async () => {}, ...extra });
+// The ledger of a test: the runs of the tickets, as the port reports them. `onSync` runs before every read (a test plays ForgeHands there).
+class FakeLedger {
+  constructor() { this.jobs = []; this.dropped = []; this.onSync = () => {}; }
+  runsOf(_, issue, label) {
+    return this.runsStateOf(null, issue).filter((run) => (label === undefined || run.label === label) && (run.started !== undefined || ['running', 'done', 'failed'].includes(run.status))).length;
+  }
+  runsStateOf(_, issue) {
+    this.onSync(this);
+    return this.jobs.filter((job) => job.issue === issue).map((job) => ({ label: job.label, status: job.status, created: job.created,
+      ...(job.started === undefined ? {} : { started: job.started }), ...(job.finished === undefined ? {} : { finished: job.finished }), ahead: 0 }));
+  }
+  async dropQueued(_, issue) {
+    let dropped = 0;
+    for (const job of this.jobs) if (job.issue === issue && (job.status === 'queued' || job.status === 'waiting')) { job.status = 'deleted'; dropped += 1; }
+    this.dropped.push(issue);
+    return dropped;
+  }
+}
+
+const runOptions = (forge, extra = {}) => ({ repository: 'owner/hello', forge, ledger: new FakeLedger(), timeoutMs: 5000, pollMs: 1, sleep: async () => {}, ...extra });
 const scenario = (steps, extra = {}) => parseScenario({ name: 'probe', title: 'Probe', description: 'test', experimental: false, precondition: null, steps, ...extra });
 const ticketStep = { do: 'ticket', as: 'ticket', title: 'T', body: 'B', label: 'ai:ready' };
 
@@ -320,7 +342,9 @@ test('E2E_* values are validated: a repository outside ALLOWED_REPOS, an unknown
   assert.throws(() => loadConfig(withE2e({ E2E_ON_START: 'yes' }), quiet), /E2E_ON_START must be 0 or 1/);
   assert.throws(() => loadConfig(withE2e({ E2E_TIMEOUT_MINUTES: '0' }), quiet), /E2E_TIMEOUT_MINUTES must be an integer/);
   const config = loadConfig(withE2e({ E2E_ON_START: '1', E2E_SCENARIOS: 'conflict-round', E2E_TIMEOUT_MINUTES: '45' }), quiet);
-  assert.deepEqual(config.e2e, { repository: 'owner/hello', onStart: true, scenarios: ['conflict-round'], timeoutMinutes: 45 });
+  assert.deepEqual(config.e2e, { repository: 'owner/hello', onStart: true, scenarios: ['conflict-round'], timeoutMinutes: 45, queueMinutes: 60 });
+  assert.equal(loadConfig(withE2e({ E2E_QUEUE_MINUTES: '30' }), quiet).e2e.queueMinutes, 30);
+  assert.throws(() => loadConfig(withE2e({ E2E_QUEUE_MINUTES: '0' }), quiet), /E2E_QUEUE_MINUTES must be an integer/);
 });
 
 test('every ticket of every built-in scenario passes the real ticket pre-flight, the experimental ones too', async () => {
@@ -657,4 +681,211 @@ test('the endpoint /e2e/run needs the STATUS_TOKEN bearer token: 404 without E2E
     for (const server of servers) server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+const MIN = 60000;
+
+test('a run that waits 40 minutes in the queue gets its 20 minutes of run time from its start: the pull request it opens at minute 50 is found', async () => {
+  const forge = new FakeForge();
+  const clock = { t: 0 };
+  const ledger = new FakeLedger();
+  // The dispatcher: the ticket's run is queued at once, starts at minute 40, and opens its pull request 10 minutes into the run.
+  ledger.onSync = () => {
+    for (const issue of forge.issues.values()) {
+      if (issue.state !== 'open' || !issue.labels.some((label) => label.name === 'ai:ready')) continue;
+      let job = ledger.jobs.find((entry) => entry.issue === issue.number);
+      if (!job) { job = { issue: issue.number, label: 'ai:ready', status: 'queued', created: clock.t }; ledger.jobs.push(job); }
+      if (job.status === 'queued' && clock.t >= 40 * MIN) { job.status = 'running'; job.started = clock.t; }
+      if (job.status === 'running' && clock.t >= job.started + 10 * MIN) {
+        const head = 'ai/issue-' + issue.number;
+        forge.commitOn(head, 'main', { 'e2e/delivery.txt': 'delivered' });
+        job.pr = forge.openPull(head, 'WIP', issue.number).number;
+        job.status = 'done';
+        job.finished = clock.t;
+      }
+    }
+  };
+  const result = await runScenario(scenario([
+    ticketStep,
+    { do: 'wait', as: 'pr', for: { findPull: 'ai/issue-$ticket' } },
+  ]), runOptions(forge, { ledger, now: () => clock.t, sleep: async (ms) => { clock.t += ms; }, pollMs: MIN, timeoutMs: 10 * 60 * MIN }));
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.cleanup, 'ok', result.cleanup_reason);
+  assert.ok(clock.t >= 50 * MIN && clock.t < 60 * MIN, 'the pull request was found at minute 50, not at the 20 minutes after the ticket: ' + clock.t / MIN);
+});
+
+test('a run that is still queued after the queue allowance fails with queued_too_long, not with a timeout', async () => {
+  const forge = new FakeForge();
+  const clock = { t: 0 };
+  const ledger = new FakeLedger();
+  ledger.onSync = () => {
+    for (const issue of forge.issues.values()) {
+      if (issue.state === 'open' && !ledger.jobs.some((job) => job.issue === issue.number)) ledger.jobs.push({ issue: issue.number, label: 'ai:ready', status: 'queued', created: clock.t });
+    }
+  };
+  const result = await runScenario(scenario([
+    ticketStep,
+    { do: 'wait', for: { findPull: 'ai/issue-$ticket' } },
+  ]), runOptions(forge, { ledger, now: () => clock.t, sleep: async (ms) => { clock.t += ms; }, pollMs: MIN, queueMs: 60 * MIN, timeoutMs: 10 * 60 * MIN }));
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /^step 2 \(wait for findPull\): queued_too_long: 0 runs ahead, the run waited more than 60 minutes in the queue; last seen: no pull request/);
+  assert.equal(clock.t, 60 * MIN, 'the wait ends when the allowance is used up');
+  assert.equal(result.cleanup, 'ok', result.cleanup_reason);
+  assert.deepEqual(ledger.dropped, [[...forge.issues.keys()][0]], 'the cleanup dropped the queued run of the ticket');
+});
+
+test('runClockOf: a running run counts its time from its start, a queued one its allowance from the queue, and no run the allowance after the last thing', () => {
+  const run = (status, extra = {}) => ({ label: 'ai:ready', status, created: 0, ahead: 0, ...extra });
+  assert.deepEqual(runClockOf([run('running', { started: 40 * MIN })], 0, 20 * MIN, 60 * MIN), { limit: 60 * MIN, state: 'running', ahead: 0 });
+  assert.deepEqual(runClockOf([run('queued', { created: 5 * MIN, ahead: 3 })], 0, 20 * MIN, 60 * MIN), { limit: 65 * MIN, state: 'queued', ahead: 3 });
+  assert.deepEqual(runClockOf([run('waiting', { created: 5 * MIN })], 0, 20 * MIN, 60 * MIN).state, 'queued', 'a run waiting for dependencies is queued too');
+  assert.deepEqual(runClockOf([], 2 * MIN, 20 * MIN, 60 * MIN), { limit: 62 * MIN, state: 'idle', ahead: 0 }, 'no run: the allowance counts from the ticket');
+  assert.deepEqual(runClockOf([run('done', { created: 0, started: 1 * MIN, finished: 30 * MIN })], 0, 20 * MIN, 60 * MIN), { limit: 90 * MIN, state: 'idle', ahead: 0 });
+});
+
+test('the runs of a ticket count across the issue routes; a queued run that never started is not a run; the port reads the queue', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'e2e-ledger-'));
+  try {
+    const jobs = new JobStore(join(dir, 'jobs.json'));
+    jobs.add({ key: 'owner/hello#7:ai:ready', label: 'ai:ready', event: {}, status: 'done', created: 1, started: 2, finished: 3 });
+    jobs.add({ key: 'owner/hello#7:ai:escalate', label: 'ai:escalate', event: {}, status: 'running', created: 4, started: 5 });
+    jobs.add({ key: 'owner/hello#7:ai:ready', label: 'ai:ready', event: {}, status: 'queued', created: 6 });
+    jobs.add({ key: 'owner/hello#8:ai:ready', label: 'ai:ready', event: {}, status: 'running', created: 7, started: 8 });
+    jobs.add({ key: 'owner/hello#7:ai:review', label: 'ai:review', event: {}, status: 'done', created: 9, started: 9 });
+    const routes = new Map([['ai:ready', { kind: 'issue' }], ['ai:escalate', { kind: 'issue' }], ['ai:review', { kind: 'pull_request' }]]);
+    const ledger = ledgerOf(jobs, routes, async () => 0);
+    assert.equal(ledger.runsOf('Owner/Hello', 7), 2, 'the first run and the escalated one; the review is not an issue run, the queued one not started');
+    assert.equal(ledger.runsOf('owner/hello', 7, 'ai:ready'), 1);
+    assert.equal(ledger.runsOf('owner/hello', 7, 'ai:escalate'), 1);
+    assert.equal(ledger.runsOf('owner/hello', 8), 1, 'another ticket has its own runs');
+    const state = ledger.runsStateOf('owner/hello', 7);
+    assert.deepEqual(state.map((run) => run.status), ['done', 'running', 'queued']);
+    assert.equal(state[2].ahead, 2, 'the two running runs (of this ticket and of #8) go before the queued one');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the dispatcher drops the queued runs of a closed ticket and leaves its running run alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'e2e-drop-'));
+  try {
+    const config = loadConfig(withE2e(), quiet);
+    const jobs = new JobStore(join(dir, 'jobs.json'));
+    const event = { repository: { full_name: 'owner/hello' }, issue: { number: 5 } };
+    jobs.add({ key: 'owner/hello#5:ai:ready', label: 'ai:ready', event, status: 'queued', created: 1 });
+    jobs.add({ key: 'owner/hello#5:ai:escalate', label: 'ai:escalate', event, status: 'running', created: 2, started: 2 });
+    jobs.add({ key: 'owner/hello#6:ai:ready', label: 'ai:ready', event: { repository: { full_name: 'owner/hello' }, issue: { number: 6 } }, status: 'queued', created: 3 });
+    const dispatcher = new Dispatcher(config, jobs, async () => { throw new Error('no network'); }, quiet, () => 1000);
+    assert.equal(await dispatcher.dropQueuedOf('owner/hello', 5), 1);
+    assert.equal(jobs.list().find((job) => job.key === 'owner/hello#5:ai:ready').status, 'deleted');
+    assert.equal(jobs.list().find((job) => job.key === 'owner/hello#5:ai:escalate').status, 'running', 'a running run is left alone');
+    assert.equal(jobs.list().find((job) => job.key === 'owner/hello#6:ai:ready').status, 'queued', 'another ticket is left alone');
+    assert.equal(await dispatcher.dropQueuedOf('owner/hello', 5), 0, 'nothing is left to drop');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the pull request of a stale compare is not a difference: the restore looks once more after a settle before it fails', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/red.marker': 'red' });
+  // The compare answers a difference that is gone once after the restore wrote the file back (a cache that is still behind).
+  const compare = forge.compare.bind(forge);
+  let stale = true;
+  forge.compare = (repository, from, to) => {
+    const answer = compare(repository, from, to);
+    if (stale && answer.files.length === 0 && to !== from) { stale = false; return { files: [{ filename: 'e2e/red.marker' }] }; }
+    return answer;
+  };
+  let slept = 0;
+  const result = await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/red.marker']), attempts: 1,
+    sleep: async () => { slept += 1; }, waitMs: 0, settleMs: 3000 });
+  assert.deepEqual(result.untouched, []);
+  assert.equal(slept, 1, 'one settle before the verdict');
+  assert.equal(stale, false, 'the stale answer was given');
+  assert.equal(forge.readFile(null, 'e2e/red.marker', 'main'), null);
+});
+
+test('restore reads each path at the commit the branch has, not at the branch name', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  forge.commitOn('main', 'main', { 'e2e/delivery.txt': 'delivered' });
+  const refs = [];
+  const readFile = forge.readFile.bind(forge);
+  forge.readFile = (repository, path, ref) => { refs.push(ref); return readFile(repository, path, ref); };
+  await restoreBranch(forge, 'owner/hello', 'main', baseline, { touched: new Set(['e2e/delivery.txt']), sleep: async () => {} });
+  assert.equal(refs.includes('main'), false, 'no read by the branch name');
+  assert.equal(refs.some((ref) => /^c\d+$/.test(ref)), true, 'reads by commit id');
+  assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main'), null);
+});
+
+test('cleanup waits for a run of its ticket that still goes, and drops the queued ones first', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const ticket = forge.createIssue('owner/hello', 'E2E normal delivery', 'B');
+  const ledger = new FakeLedger();
+  // The run is going for three looks, then it has ended (it delivered nothing: the cleanup has nothing to restore).
+  ledger.jobs.push({ issue: ticket.number, label: 'ai:ready', status: 'running', created: 0, started: 0 });
+  ledger.jobs.push({ issue: ticket.number, label: 'ai:escalate', status: 'queued', created: 1 });
+  let looks = 0;
+  ledger.onSync = () => {
+    looks += 1;
+    if (looks === 2) ledger.jobs[0].status = 'done';
+  };
+  let slept = 0;
+  const outcome = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline },
+    { sleep: async () => { slept += 1; }, ledger, pollMs: 1000, leftoverMs: 60000 });
+  assert.deepEqual(ledger.dropped, [ticket.number], 'the queued run was dropped');
+  assert.equal(outcome.problem, null, outcome.problem);
+  assert.ok(slept >= 1 && slept <= 3, 'it waited for the running one, not for the full bound: ' + slept);
+});
+
+test('cleanup reports a run of its ticket that is still going after the bound, and does not wait for ever', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const ticket = forge.createIssue('owner/hello', 'E2E normal delivery', 'B');
+  const ledger = new FakeLedger();
+  ledger.jobs.push({ issue: ticket.number, label: 'ai:ready', status: 'running', created: 0, started: 0 });
+  let slept = 0;
+  const outcome = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline },
+    { sleep: async () => { slept += 1; }, ledger, pollMs: 1000, leftoverMs: 5000 });
+  assert.equal(slept, 5);
+  assert.match(outcome.problem, /runs of the tickets still going after 5 s: #\d+ running/);
+});
+
+test('cleanup takes the pull requests and the stale paths of its own run only: a delivery of an earlier ticket with a higher number is left alone', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const earlier = forge.createIssue('owner/hello', 'E2E normal delivery, earlier', 'B');
+  const ticket = forge.createIssue('owner/hello', 'E2E revert on red', 'B');
+  // The earlier ticket's pull request is opened after the run's ticket, so its number is higher: it is not the run's. Its branch changes a file
+  // the cleanup cannot read; a stray of the same kind is on main (it came from elsewhere).
+  forge.commitOn('ai/issue-' + earlier.number, 'main', { 'e2e/delivery.txt': 'delivered', 'e2e/link': '@@link' });
+  const laterPull = forge.openPull('ai/issue-' + earlier.number, 'earlier', earlier.number);
+  forge.commitOn('main', 'main', { 'e2e/link': '@@link' });
+  linkEntries(forge);
+  const outcome = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline }, { sleep: async () => {} });
+  assert.equal(outcome.problem, null, 'the stray of the earlier delivery is not the run\'s concern');
+  assert.match(outcome.note, /e2e\/link/);
+  assert.equal(laterPull.state, 'open', 'the pull request of the earlier ticket is not closed by this run\'s cleanup');
+  assert.equal(earlier.state, 'open', 'its ticket is not closed either');
+});
+
+test('runTicketOf: a runs count names its ticket, an ai/issue branch names it, an ai/revert branch names the ticket of the pull request it reverts', async () => {
+  const forge = new FakeForge();
+  const pr = forge.openPull('ai/issue-7', 'x', 7);
+  const probeOf = (vars = new Map([['pr', pr.number]])) => ({ forge, repository: 'owner/hello', defaultBranch: 'main', ledger: new FakeLedger(), vars });
+  assert.equal(await runTicketOf({ runs: '$pr', atLeast: 1 }, probeOf()), pr.number);
+  assert.equal(await runTicketOf({ findPull: 'ai/issue-42' }, probeOf()), 42);
+  assert.equal(await runTicketOf({ findPull: 'ai/revert-' + pr.number }, probeOf()), 7);
+  assert.equal(await runTicketOf({ issue: '3', state: 'open' }, probeOf()), null);
+});
+
+test('the revert scenario counts its runs across the issue routes, not under one label', () => {
+  const revert = SCENARIOS.find((entry) => entry.name === 'revert-on-red');
+  const predicates = revert.steps.filter((step) => step.do === 'wait' || step.do === 'assert').map((step) => step.for ?? step.that);
+  const runs = predicates.filter((predicate) => 'runs' in predicate);
+  assert.equal(runs.length, 2, 'the restart wait and the exact-count assert');
+  for (const predicate of runs) assert.equal('label' in predicate, false, 'no label: ' + JSON.stringify(predicate));
 });

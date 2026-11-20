@@ -122,8 +122,26 @@ export async function probe(predicate: Predicate, p: Probe): Promise<Verdict> {
   }
   const number = numberOf(predicate.runs, p.vars);
   const runs = p.ledger.runsOf(p.repository, number, predicate.label);
+  const where = '#' + number + (predicate.label ? ' ' + predicate.label : ' (all issue routes)');
   const problems: string[] = [];
   if (predicate.exactly !== undefined && runs !== predicate.exactly) problems.push('runs ' + runs + ', wanted exactly ' + predicate.exactly);
   if (predicate.atLeast !== undefined && runs < predicate.atLeast) problems.push('runs ' + runs + ', wanted at least ' + predicate.atLeast);
-  return problems.length ? { ok: false, detail: '#' + number + ' ' + predicate.label + ': ' + problems.join('; ') } : { ok: true, detail: '#' + number + ' ' + predicate.label + ': ' + runs + ' runs' };
+  return problems.length ? { ok: false, detail: where + ': ' + problems.join('; ') } : { ok: true, detail: where + ': ' + runs + ' runs' };
+}
+
+/**
+ * The issue whose runs a run-dependent predicate waits for, or null when it is not one: `runs` names it, a findPull of `ai/issue-<n>` is
+ * the run of that issue, and a findPull of `ai/revert-<n>` is the run of the ticket that pull request came from (read from the forge).
+ */
+export async function runTicketOf(predicate: Predicate, p: Probe): Promise<number | null> {
+  if ('runs' in predicate) return numberOf(predicate.runs, p.vars);
+  if (!('findPull' in predicate)) return null;
+  const head = expand(predicate.findPull, p.vars);
+  const issue = /^ai\/issue-(\d+)$/.exec(head);
+  if (issue) return Number(issue[1]);
+  const revert = /^ai\/revert-(\d+)$/.exec(head);
+  if (!revert) return null;
+  const pr = await p.forge.getPull(p.repository, Number(revert[1]));
+  const origin = /^ai\/issue-(\d+)$/.exec(branchOf(pr));
+  return origin ? Number(origin[1]) : null;
 }

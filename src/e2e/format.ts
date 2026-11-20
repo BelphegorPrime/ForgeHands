@@ -25,8 +25,11 @@ export type Predicate =
   | { mergeCommit: string; status: string }
   /** The combined commit status of the tip of a branch; `default` is the default branch of the repository. */
   | { branch: string; status: string }
-  /** How many runs ForgeHands started for this issue with this label (the ledger, not the forge). */
-  | { runs: string; label: string; atLeast?: number; exactly?: number };
+  /**
+   * How many runs ForgeHands started for this issue (the ledger, not the forge): under every issue route, or only under `label` when it is
+   * given. A ticket that is escalated or sent to a fallback route keeps counting, so leave `label` out unless the route is the point.
+   */
+  | { runs: string; label?: string; atLeast?: number; exactly?: number };
 
 export type Step =
   /** Creates an issue with a body, puts the label on it (a route of LABEL_ROUTES starts a run) and remembers its number as `as`. */
@@ -50,7 +53,7 @@ export interface Scenario {
   steps: Step[];
 }
 
-/** The default timeout of a wait for a pull request (findPull), when the step names none. */
+/** The default timeout of a wait for a pull request (findPull), when the step names none. It counts from the start of the run (see runner.ts). */
 export const DEFAULT_FIND_PULL_MINUTES = 20;
 const NAME = /^[a-z0-9][a-z0-9-]{0,60}$/;
 const VARIABLE = /^[a-z][a-zA-Z0-9]{0,40}$/;
@@ -100,11 +103,11 @@ function checkPredicate(where: string, value: unknown, known: Set<string>): Pred
     case 'mergeCommit': return { mergeCommit: checkText(where, p.mergeCommit, known, 'mergeCommit'), status: checkText(where, p.status, known, 'status') };
     case 'branch': return { branch: checkText(where, p.branch, known, 'branch'), status: checkText(where, p.status, known, 'status') };
     default: {
-      if (p.label === undefined) fail(where, 'runs needs a label');
       const atLeast = p.atLeast === undefined ? undefined : Number(p.atLeast);
       const exactly = p.exactly === undefined ? undefined : Number(p.exactly);
       if (atLeast === undefined && exactly === undefined) fail(where, 'runs needs atLeast or exactly');
-      return { runs: checkText(where, p.runs, known, 'runs'), label: label(p.label), ...(atLeast === undefined ? {} : { atLeast }), ...(exactly === undefined ? {} : { exactly }) };
+      return { runs: checkText(where, p.runs, known, 'runs'), ...(p.label === undefined ? {} : { label: label(p.label) }),
+        ...(atLeast === undefined ? {} : { atLeast }), ...(exactly === undefined ? {} : { exactly }) };
     }
   }
 }
@@ -150,7 +153,8 @@ export function parseScenario(value: unknown): Scenario {
         const as = capture();
         if (as && !('findPull' in for_)) fail(at, 'only a findPull wait captures a number (as)');
         if (as) known.add(as);
-        // A pull request that does not appear within 20 minutes is a failed run, not a reason to wait for the rest of the scenario's time.
+        // A pull request that does not appear within 20 minutes of the start of its run is a failed run, not a reason to wait for the rest of the
+        // scenario's time.
         const minutes = timeout() ?? ('findPull' in for_ ? DEFAULT_FIND_PULL_MINUTES : undefined);
         return { do: 'wait', for: for_, ...(as ? { as } : {}), ...(minutes === undefined ? {} : { timeoutMinutes: minutes }) };
       }

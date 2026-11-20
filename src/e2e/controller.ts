@@ -4,11 +4,11 @@
 import { isDry } from '../dry.ts';
 import type { Notify } from '../notify/index.ts';
 import type { JobStore } from '../store/jobs.ts';
-import type { DirectConfig, E2eRecord, Logger } from '../types.ts';
+import type { DirectConfig, E2eRecord, JobStatus, Logger } from '../types.ts';
 import type { Forge } from '../types/forge.ts';
 import type { Scenario } from './format.ts';
 import { selectScenarios } from './scenarios.ts';
-import { e2eForgeOf, type E2eForge, type LedgerPort } from './port.ts';
+import { e2eForgeOf, type E2eForge, type LedgerPort, type TicketRun } from './port.ts';
 import { runSuite, type ScenarioResult } from './runner.ts';
 
 export interface E2eDeps {
@@ -20,6 +20,8 @@ export interface E2eDeps {
   version: string;
   logger: Logger;
   now?: () => number;
+  /** Drops the queued runs of an issue (ForgeHands' dispatcher; see Dispatcher.dropQueuedOf). Without it a closed ticket's queued run starts later. */
+  dropQueued?: (repository: string, issue: number) => Promise<number>;
   /** Replaces the scenarios of E2E_SCENARIOS (tests). */
   scenarios?: Scenario[];
   /** How often a wait looks again (default 30 s). */
@@ -40,13 +42,36 @@ export interface E2eState {
 /** Why a run did not start: the suite is off, this repository is in a dry run, the forge cannot run it (GitLab), or a run is going. */
 export type StartResult = { status: 'started'; done: Promise<void>; scenarios: string[] } | { status: 'off' | 'dry_run' | 'unsupported' | 'busy' };
 
-// The runs ForgeHands started for an issue with a label, read from the ledger (every run it ever started, kept 30 days).
-function ledgerOf(jobs: JobStore): LedgerPort {
+// The runs of an issue, read from the ledger (every run it ever started, kept 30 days) and the queue. A run counts under an issue route (a
+// route of kind `issue`: the worker label, its escalation, the fallbacks), or under one label when a predicate names it. A run that was only
+// queued and never started is not a run.
+export function ledgerOf(jobs: JobStore, routes: Map<string, { kind?: string }>, dropQueued: (repository: string, issue: number) => Promise<number>): LedgerPort {
+  const isIssueRoute = (label: string): boolean => routes.get(label)?.kind === 'issue';
+  const ticketJobs = (repository: string, issue: number) => {
+    const prefix = repository.toLowerCase() + '#' + issue + ':';
+    return jobs.list().filter((job) => job.key.toLowerCase().startsWith(prefix));
+  };
+  const started = (status: JobStatus, startedAt?: number): boolean => Boolean(startedAt) || status === 'running' || status === 'done' || status === 'failed';
   return {
     runsOf(repository, issue, label) {
-      const prefix = repository.toLowerCase() + '#' + issue + ':';
-      return jobs.list().filter((job) => job.key.toLowerCase().startsWith(prefix) && job.label === label).length;
+      return ticketJobs(repository, issue)
+        .filter((job) => (label === undefined ? isIssueRoute(job.label) : job.label === label) && started(job.status, job.started)).length;
     },
+    runsStateOf(repository, issue) {
+      const active = jobs.list(true);
+      return ticketJobs(repository, issue).filter((job) => isIssueRoute(job.label)).map((job): TicketRun => ({
+        label: job.label,
+        status: job.status,
+        created: job.created,
+        ...(job.started === undefined ? {} : { started: job.started }),
+        ...(job.finished === undefined ? {} : { finished: job.finished }),
+        // The runs that go first: the running ones, and the queued ones created before this one.
+        ahead: job.status === 'queued' || job.status === 'waiting'
+          ? active.filter((other) => other !== job && (other.status === 'running' || (other.status === 'queued' && other.created < job.created))).length
+          : 0,
+      }));
+    },
+    dropQueued: (repository, issue) => dropQueued(repository, issue),
   };
 }
 
@@ -77,7 +102,7 @@ export class E2eController {
     const scenarios = this.scenarios();
     this.busy = { trigger, since: this.now() };
     // `done` never rejects: a run that breaks is logged, and the next start is not blocked by it.
-    const done = this.execute(trigger, e2eForge, scenarios, ledgerOf(jobs), repository)
+    const done = this.execute(trigger, e2eForge, scenarios, ledgerOf(jobs, config.routes, (repo, issue) => this.dropQueued(repo, issue)), repository)
       .catch((caught) => this.deps.logger.error('e2e: the run broke:', (caught as Error)?.message))
       .finally(() => { this.busy = null; });
     return { status: 'started', done, scenarios: scenarios.map((scenario) => scenario.name) };
@@ -105,7 +130,7 @@ export class E2eController {
     let error: string | null = null;
     try {
       results = await runSuite(scenarios, { repository, forge, ledger, timeoutMs: config.e2e.timeoutMinutes * 60000, pollMs: this.deps.pollMs ?? 30000,
-        now: this.deps.now, sleep: this.deps.sleep });
+        queueMs: config.e2e.queueMinutes * 60000, now: this.deps.now, sleep: this.deps.sleep });
     } catch (caught) {
       error = String((caught as Error)?.message || caught).slice(0, 600);
       logger.error('e2e: the suite could not run:', error);
@@ -142,6 +167,11 @@ export class E2eController {
   }
 
   private now(): number { return this.deps.now ? this.deps.now() : Date.now(); }
+
+  // Drops the queued runs of an issue of the test repository; without the dispatcher there is nothing queued to drop.
+  private async dropQueued(repository: string, issue: number): Promise<number> {
+    return this.deps.dropQueued ? this.deps.dropQueued(repository, issue) : 0;
+  }
 
   /**
    * The gauges of the last run, per scenario: forgehands_e2e_scenario_ok (1 when its steps held; a failed cleanup does not change it) and

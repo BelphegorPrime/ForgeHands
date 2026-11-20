@@ -1,13 +1,13 @@
 // Runs scenarios against a test repository through the forge client. A scenario has a deadline (E2E_TIMEOUT_MINUTES); its cleanup runs
-// whatever happened: the pull requests and the issues above its first ticket are closed (sub-issues included), the branches of its tickets
-// and reverts are deleted,
-// and the default branch is put back to the tree it had when the scenario started. The cleanup only touches what the run created: pull
-// requests and branches with numbers from the first ticket of the run on, which nothing else in the test repository should use.
+// whatever happened: the pull requests and the issues above its first ticket are closed (sub-issues included), the queued runs of its tickets
+// are dropped and the running ones waited for, the branches of its tickets and reverts are deleted, and the default branch is put back to the
+// tree it had when the scenario started. The cleanup only touches what the run created: run branches (ai/issue-<n>, ai/revert-<n>) with numbers
+// from the first ticket of the run on. A wait for a run counts its time from the start of the run; queueing has its own allowance.
 // A ticket that the pre-flight rejects ends the scenario at once (preflight_rejected): no worker starts on it, so no pull request comes.
 import { PREFLIGHT_REJECTION } from '../agent/preflight.ts';
 import type { Predicate, Scenario, Step } from './format.ts';
-import { probe, type Probe, type Verdict } from './predicates.ts';
-import type { E2eForge, LedgerPort } from './port.ts';
+import { branchOf, probe, runTicketOf, type Probe, type Verdict } from './predicates.ts';
+import type { E2eForge, LedgerPort, TicketRun } from './port.ts';
 
 export interface RunOptions {
   repository: string;
@@ -17,6 +17,10 @@ export interface RunOptions {
   timeoutMs: number;
   /** How often a wait looks again. */
   pollMs: number;
+  /** A run of a ticket may wait queued this long before a wait for it fails (default 60 minutes). Queueing is not counted in a run's time. */
+  queueMs?: number;
+  /** How long the cleanup waits for the runs of its tickets that are still going (default 30 minutes). */
+  leftoverMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -42,6 +46,12 @@ class StepFailed extends Error {}
 
 const pause = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 const PREDICATE_KINDS = ['issue', 'pull', 'findPull', 'mergeCommit', 'branch', 'runs'] as const;
+const MINUTE = 60000;
+/** How long a run of the suite's ticket may wait queued before its wait fails (E2E_QUEUE_MINUTES sets it in production). */
+const DEFAULT_QUEUE_MS = 60 * MINUTE;
+/** How long the cleanup waits for the runs of its tickets that are still going (a run that was started and cannot be stopped). */
+const DEFAULT_LEFTOVER_MS = 30 * MINUTE;
+const ACTIVE_RUN = new Set(['waiting', 'queued', 'running']);
 
 export interface RestoreOptions {
   /**
@@ -53,6 +63,11 @@ export interface RestoreOptions {
   attempts?: number;
   /** The wait between two passes. */
   waitMs?: number;
+  /**
+   * The wait before the last look at a branch that still differs. The forge answers the compare and the contents of a commit that was just
+   * written a little later than the write: a difference that is only there in that window is not a difference (default 3 seconds).
+   */
+  settleMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -75,10 +90,11 @@ function listOf(paths: string[]): string {
 }
 
 // Makes the file at `path` of `branch` equal to its content at `sha`: a commit writes it back, or deletes it when it did not exist then.
+// `tip` is the commit the branch has now: the file is read at that commit, not at the branch name (a name can be answered from a cache).
 // Returns 1 when a commit was made, 0 when the file already is as it should be. A file the contents API cannot read throws.
-async function restorePath(forge: E2eForge, repository: string, branch: string, sha: string, path: string): Promise<number> {
+async function restorePath(forge: E2eForge, repository: string, branch: string, tip: string, sha: string, path: string): Promise<number> {
   const before = await forge.readFile(repository, path, sha);
-  const now = await forge.readFile(repository, path, branch);
+  const now = await forge.readFile(repository, path, tip);
   if (!before && !now) return 0;
   // Base64 of the same bytes is the same text, so this compares the bytes; the line breaks of the encoding do not count.
   if (before && now && before.content.replace(/\s+/g, '') === now.content.replace(/\s+/g, '')) return 0;
@@ -97,28 +113,71 @@ export async function restoreBranch(forge: E2eForge, repository: string, branch:
   const attempts = Math.max(1, options.attempts ?? 3);
   const sleep = options.sleep ?? pause;
   const waitMs = options.waitMs ?? 2000;
+  const settleMs = options.settleMs ?? 3000;
+  // The differences between `sha` and the tip the branch has now, read by the commit's id each time.
+  const tipOf = async (): Promise<string> => {
+    const tip = await forge.branchTip(repository, branch);
+    if (!tip) throw new Error('branch ' + branch + ' does not exist');
+    return tip;
+  };
+  const leftAt = async (): Promise<string[]> => {
+    const tip = await tipOf();
+    return tip === sha ? [] : pathsOf(await forge.compare(repository, sha, tip));
+  };
   let changed = 0;
   let left: string[] = [];
   for (let pass = 1; ; pass++) {
-    const tip = await forge.branchTip(repository, branch);
-    if (!tip) throw new Error('branch ' + branch + ' does not exist');
+    const tip = await tipOf();
     if (tip !== sha) {
       for (const path of pathsOf(await forge.compare(repository, sha, tip))) {
         // A path the API refuses now is looked at again by the next pass; the last pass reports it as left.
-        try { changed += await restorePath(forge, repository, branch, sha, path); }
+        try { changed += await restorePath(forge, repository, branch, tip, sha, path); }
         catch { /* see above */ }
       }
     }
-    const after = await forge.branchTip(repository, branch);
-    if (!after) throw new Error('branch ' + branch + ' does not exist');
-    left = after === sha ? [] : pathsOf(await forge.compare(repository, sha, after));
-    if (!left.length || pass >= attempts) break;
+    left = await leftAt();
+    if (!left.length) break;
+    if (pass >= attempts) {
+      // The last look is not taken at once: a difference that is still there after a settle is one, one that is gone was a stale answer.
+      await sleep(settleMs);
+      left = await leftAt();
+      break;
+    }
     await sleep(waitMs);
   }
   const touched = options.touched;
   const mine = left.filter((path) => !touched || touched.has(path));
   if (mine.length) throw new Error(branch + ' still differs from ' + sha.slice(0, 8) + ' in ' + mine.length + ' file(s) of the run: ' + listOf(mine));
   return { changed, untouched: left };
+}
+
+/** Where the clock of a run-dependent wait stands: the run is going, a run waits in the queue, or no run is active (the wait's own clock). */
+export interface RunClock {
+  /** The time the wait gives up at, as things stand. */
+  limit: number;
+  state: 'running' | 'queued' | 'idle';
+  /** For a queued run: the runs that go before it. */
+  ahead: number;
+}
+
+/**
+ * The clock of a wait for a run (`findPull` of a ticket's branch, `runs`). A run that is going gets `runMs` from its start: queueing does not
+ * count against it. A run that waits in the queue gets `queueMs` from the moment it was queued, and that allowance is separate from the run
+ * time. With no run active the wait gets `queueMs` after the last thing that happened to the ticket (`since` when it had no run at all).
+ */
+export function runClockOf(runs: TicketRun[], since: number, runMs: number, queueMs: number): RunClock {
+  const running = runs.filter((run) => run.status === 'running');
+  if (running.length) {
+    const latest = Math.max(...running.map((run) => run.started ?? run.created));
+    return { limit: latest + runMs, state: 'running', ahead: 0 };
+  }
+  const queued = runs.filter((run) => run.status === 'queued' || run.status === 'waiting');
+  if (queued.length) {
+    const first = queued.reduce((a, b) => (b.created < a.created ? b : a));
+    return { limit: first.created + queueMs, state: 'queued', ahead: first.ahead };
+  }
+  const last = Math.max(since, ...runs.map((run) => run.finished ?? run.created));
+  return { limit: last + queueMs, state: 'idle', ahead: 0 };
 }
 
 // The kind of check a predicate makes, for the report ("wait runs", "assert pull").
@@ -141,6 +200,9 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
   let reason: string | null = null;
 
   const probeOf = (): Probe => ({ forge, repository, defaultBranch, ledger: options.ledger, vars });
+  // When each ticket of this run was created: a run-dependent wait with no run yet counts its queue allowance from there.
+  const createdAt = new Map<number, number>();
+  const queueMs = options.queueMs ?? DEFAULT_QUEUE_MS;
 
   // The reason a ticket of this run was rejected by the pre-flight, or null. A read that fails is no rejection: the wait goes on.
   const rejectedTicket = async (): Promise<string | null> => {
@@ -156,8 +218,13 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
   };
 
   // A read that fails counts as "not yet" in a wait, so that one flaky answer does not end the scenario.
+  // A wait for a run (a findPull of a ticket's branch, a runs count) does not run on the step's clock from its start: its limit comes from the
+  // ticket's runs in the ledger (runClockOf). A run that is queued past queueMs fails with queued_too_long, not with a timeout.
   const waitFor = async (step: Extract<Step, { do: 'wait' }>): Promise<void> => {
-    const limit = step.timeoutMinutes === undefined ? deadline : Math.min(deadline, now() + step.timeoutMinutes * 60000);
+    const waitStart = now();
+    const fixedLimit = step.timeoutMinutes === undefined ? deadline : Math.min(deadline, waitStart + step.timeoutMinutes * 60000);
+    const runMs = step.timeoutMinutes === undefined ? deadline - waitStart : step.timeoutMinutes * 60000;
+    const runDependent = 'runs' in step.for || 'findPull' in step.for;
     let verdict: Verdict = { ok: false, detail: 'not checked yet' };
     for (;;) {
       const rejected = await rejectedTicket();
@@ -168,7 +235,22 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
         if (step.as) vars.set(step.as, verdict.captured as number);
         return;
       }
-      if (now() >= limit) throw new StepFailed('timed out; last seen: ' + verdict.detail);
+      let limit = fixedLimit;
+      let clock: RunClock | null = null;
+      if (runDependent) {
+        const ticket = await runTicketOf(step.for, probeOf()).catch(() => null);
+        if (ticket !== null) {
+          clock = runClockOf(options.ledger.runsStateOf(repository, ticket), createdAt.get(ticket) ?? waitStart, runMs, queueMs);
+          limit = Math.min(deadline, clock.limit);
+        }
+      }
+      if (now() >= limit) {
+        if (clock?.state === 'queued') {
+          throw new StepFailed('queued_too_long: ' + clock.ahead + ' runs ahead, the run waited more than ' + Math.round(queueMs / MINUTE)
+            + ' minutes in the queue; last seen: ' + verdict.detail);
+        }
+        throw new StepFailed('timed out; last seen: ' + verdict.detail);
+      }
       await sleep(Math.max(1, Math.min(options.pollMs, limit - now())));
     }
   };
@@ -179,6 +261,7 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
       // The ticket is remembered before its label is set, so that the cleanup closes it even when the label call fails.
       const issue = await forge.createIssue(repository, step.title, step.body);
       tickets.push(issue.number);
+      createdAt.set(issue.number, now());
       vars.set(step.as, issue.number);
       const label = await forge.findOrCreateLabel(repository, step.label, '#0e8a16');
       await forge.addLabels(repository, issue.number, [label], 'issue');
@@ -212,7 +295,8 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
     reason = where + ': ' + String(error?.message || error).slice(0, 600);
   }
 
-  const outcome = await cleanup(repository, forge, { tickets, defaultBranch, baseline }, { sleep })
+  const outcome = await cleanup(repository, forge, { tickets, defaultBranch, baseline },
+    { sleep, ledger: options.ledger, pollMs: options.pollMs, leftoverMs: options.leftoverMs })
     .catch((error): CleanupOutcome => ({ problem: String(error?.message || error).slice(0, 600), note: null }));
   return {
     scenario: scenario.name,
@@ -244,14 +328,15 @@ const isRunBranch = (name: string, first: number): boolean => {
 };
 
 /**
- * The paths the run changed: the files that its pull requests and its branches (numbers from `first` on) change against the start commit.
- * Null when they cannot be read; the restore then treats every difference as the run's.
+ * The paths the run changed: the files that its pull requests and its branches change against the start commit. "Its" means a run branch
+ * (ai/issue-<n> or ai/revert-<n>) with a number from `first` on: a delivery of an earlier scenario's ticket that lands during this run is not
+ * this run's, however high its pull request number is. Null when they cannot be read; the restore then treats every difference as the run's.
  */
 async function pathsOfRun(forge: E2eForge, repository: string, baseline: string, first: number): Promise<Set<string> | null> {
   try {
     const heads = new Set<string>();
     for (const pr of await forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' })) {
-      if (pr.number > first && pr.head?.sha) heads.add(pr.head.sha);
+      if (isRunBranch(branchOf(pr), first) && pr.head?.sha) heads.add(pr.head.sha);
     }
     for (const branch of await forge.listBranches(repository)) {
       if (isRunBranch(branch.name, first) && branch.sha) heads.add(branch.sha);
@@ -269,7 +354,17 @@ async function pathsOfRun(forge: E2eForge, repository: string, baseline: string,
  * runs), then branches, then the default branch. Each action is tried on its own; the outcome lists what failed (problem: null when all of
  * it held) and what was left on purpose (note).
  */
-export async function cleanup(repository: string, forge: E2eForge, created: Created, pacing: { sleep?: (ms: number) => Promise<void> } = {}): Promise<CleanupOutcome> {
+export interface CleanupPacing {
+  sleep?: (ms: number) => Promise<void>;
+  /** The ledger: its queued runs of the tickets are dropped, and the cleanup waits for the runs that still go. Without it neither happens. */
+  ledger?: LedgerPort;
+  /** How often the cleanup looks at the runs that still go (default 30 s). */
+  pollMs?: number;
+  /** How long it waits for them (default 30 minutes). */
+  leftoverMs?: number;
+}
+
+export async function cleanup(repository: string, forge: E2eForge, created: Created, pacing: CleanupPacing = {}): Promise<CleanupOutcome> {
   const problems: string[] = [];
   const attempt = async (what: string, action: () => Promise<unknown>): Promise<void> => {
     try { await action(); }
@@ -285,23 +380,52 @@ export async function cleanup(repository: string, forge: E2eForge, created: Crea
     const first = Math.min(...created.tickets);
     await attempt('list pull requests', async () => {
       const pulls = await forge.listPulls(repository, { state: 'open', limit: 50, sort: 'recentupdate' });
-      for (const pr of pulls.filter((entry) => entry.number > first)) await attempt('close pull request #' + pr.number, () => forge.closePull(repository, pr.number));
+      for (const pr of pulls.filter((entry) => isRunBranch(branchOf(entry), first))) await attempt('close pull request #' + pr.number, () => forge.closePull(repository, pr.number));
     });
     for (const number of created.tickets) await attempt('close ticket #' + number, () => forge.closeIssue(repository, number));
+    // A closed ticket's run that is only queued would start later and deliver onto the branch of the next scenario: it is dropped here.
+    // A run that is already going cannot be stopped; the cleanup waits for it below.
+    if (pacing.ledger) {
+      const ledger = pacing.ledger;
+      for (const number of created.tickets) await attempt('drop the queued runs of #' + number, () => ledger.dropQueued(repository, number));
+    }
     // A ticket the planner split (or a run that opened another ticket) has its issues above the first ticket, and the pull request of a
     // sub-issue can merge without closing it: those are closed too. Issues and pull requests share one number space, so the walk goes up
     // from the first ticket and ends after three numbers in a row that do not exist.
     await attempt('close the issues above the first ticket', async () => {
       let missing = 0;
       for (let number = first; missing < 3; number++) {
-        let issue: { state: string } | null = null;
+        let issue: { state: string; pull_request?: unknown } | null = null;
         try { issue = await forge.getIssue(repository, number); }
         catch (error) { if (!/HTTP 404\b/.test(String(error?.message))) throw error; }
         if (!issue) { missing++; continue; }
         missing = 0;
-        if (issue.state === 'open') await attempt('close issue #' + number, () => forge.closeIssue(repository, number));
+        // The issue endpoint answers for pull requests too: a pull request is not a sub-issue (the pull requests of the run are closed above).
+        if (issue.state === 'open' && !issue.pull_request) await attempt('close issue #' + number, () => forge.closeIssue(repository, number));
       }
     });
+    if (pacing.ledger) {
+      const ledger = pacing.ledger;
+      const pollMs = pacing.pollMs ?? 30000;
+      const polls = Math.ceil((pacing.leftoverMs ?? DEFAULT_LEFTOVER_MS) / pollMs);
+      const nap = pacing.sleep ?? pause;
+      for (let poll = 0; ; poll++) {
+        let active: string[];
+        try {
+          active = created.tickets.flatMap((number) => ledger.runsStateOf(repository, number)
+            .filter((run) => ACTIVE_RUN.has(run.status)).map((run) => '#' + number + ' ' + run.status));
+        } catch (error) {
+          problems.push('read the runs of the tickets: ' + String(error?.message || error).slice(0, 200));
+          break;
+        }
+        if (!active.length) break;
+        if (poll >= polls) {
+          problems.push('runs of the tickets still going after ' + Math.round((pacing.leftoverMs ?? DEFAULT_LEFTOVER_MS) / 1000) + ' s: ' + listOf(active));
+          break;
+        }
+        await nap(pollMs);
+      }
+    }
     await attempt('list branches', async () => {
       for (const branch of await forge.listBranches(repository)) {
         if (isRunBranch(branch.name, first)) await attempt('delete branch ' + branch.name, () => forge.deleteBranch(repository, branch.name));

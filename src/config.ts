@@ -500,13 +500,15 @@ function parseE2e(env: NodeJS.ProcessEnv, allowed: Set<string>, forgeReady: bool
   }
   // Minutes for one scenario (cleanup not included): a worker run takes long, so the default is generous.
   const timeoutMinutes = positiveInt(env.E2E_TIMEOUT_MINUTES, 90, 'E2E_TIMEOUT_MINUTES', 1440) as number;
+  // Minutes a ticket of the suite may wait queued (other runs first) before its run is counted as never started: queueing is not a run.
+  const queueMinutes = positiveInt(env.E2E_QUEUE_MINUTES, 60, 'E2E_QUEUE_MINUTES', 1440) as number;
   if (onStart && !repository) throw new Error('E2E_ON_START=1 needs E2E_REPO, the test repository the suite runs against');
   if (repository) {
     if (!REPO.test(repository)) throw new Error('E2E_REPO must be owner/repository, got ' + repository);
     if (!allowed.has(repository)) throw new Error('E2E_REPO ' + repository + ' is not in ALLOWED_REPOS');
     if (!forgeReady) throw new Error('E2E_REPO needs FORGE_URL and FORGE_TOKEN (or FORGEJO_URL and FORGEJO_TOKEN) to drive the test repository');
   }
-  return { repository, onStart, scenarios: names.length ? names : null, timeoutMinutes };
+  return { repository, onStart, scenarios: names.length ? names : null, timeoutMinutes, queueMinutes };
 }
 
 // A 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.
