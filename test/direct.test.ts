@@ -1219,7 +1219,9 @@ const goodRoutes = (over = {}) => ({
 async function mergerFor(routes, extra, later) {
   const config = loadConfig(env(withMerge({ APPROVAL_GRACE_SECONDS: '0', ...extra })));
   const forgejo = fakeForgejo(routes);
-  return { config, forgejo, merger: new Merger(config, forgejo.send, quiet, later) };
+  const merger = new Merger(config, forgejo.send, quiet, later);
+  merger.sleep = async () => {};
+  return { config, forgejo, merger };
 }
 const approvedEvent = () => ({ repository: { full_name: repo }, pull_request: { number: 34, head_ref: 'ai/issue-26' }, issue: { number: 26 } });
 
@@ -1289,6 +1291,53 @@ test('merge: a WIP title makes Forgejo report not mergeable; the title is cleane
   const { merger, forgejo } = await mergerFor(routes);
   assert.equal(await merger.handle(approvedEvent()), 'merged');
   assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /pulls/34/merge', 'POST /issues/34/comments', 'PATCH /issues/26']);
+});
+
+// Forgejo works `mergeable` out again after the title change: the flag may still say false on the first read after it. `turnsTrueAt` is the read
+// (counted from the title change, 1 = the first) from which Forgejo says true; Infinity: it never does.
+function wipThenClean(turnsTrueAt) {
+  let cleaned = false;
+  let reads = 0;
+  const pr = () => {
+    if (!cleaned) return { state: 'open', merged: false, mergeable: true, title: 'WIP: Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] };
+    reads++;
+    return { state: 'open', merged: false, mergeable: reads >= turnsTrueAt, title: 'Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] };
+  };
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34']: pr, ['PATCH ' + API + '/pulls/34']: () => { cleaned = true; return {}; } });
+  return { routes, reads: () => reads };
+}
+
+test('merge: a stale false mergeable after the WIP marker is gone is read again, and a true on the second re-read merges', async () => {
+  const { routes, reads } = wipThenClean(3);
+  const { merger, forgejo } = await mergerFor(routes);
+  const waits = [];
+  merger.sleep = async (ms) => { waits.push(ms); };
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+  assert.deepEqual(waits, [2000, 2000], 'two waits of two seconds: the read after the title change and the first re-read said false');
+  assert.equal(reads(), 3, 'the read after the title change, then two re-reads');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /pulls/34/merge', 'POST /issues/34/comments', 'PATCH /issues/26']);
+});
+
+test('merge: a mergeable false that stays false after four re-reads is a conflict: refused as not_mergeable, one comment', async () => {
+  const { routes, reads } = wipThenClean(Infinity);
+  const { merger, forgejo } = await mergerFor(routes);
+  const waits = [];
+  merger.sleep = async (ms) => { waits.push(ms); };
+  assert.equal(await merger.handle(approvedEvent()), 'not_mergeable');
+  assert.deepEqual(waits, [2000, 2000, 2000, 2000], 'four re-reads, two seconds apart');
+  assert.equal(reads(), 5, 'the read after the title change and the four re-reads');
+  assert.deepEqual(forgejo.wrote(), ['PATCH /pulls/34', 'POST /issues/34/comments']);
+  assert.match(forgejo.calls.find((call) => call.method === 'POST' && call.path.endsWith('/issues/34/comments')).body.body, /does not merge cleanly/);
+});
+
+test('merge: a clean title with a false mergeable is not re-read at all (no WIP marker, no wait)', async () => {
+  const routes = goodRoutes({ ['GET ' + API + '/pulls/34']: { state: 'open', merged: false, mergeable: false, title: 'Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }] } });
+  const { merger, forgejo } = await mergerFor(routes);
+  const waits = [];
+  merger.sleep = async (ms) => { waits.push(ms); };
+  assert.equal(await merger.handle(approvedEvent()), 'not_mergeable');
+  assert.deepEqual(waits, []);
+  assert.equal(forgejo.calls.filter((call) => call.method === 'GET' && call.path === API + '/pulls/34').length, 1);
 });
 
 test('merge: a real conflict after the title is clean is reported, and a blocked pull request keeps its WIP title', async () => {

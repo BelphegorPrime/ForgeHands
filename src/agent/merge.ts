@@ -18,6 +18,9 @@ const MAX_FILES = 1000;
 // A held two-key merge is looked at again this often (the timer in the dispatch tick), so that a lifted HOLD_LABEL or a new commit is noticed.
 const HOLD_RECHECK_MS = 5 * 60000;
 const DAY_MS = 24 * 60 * 60000;
+// After the WIP marker is removed Forgejo works out `mergeable` again, a moment later: a false that is read right after is read again this often.
+const MERGEABLE_REREADS = 4;
+const MERGEABLE_WAIT_MS = 2000;
 
 // The ledger key of a pull request's hold: "repo#pr<n>" (lower case), the same form as the ledger keys of bot pull requests.
 export const holdKey = (repository: string, number: number): string => repository.toLowerCase() + '#pr' + number;
@@ -47,6 +50,8 @@ export class Merger {
   // The ledger (the dispatcher sets it): holds of two-key merges are kept there, so that a restart neither loses nor shortens one.
   ledger: JobStore | null = null;
   now: () => number = Date.now;
+  // The wait between re-reads of `mergeable` (see readMergeable). A test replaces it.
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   constructor(config: DirectConfig, send: Fetch = fetch, logger: Logger = console,
     later: (run: () => void, ms: number) => void = (run, ms) => { setTimeout(run, ms).unref(); }, dry: DryLog = new DryLog(logger)) {
@@ -159,7 +164,7 @@ export class Merger {
       let current = pr;
       if (this.forge.isWip(pr.title || '')) {
         await this.forge.setPullTitle(repository, number, this.forge.stripWip(pr.title));
-        current = await this.forge.getPull(repository, number);
+        current = await this.readMergeable(repository, number);
       }
       let twoKeys = false;
       if (protectedFiles.length) {
@@ -209,6 +214,17 @@ export class Merger {
       this.tell('failed', repository, number, { why: 'merge_failed' });
       return metrics.refused('merge_failed');
     }
+  }
+
+  // The pull request as Forgejo has it once the WIP marker is gone. Forgejo recomputes `mergeable` asynchronously, so a false read right after the
+  // title change may be stale: it is read again up to MERGEABLE_REREADS times, MERGEABLE_WAIT_MS apart. Only a false that stays is a conflict.
+  async readMergeable(repository: string, number: number): Promise<Json> {
+    let pull = await this.forge.getPull(repository, number);
+    for (let read = 0; read < MERGEABLE_REREADS && pull?.mergeable === false; read++) {
+      await this.sleep(MERGEABLE_WAIT_MS);
+      pull = await this.forge.getPull(repository, number);
+    }
+    return pull;
   }
 
   // What ForgeHands merged goes to the ledger: the merge commit, read from the pull request after the merge (Forgejo's merge call does not return

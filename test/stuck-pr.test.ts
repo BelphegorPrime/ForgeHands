@@ -479,3 +479,41 @@ test('a conflict on a pull request whose verdict is OK is stuck too: the merger 
   await t.dispatcher.sweep.run();
   assert.equal(t.jobs.stuck.get(repo + '#pr34').why, 'stuck_conflict');
 });
+
+test('a WIP-titled pull request that Forgejo reports as not mergeable with a NOT OK verdict is stuck_verdict, not a conflict', async () => {
+  const t = await build();
+  // Forgejo says mergeable false for the WIP title alone; the branch itself does not conflict (PR #85 and #89 of openapi-generator).
+  world.pulls = [agentPull(NEW, ['ai:changes'], { title: 'WIP: feat: add TypeScript target', draft: true, mergeable: false })];
+  world.comments[34] = [verdict(NOT_OK, clock - 2 * HOUR)];
+  reviewed(t.jobs, NEW);
+  addJob(t.jobs, { label: 'ai:changes', index: 1 });
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(names(34).includes('ai:blocked'));
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').why, 'stuck_verdict');
+  assert.match(comments()[0], /the latest review of commit .* says NOT OK/);
+  assert.doesNotMatch(comments()[0], /conflicts with|not mergeable/, 'the comment does not claim a conflict');
+  assert.match(metrics.render(), /forgehands_stuck_pr_blocks_total\{reason="stuck_verdict"\} [1-9]/);
+});
+
+test('a WIP-titled pull request with mergeable false and no verdict is left alone: the WIP marker is no conflict', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, [], { title: 'WIP: Fix it', draft: true, mergeable: false })];
+  reviewed(t.jobs, NEW);
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.ok(!names(34).includes('ai:blocked'));
+  assert.equal(t.jobs.stuck.size, 0);
+});
+
+test('a clean-titled pull request with mergeable false and no verdict is still a stuck_conflict', async () => {
+  const t = await build();
+  world.pulls = [agentPull(NEW, [], { title: 'Fix it', mergeable: false })];
+  reviewed(t.jobs, NEW);
+  await t.dispatcher.sweep.run();
+  clock += 95 * MINUTE;
+  await t.dispatcher.sweep.run();
+  assert.equal(t.jobs.stuck.get(repo + '#pr34').why, 'stuck_conflict');
+});
