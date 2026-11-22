@@ -69,6 +69,31 @@ export function listedIssues(issues: Issue[]): Issue[] {
   return issues.filter((issue) => !isDeletedInForge(issue));
 }
 
+// One row of the operator card: the ticket's number and title, its link, its repository and how long it has been open.
+export interface OperatorRow {
+  key: string;
+  repository: string;
+  number: number;
+  title: string;
+  href: string | null;
+  age: string;
+}
+
+// The operator tickets (status.factory.operator_tickets) as card rows, in the order the server gives (oldest first).
+export function operatorRows(tickets: { issue: string; issue_url: string | null; title: string; since: string }[], generated: string): OperatorRow[] {
+  return tickets.map((ticket) => {
+    const match = /^(.*)#(\d+)$/.exec(ticket.issue);
+    return {
+      key: ticket.issue,
+      repository: match ? (match[1] as string) : ticket.issue,
+      number: match ? Number(match[2]) : 0,
+      title: ticket.title,
+      href: ticket.issue_url,
+      age: ageText(ticket.since, generated),
+    };
+  });
+}
+
 // A piece of a text: plain, or a '#n' reference with the forge address of that issue (the server gives the addresses, see forge-links.ts).
 export interface TextPart {
   text: string;

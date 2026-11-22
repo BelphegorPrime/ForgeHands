@@ -6,6 +6,7 @@ import {
   isDeletedInForge,
   linkParts,
   listedIssues,
+  operatorRows,
   percent,
   reasonLabel,
   revertAlert,
@@ -105,4 +106,16 @@ test("a state line links its '#n' numbers that have a forge address and keeps th
     { text: "#5a and " },
     { text: "#123", href: "y" },
   ]);
+});
+
+test("the operator card rows give number, title, link, repository and age; an empty list gives no rows", () => {
+  const rows = operatorRows(
+    [{ issue: "owner/hello#7", issue_url: "https://forge.example/owner/hello/issues/7", title: "Set up the backup", since: "2026-06-30T09:00:00.000Z" }, { issue: "owner/other#3", issue_url: null, title: "", since: "2026-06-30T11:50:00.000Z" }],
+    GENERATED,
+  );
+  assert.deepEqual(rows, [
+    { key: "owner/hello#7", repository: "owner/hello", number: 7, title: "Set up the backup", href: "https://forge.example/owner/hello/issues/7", age: "for 3 h" },
+    { key: "owner/other#3", repository: "owner/other", number: 3, title: "", href: null, age: "for 10 min" },
+  ]);
+  assert.deepEqual(operatorRows([], GENERATED), []);
 });

@@ -385,16 +385,27 @@ function renderWorkspace(status: Status): string {
     + escape(disk) + (w.hold ? '. <strong>' + escape(w.hold) + ': no new run starts</strong>' : '') + '.</p>';
 }
 
+// A link to a forge item (same window and rel as the dashboard's), or the escaped text without an address.
+const linkTo = (url: string | null | undefined, text: string): string => url
+  ? '<a href="' + escape(url) + '" target="_blank" rel="noopener noreferrer">' + escape(text) + '</a>'
+  : escape(text);
+
+// Escaped text whose '#n' numbers become links when `links` has their address (keyed by the number, see forge-links.ts).
+const linkedText = (text: string, links: Record<string, string> = {}): string => text.split(/(#\d+\b)/).map((part) => {
+  const match = /^#(\d+)$/.exec(part);
+  return match && links[match[1] as string] ? linkTo(links[match[1] as string], part) : escape(part);
+}).join('');
+
 export function renderStatus(status: Status): string {
-  const line = (issue: Status['issues'][number]) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
-    + escape(issue.state) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
+  const line = (issue: Status['issues'][number]) => '<tr><td>' + linkTo(issue.issue_url, issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? linkTo(issue.pr_url, '#' + issue.pr) : '') + '</td><td>'
+    + linkedText(issue.state, issue.state_links) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
   const head = '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n';
   const closedIssues = status.issues.filter((issue) => issue.closed);
   const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';
   const rows = status.issues.filter((issue) => !issue.closed).map(line).join('\n');
   const hiddenNote = status.hidden ? '<p><a href="?all=1">' + status.hidden + ' older closed ticket(s) hidden: show all</a></p>' : '';
-  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + (entry.pr ? ' #' + entry.pr : '')
-    + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
+  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + (entry.pr ? ' ' + linkTo(entry.pr_url, '#' + entry.pr) : '')
+    + ' (' + linkTo(entry.issue_url, 'issue #' + entry.issue) + '): waiting for a human since ' + escape(entry.since) + ', ' + linkedText(entry.reason, entry.reason_links) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'

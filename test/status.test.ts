@@ -570,3 +570,53 @@ test("without a forge the status gives no addresses, and a state keeps its plain
   assert.equal(status.waiting_for_human[0].pr_url, null);
   assert.equal(status.waiting_for_human[0].issue_url, null);
 });
+
+test("the server-rendered status links every issue and pull request number, state strings included", () => {
+  const config = loadConfig(env({ FORGE_URL: "https://forge.example/", FORGE_TOKEN: "forge-token" }));
+  const jobs = new JobStore(join(dir, "html-links.json"));
+  jobs.add({
+    key: repo + "#7:ai:ready",
+    label: "ai:ready",
+    status: "waiting",
+    waiting_for: [54, 55],
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 7, title: "Ticket 7" } },
+  });
+  jobs.add({
+    key: repo + "#8:ai:ready",
+    label: "ai:ready",
+    status: "done",
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 8, title: "Ticket 8" }, pull_request: { number: 80 } },
+  });
+  const html = renderStatus(buildStatus(config, jobs, NOW, undefined, [{ repository: repo, issue: 7, pr: 70, since: NOW - HOUR, reason: "label" }]));
+  const link = (url, text) => '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + "</a>";
+  assert.ok(html.includes(link("https://forge.example/owner/hello/issues/7", "owner/hello#7")), "ticket link");
+  assert.ok(html.includes(link("https://forge.example/owner/hello/pulls/80", "#80")), "pull request link");
+  assert.ok(html.includes(link("https://forge.example/owner/hello/issues/54", "#54") + ", " + link("https://forge.example/owner/hello/issues/55", "#55")), "numbers in the state line");
+  assert.ok(html.includes(link("https://forge.example/owner/hello/pulls/70", "#70")), "waiting pull request link");
+  assert.ok(html.includes(link("https://forge.example/owner/hello/issues/7", "issue #7")), "waiting issue link");
+});
+
+test("the server-rendered status shows no links without a forge", () => {
+  const jobs = new JobStore(join(dir, "html-no-forge.json"));
+  jobs.add({
+    key: repo + "#7:ai:ready",
+    label: "ai:ready",
+    status: "waiting",
+    waiting_for: [54],
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 7, title: "Ticket 7" } },
+  });
+  const html = renderStatus(buildStatus(loadConfig(env()), jobs, NOW));
+  assert.doesNotMatch(html, /<a href="https?:/);
+  assert.match(html, /waiting for #54/);
+});
+
+test("the operator tickets reach status.json with their forge addresses", () => {
+  const config = loadConfig(env({ FORGE_URL: "https://forge.example/", FORGE_TOKEN: "forge-token" }));
+  const jobs = new JobStore(join(dir, "operator.json"));
+  jobs.operatorTickets.set(repo + "#7", { repository: repo, issue: 7, title: "Set up the Postgres backup", at: NOW - HOUR });
+  const list = buildStatus(config, jobs, NOW).factory.operator_tickets.list;
+  assert.deepEqual(list, [{ issue: repo + "#7", issue_url: "https://forge.example/owner/hello/issues/7", title: "Set up the Postgres backup", since: new Date(NOW - HOUR).toISOString() }]);
+});

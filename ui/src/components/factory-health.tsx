@@ -17,6 +17,7 @@ import { ForgeLink, LinkedText } from "./forge-link.tsx";
 import {
   ageText,
   countRows,
+  operatorRows,
   percent,
   reasonLabel,
   revertRows,
@@ -447,6 +448,49 @@ function CountList({
         <None text={empty} />
       )}
     </div>
+  );
+}
+
+// The operator prerequisites: tickets labelled for the operator, that wait for a person. Shown right under "Waiting for a human".
+export function OperatorCard({ status }: { status: DashboardStatus }) {
+  const { operator_tickets: operator } = status.factory;
+  const rows = operatorRows(operator.list, status.generated);
+  return (
+    <Card className="panel waiting-panel" id="waiting-operator">
+      <CardHeader className="panel-header">
+        <div>
+          <CardTitle>Waiting for you: operator prerequisites</CardTitle>
+          <p className="panel-subtitle">
+            {rows.length ? "Oldest first" : "Nothing waits for you"}
+          </p>
+        </div>
+        <span className="panel-icon warm">
+          <UserRound size={17} />
+        </span>
+      </CardHeader>
+      <CardContent className="health-body">
+        <p className="health-count">
+          <strong>{operator.count}</strong>
+          <span>open</span>
+        </p>
+        {rows.length ? (
+          <ul className="health-list waiting-list">
+            {rows.map((row) => (
+              <li key={row.key}>
+                <ForgeLink href={row.href}>
+                  #{row.number} {row.title || "Untitled ticket"}
+                </ForgeLink>{" "}
+                <span className="table-muted">
+                  {row.repository} · open {row.age}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <None text="None" />
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

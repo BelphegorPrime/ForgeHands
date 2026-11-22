@@ -34,6 +34,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs.tsx";
 import {
   FactoryHealth,
+  OperatorCard,
   WaitingForHuman,
 } from "./components/factory-health.tsx";
 import { LinkedText } from "./components/forge-link.tsx";
@@ -352,6 +353,7 @@ function App() {
           )}
 
           {status && <WaitingForHuman status={status} />}
+          {status && <OperatorCard status={status} />}
 
           <section className="metric-grid" aria-label="Summary metrics">
             <Metric
