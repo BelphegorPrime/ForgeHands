@@ -42,6 +42,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_failure_escalations_total: 'Runs that ended stuck, timed out or out of iterations (rounds), or finished twice without a delivery (issues), and started once more on the profile of their escalate_to route (FAILURE_ESCALATE).',
   forgehands_handbacks_total: 'Worker runs on an issue that handed the ticket back by a comment instead of a pull request (HANDBACK_HANDLING), by what ForgeHands did: retry (nothing pushed, run once more), escalate (blocker, run on escalate_to), planner (back to SPLIT_LABEL), blocked (a human, no planner).',
   forgehands_stuck_pr_blocks_total: 'Agent pull requests the stuck-PR watchdog blocked for a human, by reason (stuck_rounds, stuck_verdict; STUCK_PR_MINUTES).',
+  forgehands_stalled_ticket_actions_total: 'Open tickets the ticket watchdog found stalled (TICKET_STALL_MINUTES: the last run ended without a pull request or a comment), by action: restart (started once more, on escalate_to when the route has one) or human (called: the second stall, or a restart that did not start).',
   forgehands_epic_gaps_total: 'Epics the epic review found still open, by action: replanned (sent back to the planner, EPIC_GAP_REPLAN) or handed (the human was called).',
   forgehands_merges_reverted_total: 'Merges ForgeHands made whose revert pull request was merged, by repository (counted once per merge).',
   forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.',
@@ -59,6 +60,7 @@ const GAUGES: Record<string, string> = {
   forgehands_stuck_pull_requests: 'Agent pull requests blocked for a human (BLOCKED_LABEL) that tickets may wait behind, from the ledger at the scrape.',
   forgehands_e2e_scenario_ok: '1 when the steps of the scenario held in the last end-to-end run (E2E_REPO), 0 when a step failed; absent until a run.',
   forgehands_e2e_cleanup_ok: '1 when the cleanup of the scenario held in the last end-to-end run (E2E_REPO), 0 when it did not; absent until a run.',
+  forgehands_stalled_tickets: 'Open tickets the ticket watchdog called a human for (BLOCKED_LABEL, reason stalled_ticket) that tickets may wait behind, from the ledger at the scrape.',
   forgehands_merges_reverted_ratio: 'Share (0 to 1) of the merges ForgeHands made in the last 30 days whose revert was merged, by repository; absent without merges in the window.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
@@ -140,7 +142,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total', 'forgehands_comment_ignored_total', 'forgehands_preflight_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_stalled_ticket_actions_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total', 'forgehands_comment_ignored_total', 'forgehands_preflight_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
@@ -162,6 +164,7 @@ export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Ma
   }
   for (const reason of IDLE_REASONS) samples.push({ name: 'forgehands_idle_jobs', labels: { reason }, value: idle?.reasons[reason] ?? 0 });
   samples.push({ name: 'forgehands_stuck_pull_requests', labels: {}, value: [...jobs.stuck.values()].filter((record) => record.blocked).length });
+  samples.push({ name: 'forgehands_stalled_tickets', labels: {}, value: [...jobs.stalled.values()].filter((record) => record.human).length });
   for (const repo of [...config.allowedRepos].sort()) {
     const rate = revertRate(jobs.merges, repo, now).ratio;
     if (rate !== null) samples.push({ name: 'forgehands_merges_reverted_ratio', labels: { repository: repo }, value: rate });

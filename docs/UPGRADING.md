@@ -413,6 +413,18 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first approval on the new version, the log shows `merged (<sha7>)` for the head, or a `not merged` line that names the reason. An approved pull request without either for an hour is a bug to report.
 - **Rollback.** Go back to the previous version. Nothing in the ledger changes; the decisions live in memory only.
 
+# Upgrading to the next version: stalled tickets and parent comments
+
+**Behaviour change, one new switch.** Two kinds of ticket waited for ever in v0.9.17: a ticket whose run was "delivered as a comment on #<parent>" with no pull request (openapi-generator #99, homegraf #316, levelUp #86), and a ticket whose last run ended "done" after a comment with no pull request and no restart.
+
+- **A comment on the parent is a hand-back while the ticket is open.** It is no delivery any more: the parent comment goes through the same routing as a comment on the ticket (`HANDBACK_HANDLING`). "Done, nothing pushed" asks the route for the push once more, a blocker escalates to `escalate_to`, a second hand-back goes to the planner or the human. A closed ticket is still delivered. The log line is `<repo>#<n>: the run commented on #<parent> and left the ticket open, a hand-back` instead of `delivered as a comment`.
+- **The ticket watchdog (`TICKET_STALL_MINUTES`, default `180`, `0` = off).** In the review sweep, an open ticket whose last run ended without a delivery for that long is started once more; the second stall calls the human (`BLOCKED_LABEL`, `waiting_for_human` reason `stalled_ticket`, dependents show `waiting behind stalled #<n>`). Tickets with an open agent pull request, a run waiting, queued or running, or a blocked or hold label are left alone; epics and planner tickets too. It needs `REVIEW_SWEEP_MINUTES` on (the default) and a `ci_success` route, like the stuck-PR watchdog.
+- **Expect a burst, once.** On the first pass after the upgrade every open ticket that was already stalled (its last run ended more than `TICKET_STALL_MINUTES` ago without a delivery) is started once more, however long ago that was. Set `TICKET_STALL_MINUTES=0` before the upgrade if you want to look at the list first (`/status` shows the states).
+- **Metrics.** `forgehands_stalled_ticket_actions_total{action="restart"|"human"}` (counter) and `forgehands_stalled_tickets` (gauge, the tickets the human was called for). `forgehands_blocks_total` has the new reason `stalled_ticket`.
+- **Ledger.** A new key `stalled` (one record per ticket). Older versions ignore it.
+- **What to check.** After the first pass, the tickets of `/status` that read `waiting for ...` after a `done` run should be restarted or listed under "Waiting for a human" within `TICKET_STALL_MINUTES`.
+- **Rollback.** Set `TICKET_STALL_MINUTES=0` to stop the watchdog. The parent-comment change has no switch: going back to the previous version restores "delivered as a comment" (the tickets that waited for it wait again).
+
 # Upgrading to the next version: a deleted issue leaves the status page
 
 **Behaviour change, no switch.** Issues deleted in the forge used to stay on the status page as open for ever (`worker done, waiting for the next event`), and every pass of the sweep of closed tickets wrote `could not read #n of <repo>: ... HTTP 404`.
