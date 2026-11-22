@@ -447,3 +447,14 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** Put one test ticket with the label on a repository, check that no run starts and that the notification and the `/status.json` entry appear, then close it and check that the tickets that depend on it start.
 - **The ticket watchdog (`TICKET_STALL_MINUTES`) leaves such a ticket alone**: a ticket that waits for an open operator ticket is not stalled, and no restart is started for it.
 - **Rollback.** Go back to the previous version. It ignores `operator_tickets`; a ticket that waits for an operator ticket then waits for the forge's dependency, which the older version reads as before. Remove the label from the tickets, or close them, first if you want the old behaviour.
+
+# Upgrading to the next version: the ticket watchdog reads the tickets that are open
+
+**Behaviour change, no switch.** On v0.9.18 the ticket watchdog (`TICKET_STALL_MINUTES`) read at most 20 candidates per pass in the same ledger order. Old tickets that were closed in the forge used up those reads on every pass, so stalled open tickets of the same repository were never reached (homegraf #316, openapi-generator #99 and levelUp #86 waited for ever).
+
+- **Known closed tickets are not read.** A ticket whose jobs the ledger marks closed (the ledger sync, or a close event) or that is deleted in the forge costs no read.
+- **A read that finds a ticket closed is remembered.** Its jobs are marked closed in the ledger, so it is never read again. Such a read does not count against the 20 of the pass.
+- **A pass starts where the last one stopped.** The candidates are read oldest finished run first, and the start moves on by the number of candidates visited (kept in memory per repository). Every open candidate is reached within a bounded number of passes, however many there are. After a restart the cursor is in memory only: a restart of ForgeHands starts again at the oldest candidate.
+- **What to check.** After the first passes, the tickets of `/status` that read `waiting for ...` after a `done` run are restarted within `TICKET_STALL_MINUTES` per pass (`forgehands_stalled_ticket_actions_total{action="restart"}` counts them). The log line `ticket watchdog: could not read` should be rare.
+- **A reopened ticket is restarted only with a new run.** A ticket that was closed and reopened by hand, without a new run, keeps the closed mark in the ledger, so the watchdog does not read it. It is looked at again once a run of it exists.
+- **Rollback.** Go back to the previous version, or set `TICKET_STALL_MINUTES=0` to stop the watchdog. The closed marks already set stay in the ledger; the previous version reads the same flags on the status page.
