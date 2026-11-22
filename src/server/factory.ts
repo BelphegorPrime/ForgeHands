@@ -55,6 +55,8 @@ export interface Factory {
     list: { issue: string; action: 'replanned' | 'handed'; replans: number; reason: string; since: string }[];
   };
   deleted_in_forge: number;
+  // Tickets labelled OPERATOR_LABEL that wait for a person (see agent/operator.ts): open ones, with their titles, oldest first.
+  operator_tickets: { count: number; list: { issue: string; title: string; since: string }[] };
   revert_rate: { alert_percent: number | null };
 }
 
@@ -127,8 +129,18 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
     preflight: { results: byLabel('forgehands_preflight_total', 'result', RESULTS), rules, notes },
     epic_gaps: { count: gapList.length, actions: byLabel('forgehands_epic_gaps_total', 'action', ['replanned', 'handed']), list: gapList },
     deleted_in_forge: issues.filter((issue) => !issue.closed && issue.state === 'deleted in the forge').length,
+    operator_tickets: operatorTickets(jobs, closed),
     revert_rate: { alert_percent: config.revertRateAlert > 0 ? config.revertRateAlert : null }
   };
+}
+
+// The operator tickets ForgeHands has seen and that are not closed yet (the ledger drops one when it is closed), oldest first.
+function operatorTickets(jobs: JobStore, closed: Set<string>): Factory['operator_tickets'] {
+  const list = [...jobs.operatorTickets.values()]
+    .filter((record) => !closed.has(record.repository.toLowerCase() + '#' + record.issue))
+    .sort((a, b) => ascending(a.at, b.at))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, title: record.title, since: iso(record.at) }));
+  return { count: list.length, list };
 }
 
 // The open tickets whose last decision was a refusal, newest decision first.

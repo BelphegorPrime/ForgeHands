@@ -157,6 +157,13 @@ function diskFreeGbOf(value: string | undefined): number {
   return gb;
 }
 
+// OPERATOR_LABEL: a label name of at most 50 characters (Forgejo's limit) without a comma (the label lists of the prompts are comma separated).
+export function operatorLabelOf(value: string | undefined): string {
+  const name = value?.trim() || 'needs:operator';
+  if (name.length > 50 || name.includes(',')) throw new Error('OPERATOR_LABEL must be a label name of at most 50 characters without a comma');
+  return name;
+}
+
 // LEDGER_SYNC_HOURS (0 = off) and STATUS_HIDE_DAYS (0 = hide nothing): whole numbers with a default.
 function wholeOf(value: string | undefined, fallback: number, name: string, max: number): number {
   if (value === undefined || value === '') return fallback;
@@ -363,6 +370,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // To tell the pull request that the rounds are used up (needs both; otherwise ForgeHands only logs it).
     forgejo: forgeUrl && forgeToken ? { url: httpUrl(forgeUrl, env.FORGE_URL ? 'FORGE_URL' : 'FORGEJO_URL').toString().replace(/\/$/, ''), token: forgeToken } : null,
     blockedLabel: env.BLOCKED_LABEL || 'ai:blocked',
+    // OPERATOR_LABEL: the label of a ticket that only an operator can do (a token, a setting, access). No run starts on it (see operatorLabelOf).
+    operatorLabel: operatorLabelOf(env.OPERATOR_LABEL),
     // When the default branch moves, open agent pull requests that fell behind and have no review or approval yet are brought up to
     // date (Forgejo's update, rebase style); one that conflicts gets a conflict round (route "on": "conflict"). 0 switches it off.
     updateBranches: env.UPDATE_BRANCHES !== '0',

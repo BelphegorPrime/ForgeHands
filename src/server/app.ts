@@ -81,7 +81,7 @@ export function createApp(
       dispatcher!.jobs,
       Date.now(),
       dispatcher!.dry,
-      [...dispatcher!.reminder.waiting.values()],
+      [...dispatcher!.reminder.waiting.values(), ...dispatcher!.operatorWaiting()],
       dispatcher!.workspace.state(),
       { all, idle: dispatcher!.idleState(), decisions: dispatcher!.merger.decisions, preflight: dispatcher!.preflight },
     ),
@@ -259,7 +259,8 @@ export function createApp(
       event,
       body,
       config.allowedRepos,
-      routeLabels("issue"),
+      // The operator label is a trigger too, so that an operator ticket is seen (and told about) once; no run starts on it (agent/operator.ts).
+      [...routeLabels("issue"), ...(direct ? [config.operatorLabel] : [])],
       {
         labelEvents: config.mode === "direct",
         prLabels: direct ? routeLabels("pull_request") : [],

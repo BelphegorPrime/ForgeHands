@@ -49,7 +49,7 @@ export interface Status {
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them; epics the review found open wait too (pr: null).
-  waiting_for_human: { repository: string; issue: number; pr: number | null; since: string; reason: string }[];
+  waiting_for_human: { repository: string; issue: number; pr: number | null; since: string; reason: string; title?: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
   // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
@@ -225,8 +225,9 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
   return KIND_TEXT[last.kind] + ' done, waiting for the next event';
 }
 
-export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
+export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number | null; since: number; reason: string; title?: string }[] = [], workspace: WorkspaceState | null = null,
   options: { all?: boolean; idle?: IdleState | null; decisions?: Map<string, { reason: string; at: number }>; preflight?: TicketPreflight | null } = {}): Status {
+
   const byIssue = new Map<string, { key: string; title: string; issueUrl: string | null; prUrl: string | null; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -317,7 +318,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier], tokens: tokensWeek[repo]?.[tier] || emptyTokens() }])) }])),
     issues,
     hidden,
-    waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
+    waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason, ...(entry.title ? { title: entry.title } : {}) })),
       ...[...jobs.stalled.values()].filter((record) => record.human && !closed.has(record.repository.toLowerCase() + '#' + record.issue))
         .map((record) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'stalled_ticket' })),
       ...[...jobs.epicGaps.values()].filter((record: EpicGapRecord) => record.human && !closed.has(record.repository + '#' + record.issue))

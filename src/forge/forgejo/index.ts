@@ -63,7 +63,11 @@ export function forgejoAgentApi(repository: string): AgentApi {
     addLabelsMethod: 'POST',
     removeLabelMethod: 'DELETE',
     closeBody: '{"state":"closed"}',
-    closeMethod: 'PATCH'
+    closeMethod: 'PATCH',
+    issues: () => api + '/issues',
+    issueCreateBody: '{"title":"<title>","body":"<body>","labels":[<label id>]}',
+    dependencyAdd: (number) => api + '/issues/' + number + '/dependencies',
+    dependencyBody: '{"index":<the issue it depends on>,"owner":"' + repository.split('/')[0] + '","repo":"' + repository.split('/').slice(1).join('/') + '"}'
   };
 }
 

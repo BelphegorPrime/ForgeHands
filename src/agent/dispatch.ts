@@ -15,6 +15,8 @@ import { ReviewSweep, stallLine } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
 import { HandbackRouter, classifyHandback, handbackLine, handbackOf } from './handback.ts';
 import { EpicGaps } from './epic-gaps.ts';
+import { isOperatorTicket } from './operator.ts';
+import type { OperatorEntry } from './operator.ts';
 import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
@@ -25,6 +27,7 @@ import { isBotPull } from './bot.ts';
 import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RevertRecord } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
+import type { Issue } from '../types/forge.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
 import { behindBlocked, blockedTickets } from './stuck.ts';
 import { markReverted, revertRate } from './revert-rate.ts';
@@ -286,6 +289,8 @@ export class Dispatcher {
   // A green commit starts every review route (on: ci_success), once per commit each: a second reviewer is a second route. The event names
   // the first one; the others are the same event under their own label.
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
+    // An operator ticket starts no run, whatever route label it also carries (see agent/operator.ts).
+    if (isOperatorTicket(event, this.config)) return this.onOperatorTicket(event);
     if (event.type === 'ci.main_failure') return this.onMainFailure(event);
     if (event.type !== 'ci.success') {
       const result = await this.enqueueOne(event);
@@ -635,6 +640,59 @@ export class Dispatcher {
     return { status: 'queued' };
   }
 
+  // A ticket labelled OPERATOR_LABEL: no run, and the human is told once, when ForgeHands first sees it.
+  async onOperatorTicket(event: ForgeEvent): Promise<{ status: string }> {
+    const repository = event.repository.full_name;
+    if (this.noteOperator(repository, event.issue.number, event.issue.title ?? '')) {
+      await this.jobs.persist(this.now());
+      this.tellOperator(repository, event.issue.number, event.issue.title ?? '', event.issue.html_url ?? null);
+    }
+    return { status: 'operator_prerequisite' };
+  }
+
+  // Keeps an operator ticket in the ledger until it is closed. True when it was not known before (the human is told then).
+  noteOperator(repository: string, number: number, title: string): boolean {
+    const key = repository.toLowerCase() + '#' + number;
+    if (this.jobs.operatorTickets.has(key)) return false;
+    this.jobs.operatorTickets.set(key, { repository, issue: number, title: title.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, 300), at: this.now() });
+    this.logger.error(repository + '#' + number + ': an operator prerequisite (' + this.config.operatorLabel + '), no run starts on it, the human is told');
+    return true;
+  }
+
+  // One message to the human (kind handover, reason operator_prerequisite) about an operator ticket.
+  tellOperator(repository: string, number: number, title: string, link: string | null): void {
+    if (!this.notifier.wants('handover')) return;
+    this.notifier.notify(immediateMessage(this.config.notify.language, 'handover', { repository, number, title, link: link ?? undefined, why: 'operator_prerequisite' }), repository);
+  }
+
+  // The operator tickets for /status (waiting_for_human): the ones not closed yet, with their titles.
+  operatorWaiting(): OperatorEntry[] {
+    return [...this.jobs.operatorTickets.values()].map((record) => ({ repository: record.repository, issue: record.issue, pr: null, since: record.at,
+      reason: 'operator_prerequisite', title: record.title }));
+  }
+
+  // The open operator tickets an issue depends on. A failed read counts as none (the run is judged as it always was).
+  async operatorDependencies(repository: string, number: number): Promise<Issue[]> {
+    try {
+      const dependencies = await this.forge.dependencies(repository, number);
+      return (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open' && (issue.labels || []).some((label) => label.name === this.config.operatorLabel));
+    } catch (error) {
+      this.logger.error('could not read the dependencies of #' + number + ':', error.message);
+      return [];
+    }
+  }
+
+  // A worker made an operator ticket for what it needs and its ticket depends on it: the ticket waits for it (no hand-back, no retry). The run is
+  // not a failed delivery; when the operator ticket is closed, onClosed starts the waiting job again like any other dependent.
+  async waitForOperator(job: Job, prerequisites: Issue[]): Promise<void> {
+    const repository = job.event.repository.full_name;
+    for (const issue of prerequisites) {
+      if (this.noteOperator(repository, issue.number, issue.title ?? '')) this.tellOperator(repository, issue.number, issue.title ?? '', issue.html_url ?? null);
+    }
+    Object.assign(job, { status: 'waiting', waiting_for: prerequisites.map((issue) => issue.number), started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
+    await this.jobs.persist(this.now());
+  }
+
   // A review of the same commit by another reviewer route: it pushes nothing, so the reviewers of one commit run side by side.
   parallelReview(job: Job, event: ForgeEvent): boolean {
     return this.config.routes.get(job.label)?.kind === 'ci_success' && this.config.routes.get(event.label ?? '')?.kind === 'ci_success'
@@ -804,7 +862,9 @@ export class Dispatcher {
 
   // An issue closed: what depended on it may start now (a waiting job), and an epic whose last dependency this was is reviewed.
   async onClosed(event: ForgeEvent): Promise<string> {
-    await this.markClosed(event.repository.full_name.toLowerCase() + '#' + event.issue.number);
+    const ticket = event.repository.full_name.toLowerCase() + '#' + event.issue.number;
+    if (this.jobs.operatorTickets.delete(ticket)) await this.jobs.persist(this.now());
+    await this.markClosed(ticket);
     if (!this.config.forgejo) return 'no_forgejo_access';
     await this.releaseFileWaitsNow();
     let blocked: Json;
@@ -1374,6 +1434,9 @@ export class Dispatcher {
       const branch = 'ai/issue-' + event.issue.number;
       const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
       if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
+      // A need only the operator can meet, with an operator ticket this ticket depends on: the ticket waits, and that is no failed delivery.
+      const prerequisites = await this.operatorDependencies(repository, event.issue.number);
+      if (prerequisites.length) { await this.waitForOperator(job, prerequisites); return; }
       const comments = await this.forge.listComments(repository, event.issue.number, 50);
       // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
       const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);

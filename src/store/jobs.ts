@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { E2eRecord, EpicGapRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, MergeRecord, NewJob, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
+import type { E2eRecord, EpicGapRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, MergeRecord, NewJob, OperatorRecord, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -26,6 +26,8 @@ export class JobStore {
   epicGaps = new Map<string, EpicGapRecord>();
   /** Tickets the ticket watchdog found stalled ("repo#n"), see StalledRecord and review-sweep.ts. Kept until the ticket is closed, or the human took its label off. */
   stalled = new Map<string, StalledRecord>();
+  /** Tickets labelled OPERATOR_LABEL that ForgeHands has seen ("repo#n", lower case), kept until the ticket is closed (see OperatorRecord). */
+  operatorTickets = new Map<string, OperatorRecord>();
   /** What ForgeHands merged, kept 30 days (see Merger.recordMerge): the daily limit and REVERT_ON_RED read it. */
   merges: MergeRecord[] = [];
   /** Reverts of merges that turned the default branch red (REVERT_RETRIES), kept 30 days. */
@@ -71,6 +73,9 @@ export class JobStore {
       }
       for (const [key, value] of Object.entries((content?.epic_gaps || {}) as Record<string, EpicGapRecord>)) {
         if (value && typeof value.issue === 'number' && typeof value.replans === 'number') this.epicGaps.set(key, value);
+      }
+      for (const [key, value] of Object.entries((content?.operator_tickets || {}) as Record<string, OperatorRecord>)) {
+        if (value && typeof value.issue === 'number' && typeof value.title === 'string') this.operatorTickets.set(key, value);
       }
       for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
         if (value && Array.isArray(value.labels)) this.labels.set(key, value);
@@ -190,7 +195,7 @@ export class JobStore {
       this.findings = this.findings.filter((entry) => entry.at >= now - KEEP_MS);
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], labels: Object.fromEntries(this.labels), deleted_in_forge: Object.fromEntries(this.deletedInForge), gone_checks: Object.fromEntries(this.goneChecks), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), epic_gaps: Object.fromEntries(this.epicGaps), stalled: Object.fromEntries(this.stalled), merges: this.merges, reverts: this.reverts, findings: this.findings, filed_findings: Object.fromEntries(this.filedFindings) }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], operator_tickets: Object.fromEntries(this.operatorTickets), labels: Object.fromEntries(this.labels), deleted_in_forge: Object.fromEntries(this.deletedInForge), gone_checks: Object.fromEntries(this.goneChecks), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), epic_gaps: Object.fromEntries(this.epicGaps), stalled: Object.fromEntries(this.stalled), merges: this.merges, reverts: this.reverts, findings: this.findings, filed_findings: Object.fromEntries(this.filedFindings) }), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;
