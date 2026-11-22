@@ -22,8 +22,20 @@ const APPROVAL_RECHECK_MS = 30 * MINUTE_MS;
 const MAX_AGE_MS = 30 * DAY_MS;
 const PULLS_PER_REPOSITORY = 50;
 const ACTIVE = new Set(['waiting', 'queued', 'running']);
+// When a job ended (or, without an end, when it started or was made): the ticket watchdog counts from here.
+const endOf = (job: Job): number => job.finished ?? job.started ?? job.created;
 // The first lines of a verdict quoted in a stuck comment: enough to show what the reviewer said, not the whole review.
 const QUOTED_LINES = 3;
+// The ticket watchdog reads the issue of at most this many stalled candidates per pass (one forge call each).
+const STALL_MAX_READS = 20;
+
+// The line the restarted run of a stalled ticket is given (its message, after the ticket's text). Empty for any other run.
+export function stallLine(event: ForgeEvent): string {
+  return event.stall_retry
+    ? '\n\nYour last run on this ticket ended without a pull request, without a comment and with the ticket still open, so nothing was delivered. '
+      + 'This is a fresh run: deliver this time, by pushing the branch ai/issue-' + event.issue.number + ' and opening its pull request, or by closing the ticket when it is done.'
+    : '';
+}
 
 // What the stuck-PR watchdog needs from the dispatcher: the way to hand a pull request to a human (markForHuman), and the rounds the ledger counts.
 export interface StuckHooks {
@@ -112,6 +124,7 @@ export class ReviewSweep {
       }
       if (!Array.isArray(pulls)) continue;
       if (this.config.stuckPrMinutes) await this.watchStuck(repository, pulls, now);
+      if (this.config.ticketStallMinutes) await this.watchStalled(repository, pulls, now);
       await this.sweepApproved(repository, pulls, now);
       for (const pr of pulls) {
         if (starts >= MAX_STARTS) break;
@@ -233,6 +246,108 @@ export class ReviewSweep {
       try { await this.jobs.persist(now); }
       catch (error) { this.logger.error('stuck watchdog: could not save the ledger:', error.message); }
     }
+  }
+
+  // TICKET_STALL_MINUTES: the ticket watchdog, run in each pass after watchStuck. An open ticket on an issue route (not an epic, not a planner ticket)
+  // whose last ForgeHands run ended (done or failed) at least that long ago is stalled when no open agent pull request from ai/issue-<n> exists,
+  // no run of it waits, is queued or runs, and it carries neither BLOCKED_LABEL nor HOLD_LABEL. The first time it is started once more: on the
+  // escalate_to of its route when there is one, else on its own route, with the stallLine. The second time the human is called (markForHuman, reason
+  // `stalled_ticket`): the tickets that wait behind it show `waiting behind stalled #n`. One record per ticket (StalledRecord, the ledger's `stalled`);
+  // it goes when the ticket is no longer stalled (a pull request, a closed ticket, a label), and once the human has taken BLOCKED_LABEL off. A run that
+  // could not be started is handed to the human at once. Returns the number of tickets acted on.
+  async watchStalled(repository: string, pulls: Json[], now: number): Promise<number> {
+    const name = repository.toLowerCase();
+    const minutes = this.config.ticketStallMinutes;
+    if (!minutes) return 0;
+    const agent = new Set<number>();
+    for (const pr of pulls) {
+      const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
+      if (match && pr?.state === 'open' && !pr.merged) agent.add(Number(match[1]));
+    }
+    // The runs of each ticket of this repository (a dependency bot's or a pull request's run has no ticket of its own).
+    const runs = new Map<number, Job[]>();
+    for (const job of this.jobs.list()) {
+      if (job.event?.repository?.full_name?.toLowerCase() !== name || job.event.pull_request || job.event.bot) continue;
+      const number = job.event.issue?.number;
+      if (!Number.isSafeInteger(number)) continue;
+      runs.set(number, [...(runs.get(number) ?? []), job]);
+    }
+    const numbers = new Set([...runs.keys(), ...[...this.jobs.stalled.values()].filter((record) => record.repository.toLowerCase() === name).map((record) => record.issue)]);
+    let reads = 0;
+    let acted = 0;
+    for (const number of [...numbers].sort((a, b) => a - b)) {
+      const key = name + '#' + number;
+      const record = this.jobs.stalled.get(key);
+      const own = runs.get(number) ?? [];
+      // A run that waits, is queued or runs: the ticket moves on (its record, if any, stays).
+      if (own.some((job) => ACTIVE.has(job.status))) continue;
+      if (agent.has(number)) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
+      const last = own.reduce<Job | null>((newest, job) => (!newest || endOf(job) > endOf(newest) ? job : newest), null);
+      if (!last || (last.status !== 'done' && last.status !== 'failed')) { if (!last && record) this.jobs.stalled.delete(key); continue; }
+      if (reads >= STALL_MAX_READS) break;
+      reads += 1;
+      let issue: Json;
+      try {
+        issue = await this.forge.getIssue(repository, number);
+      } catch (error) {
+        this.logger.error('ticket watchdog: could not read ' + repository + '#' + number + ':', error.message);
+        continue;
+      }
+      if (!issue || issue.state !== 'open') { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
+      const labels: string[] = (issue.labels || []).map((label: Json) => label?.name);
+      if (labels.some((label) => this.config.epicLabels.has(label) || label === this.config.splitLabel)) continue; // epics and planner tickets: the epic-gap path
+      // The human took BLOCKED_LABEL off: the record goes, and the ticket is looked at afresh.
+      if (record?.human && !labels.includes(this.config.blockedLabel)) { this.jobs.stalled.delete(key); acted += 1; }
+      const current = this.jobs.stalled.get(key);
+      if (labels.includes(this.config.blockedLabel) || labels.includes(this.config.holdLabel)) continue;
+      const route = this.config.routes.get(last.label);
+      if (route?.kind !== 'issue' || this.config.epicLabels.has(last.label) || last.label === this.config.splitLabel) continue;
+      if (current?.run === last.id) continue; // acted on this run already
+      if (now - endOf(last) < minutes * MINUTE_MS) continue;
+      if (!current) {
+        const target = route.escalateTo && this.config.routes.has(route.escalateTo) ? route.escalateTo : last.label;
+        let status = 'failed';
+        try {
+          status = (await this.enqueue(this.stallEvent(last.event, target))).status;
+        } catch (error) {
+          this.logger.error('ticket watchdog: could not start ' + repository + '#' + number + ' once more:', error.message);
+        }
+        const restarted = status === 'queued' || status === 'waiting' || status === 'deferred';
+        metrics.inc('forgehands_stalled_ticket_actions_total', { action: restarted ? 'restart' : 'human' });
+        this.logger.error(repository + '#' + number + ': stalled (its last run ' + last.id + ' ended without a delivery), ' + (restarted ? 'started once more on ' + target : 'the start failed, the human is called'));
+        this.jobs.stalled.set(key, { repository: name, issue: number, run: last.id, restarts: 1, human: !restarted, at: now });
+        acted += 1;
+        if (!restarted) await this.hooks.block(this.ticketEvent(last.event), this.stalledText(number, minutes, 'the start did not work'), 'stalled_ticket');
+        continue;
+      }
+      // A restarted run that ended without a delivery too: the human is called.
+      metrics.inc('forgehands_stalled_ticket_actions_total', { action: 'human' });
+      this.logger.error(repository + '#' + number + ': stalled again after the restart (' + last.id + '), the human is called');
+      this.jobs.stalled.set(key, { repository: name, issue: number, run: last.id, restarts: current.restarts, human: true, at: now });
+      acted += 1;
+      await this.hooks.block(this.ticketEvent(last.event), this.stalledText(number, minutes, 'the run started once more ended the same way'), 'stalled_ticket');
+    }
+    if (acted) {
+      try { await this.jobs.persist(now); }
+      catch (error) { this.logger.error('ticket watchdog: could not save the ledger:', error.message); }
+    }
+    return acted;
+  }
+
+  // The event a restart is enqueued with: the ticket of the last run, on the label to start with, marked as a stall retry.
+  stallEvent(base: ForgeEvent, label: string): ForgeEvent {
+    return { ...base, label, label_event: false, previous_labels: undefined, ci: undefined, comment: undefined, stall_retry: true } as ForgeEvent;
+  }
+
+  // The ticket of a run as the human notice needs it (markForHuman reads the repository and the issue).
+  ticketEvent(base: ForgeEvent): ForgeEvent {
+    return { ...base, label: undefined, label_event: undefined, ci: undefined, pull_request: undefined, bot: undefined } as ForgeEvent;
+  }
+
+  // The words of the notice for a stalled ticket (the mention is added by markForHuman).
+  stalledText(number: number, minutes: number, detail: string): string {
+    return 'ForgeHands: issue #' + number + ' is stalled: its last run ended without a pull request, without a comment and with the ticket still open, and ' + detail
+      + '. A human has to look at the ticket. Removing ' + this.config.blockedLabel + ' lets ForgeHands look at it again (it waits ' + minutes + ' minutes after its last run).';
   }
 
   // One pull request of the watchdog. Returns true when the ledger's stuck records changed. An agent pull request (ai/issue-<n>) has its ticket

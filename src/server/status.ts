@@ -6,7 +6,7 @@ import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
 import type { E2eState } from '../e2e/controller.ts';
 import { holdKey } from '../agent/merge.ts';
-import { behindBlocked, blockedTickets } from '../agent/stuck.ts';
+import { behindBlocked, blockedTickets, stalledTickets } from '../agent/stuck.ts';
 import { revertRate } from '../agent/revert-rate.ts';
 import type { RevertRate } from '../agent/revert-rate.ts';
 import type { EpicGapRecord, MergeRecord } from '../types.ts';
@@ -258,6 +258,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const behind = behindBlocked(jobs.list(), blockedTickets(jobs.stuck));
   // The same for the epics the review found open (EPIC_GAP_REPLAN): the tickets that wait behind one of them.
   const behindGaps = behindBlocked(jobs.list(), new Set(jobs.epicGaps.keys()));
+  // The same for the tickets the ticket watchdog called a human for (TICKET_STALL_MINUTES): "waiting behind stalled #n".
+  const behindStalled = behindBlocked(jobs.list(), stalledTickets(jobs.stalled));
   let hidden = 0;
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
@@ -266,11 +268,13 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const issueNumber = entry.key.includes('#') ? Number(entry.key.slice(entry.key.lastIndexOf('#') + 1)) : 0;
     const chain = closed.has(entry.key) ? [] : behind.get(entry.key) ?? [];
     const gaps = closed.has(entry.key) ? [] : behindGaps.get(entry.key) ?? [];
+    const stalled = closed.has(entry.key) ? [] : behindStalled.get(entry.key) ?? [];
     // The last merge decision of an open pull request (the merger keeps it by "repo#<pr>"; a merged one leaves it).
     const decision = pr && !closed.has(entry.key) ? options.decisions?.get(entry.key.split(/[#!]/)[0].toLowerCase() + '#' + pr) : undefined;
     const base = jobs.isDeletedInForge(entry.key) ? 'deleted in the forge' : deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
     // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
     const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ')
+      : stalled.length && base.startsWith('waiting for') ? 'waiting behind stalled ' + stalled.map((number) => '#' + number).join(', ')
       : gaps.length && base.startsWith('waiting for') ? 'waiting behind epic with gaps ' + gaps.map((number) => '#' + number).join(', ') : base;
     return {
       issue: entry.key,
@@ -309,6 +313,8 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     issues,
     hidden,
     waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason })),
+      ...[...jobs.stalled.values()].filter((record) => record.human && !closed.has(record.repository.toLowerCase() + '#' + record.issue))
+        .map((record) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'stalled_ticket' })),
       ...[...jobs.epicGaps.values()].filter((record: EpicGapRecord) => record.human && !closed.has(record.repository + '#' + record.issue))
         .map((record: EpicGapRecord) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'epic stays open after its review: ' + record.reason }))],
     workspace,

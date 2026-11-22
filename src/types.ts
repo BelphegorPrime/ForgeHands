@@ -161,6 +161,8 @@ export interface DirectConfig extends BaseConfig {
   reviewSweepMinutes: number;
   /** STUCK_PR_MINUTES (0 = off, at most 10080): how long an agent pull request may sit with a NOT OK verdict and nothing running before the watchdog blocks it. See stuck.ts. */
   stuckPrMinutes: number;
+  /** TICKET_STALL_MINUTES (0 = off, at most 10080): how long after its last run an open ticket with no pull request may sit without a delivery before the ticket watchdog acts. See review-sweep.ts. */
+  ticketStallMinutes: number;
   /** EPIC_GAP_REPLAN (default 1, 0 = off, at most 5): how often an epic that the review found open goes back to the planner before a human is called. See epic-gaps.ts. */
   epicGapReplan: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
@@ -307,6 +309,8 @@ export interface ForgeEvent extends BaseEvent {
   plan_answer?: boolean;
   /** A ticket started again because its change was reverted (REVERT_RETRIES): the message says so. */
   revert_retry?: boolean;
+  /** A ticket started again by the ticket watchdog (TICKET_STALL_MINUTES): its last run ended without a delivery; the prompt says so. */
+  stall_retry?: boolean;
 }
 
 /** A push to the default branch. */
@@ -403,6 +407,17 @@ export interface StuckRecord {
   blocked: boolean;
   eligible_at: number;
   blocked_at: number | null;
+}
+
+/** A ticket the ticket watchdog found stalled (kept in the ledger per ticket, "repo#n"): `restarts` is 1 once it was started once more, `human` is true
+ * once the human was called (the ticket carries BLOCKED_LABEL). `run` is the id of the last run it acted on. See review-sweep.ts and stuck.ts. */
+export interface StalledRecord {
+  repository: string;
+  issue: number;
+  run: string;
+  restarts: number;
+  human: boolean;
+  at: number;
 }
 
 export interface Job {

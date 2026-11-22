@@ -415,6 +415,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     reviewSweepMinutes: wholeOf(env.REVIEW_SWEEP_MINUTES, 10, 'REVIEW_SWEEP_MINUTES', 1440),
     // STUCK_PR_MINUTES (default 90, 0 = off, at most 10080): the watchdog of the review sweep blocks an agent pull request that nothing moves on from.
     stuckPrMinutes: wholeOf(env.STUCK_PR_MINUTES, 90, 'STUCK_PR_MINUTES', 10080),
+    // TICKET_STALL_MINUTES (default 180, 0 = off, at most 10080): the ticket watchdog of the review sweep restarts, then calls a human for, an open ticket
+    // whose last run ended without a delivery (src/agent/review-sweep.ts, watchStalled).
+    ticketStallMinutes: wholeOf(env.TICKET_STALL_MINUTES, 180, 'TICKET_STALL_MINUTES', 10080),
     // EPIC_GAP_REPLAN (default 1, 0 = off, at most 5): an epic the review found open goes back to the planner this many times (per epic, until it closes)
     // before the human is called. See src/agent/epic-gaps.ts.
     epicGapReplan: wholeOf(env.EPIC_GAP_REPLAN, 1, 'EPIC_GAP_REPLAN', 5),

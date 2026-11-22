@@ -665,8 +665,9 @@ test('a pull request or a comment since the run began, a closed issue or an epic
   assert.equal(stale.job.delivery_retry, 1, 'an old pull request and an old comment are not a delivery');
 });
 
-// A worker may deliver by a comment of the agent on the issue it blocks (its parent): #26 blocks #31, which is the report's place.
-test('a comment of the agent on the parent (the issue the run blocks) is a delivery, logged and not closed', async () => {
+// A comment of the agent on the issue this one blocks (its parent) is no delivery while the ticket is open: the ticket has no pull request and is
+// still open. It is a hand-back like a comment on the ticket itself (handback.ts): "done, nothing pushed" asks for the push, a blocker escalates.
+test('a comment of the agent on the parent while the ticket stays open is a hand-back: the run is asked to push', async () => {
   const at = (ms) => new Date(clock + ms).toISOString();
   const logs = [];
   const t = await buildDelivery({
@@ -677,11 +678,43 @@ test('a comment of the agent on the parent (the issue the run blocks) is a deliv
     }
   });
   await t.end();
+  assert.notEqual(t.job.status, 'done', 'not delivered');
+  assert.equal(t.job.delivered_on, undefined);
+  assert.equal(t.job.handback_retry, true, 'a hand-back: the push is asked for');
+  assert.equal(t.job.handback_push, true);
+  assert.equal(t.job.status, 'running', 'queued again and started in the same pass');
+  assert.ok(logs.includes('owner/hello#26: the run commented on #31 and left the ticket open, a hand-back'), logs.join('\n'));
+  assert.ok(!t.forgejo.calls.some((call) => call.method !== 'GET' && call.path.includes('/issues/26') && !call.path.endsWith('/comments')), 'the ticket is not closed by ForgeHands');
+});
+
+test('a blocker comment of the agent on the parent escalates the run like a blocker on the ticket', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString();
+  const t = await buildDelivery({
+    extra: { LABEL_ROUTES: DELIVERY_ROUTES },
+    routes: {
+      ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }],
+      ['GET ' + API + '/issues/31/comments']: [{ created_at: at(60000), body: 'I am blocked: the API key is missing.', user: { login: 'openhands' } }]
+    }
+  });
+  await t.end();
+  assert.equal(t.job.escalated, true);
+  assert.equal(t.job.escalated_after, 'handback');
+  assert.equal(starts().at(-1).body.agent_profile_id, ESCALATE);
+});
+
+test('a comment of the agent on the parent after the ticket was closed is a delivery', async () => {
+  const at = (ms) => new Date(clock + ms).toISOString();
+  const t = await buildDelivery({
+    issueState: 'closed',
+    routes: {
+      ['GET ' + API + '/issues/26/blocks']: [{ number: 31, state: 'open' }],
+      ['GET ' + API + '/issues/31/comments']: [{ created_at: at(60000), body: 'verification', user: { login: 'openhands' } }]
+    }
+  });
+  await t.end();
   assert.equal(t.job.status, 'done');
   assert.equal(t.job.delivery_retry, undefined, 'not run once more');
-  assert.equal(t.job.delivered_on, 31);
-  assert.ok(logs.includes('owner/hello#26: delivered as a comment on #31'), logs.join('\n'));
-  assert.ok(!t.forgejo.calls.some((call) => call.method !== 'GET' && call.path.includes('/issues/26') && !call.path.endsWith('/comments')), 'the ticket is not closed by ForgeHands');
+  assert.equal(t.job.handback_retry, undefined);
 });
 
 test('a comment on an unrelated issue, of another user, or older than the run does not deliver for the parent', async () => {

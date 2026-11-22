@@ -2,7 +2,7 @@
 // keeps the records in the ledger; a ticket that waits, directly or through other waiting tickets, for a blocked one is marked "waiting behind stuck".
 // Read from the ledger only: no forge read.
 import { waitGraph } from './waits.ts';
-import type { Job, StuckRecord } from '../types.ts';
+import type { Job, StalledRecord, StuckRecord } from '../types.ts';
 
 // The ledger key of a pull request's stuck record: "repo#pr<n>" (lower case), the form the holds of two-key merges use too.
 export const stuckKey = (repository: string, number: number): string => repository.toLowerCase() + '#pr' + number;
@@ -12,6 +12,13 @@ export function blockedTickets(records: Map<string, StuckRecord>): Set<string> {
   const tickets = new Set<string>();
   // A revert pull request without a ticket (issue 0) blocks no ticket.
   for (const record of records.values()) if (record.blocked && record.issue > 0) tickets.add(record.repository.toLowerCase() + '#' + record.issue);
+  return tickets;
+}
+
+// The tickets ("repo#issue", lower case) the ticket watchdog called a human for (`human`, see StalledRecord): they wait behind the same chain as a blocked pull request.
+export function stalledTickets(records: Map<string, StalledRecord>): Set<string> {
+  const tickets = new Set<string>();
+  for (const record of records.values()) if (record.human) tickets.add(record.repository.toLowerCase() + '#' + record.issue);
   return tickets;
 }
 

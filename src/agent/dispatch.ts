@@ -11,9 +11,9 @@ import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
-import { ReviewSweep } from './review-sweep.ts';
+import { ReviewSweep, stallLine } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
-import { HandbackRouter, handbackLine, handbackOf } from './handback.ts';
+import { HandbackRouter, classifyHandback, handbackLine, handbackOf } from './handback.ts';
 import { EpicGaps } from './epic-gaps.ts';
 import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
@@ -1369,6 +1369,7 @@ export class Dispatcher {
       const since = job.started - 60000;
       const repository = event.repository.full_name;
       const issue = await this.forge.getIssue(repository, event.issue.number);
+      // A ticket that is closed (by the run, or by a person) is delivered: a comment on its parent is then the report, see parentComment below.
       if (!issue || issue.state !== 'open') return;
       const branch = 'ai/issue-' + event.issue.number;
       const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
@@ -1378,14 +1379,16 @@ export class Dispatcher {
       const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
       const handback = this.config.handbackHandling && written.length ? handbackOf(written) : null;
       if (written.length && !handback) return;
-      const parent = await this.parentDelivery(event, since);
-      if (parent) {
-        Object.assign(job, { delivered_on: parent });
-        this.logger.error(repository + '#' + event.issue.number + ': delivered as a comment on #' + parent);
-        return;
-      }
       if (handback) {
         await this.handback.handle(job, handback.kind, handback.text);
+        return;
+      }
+      // A comment on the parent (the issue this one blocks) is no delivery while this ticket is open: the ticket has no pull request and is not
+      // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
+      const parent = await this.parentComment(event, since);
+      if (parent && this.config.handbackHandling) {
+        this.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
+        await this.handback.handle(job, classifyHandback(parent.text) === 'blocker' ? 'blocker' : 'pushed_nothing', parent.text);
         return;
       }
       if (!job.delivery_retry) {
@@ -1415,9 +1418,9 @@ export class Dispatcher {
     return true;
   }
 
-  // A worker on a ticket that blocks another (the parent, where its report belongs) may deliver by a comment of the agent on that parent. Returns
-  // the number of the parent, or null. A read that fails counts as no comment: an unknown answer never reads as delivered.
-  async parentDelivery(event: ForgeEvent, since: number): Promise<number | null> {
+  // The newest comment of the agent since the run began on a parent (an issue this one blocks), with the parent's number, or null. A read that fails
+  // counts as no comment: an unknown answer never reads as delivered.
+  async parentComment(event: ForgeEvent, since: number): Promise<{ number: number; text: string } | null> {
     let login: string | null;
     let parents: Json;
     try {
@@ -1431,7 +1434,8 @@ export class Dispatcher {
     for (const parent of Array.isArray(parents) ? parents : []) {
       try {
         const comments = await this.forge.listComments(event.repository.full_name, parent.number, 50);
-        if (comments.some((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since)) return parent.number;
+        const own = comments.filter((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since);
+        if (own.length) return { number: parent.number, text: String(own.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0].body ?? '') };
       } catch (error) {
         this.logger.error('could not read the comments of #' + parent.number + ':', error.message);
       }
@@ -2210,7 +2214,7 @@ export class Dispatcher {
       agent_profile_id: effective.profile,
       max_iterations: route.maxIterations,
       tags: { source: 'forgehands', ...(job.event.bot ? { bot: 'dependency' } : { issue: String(job.event.issue.number) }), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
-      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks, notes) + handbackLine(job) }] }
+      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks, notes) + handbackLine(job) + stallLine(job.event) }] }
     };
     if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
     // Built per start from the environment; never stored in the ledger.
