@@ -20,6 +20,9 @@ export interface TicketRun {
   finished?: number;
   /** For a queued or waiting run: how many runs go first (running ones, and queued ones created before it). */
   ahead: number;
+  /** What started the run, read from its job: `first` (the worker's first run), `revert restart` (the event carries the revert_retry marker),
+   * `escalated after <state>`, or `delivery retry`. For the scenario's notes only; a predicate does not read it. */
+  why: string;
 }
 
 /** The runs ForgeHands started (and queued) for an issue, through the ledger and the dispatcher's queue. */
@@ -29,6 +32,11 @@ export interface LedgerPort {
    * routes of kind `issue`: the worker label, its escalation, the fallbacks). A run that was only queued and never started does not count.
    */
   runsOf(repository: string, issue: number, label?: string): number;
+  /**
+   * The runs ForgeHands started for an issue because its change was reverted (the event carries `revert_retry`, see Dispatcher.revertMerged), under
+   * the issue routes. A run that was only queued and never started does not count.
+   */
+  revertRestartsOf(repository: string, issue: number): number;
   /** Every run of an issue under the issue routes, oldest first, whatever its state (ended ones included). */
   runsStateOf(repository: string, issue: number): TicketRun[];
   /** Drops the runs of an issue that wait or are queued (a closed ticket must not start later). Running runs are left alone. Returns how many. */

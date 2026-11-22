@@ -29,7 +29,12 @@ export type Predicate =
    * How many runs ForgeHands started for this issue (the ledger, not the forge): under every issue route, or only under `label` when it is
    * given. A ticket that is escalated or sent to a fallback route keeps counting, so leave `label` out unless the route is the point.
    */
-  | { runs: string; label?: string; atLeast?: number; exactly?: number };
+  | { runs: string; label?: string; atLeast?: number; exactly?: number }
+  /**
+   * How many of the runs ForgeHands started for this issue were restarts caused by a revert of its change (the run's event carries the
+   * `revert_retry` marker, set by Dispatcher.revertMerged). Under every issue route, as `runs` is; a hand-back escalation is not one of them.
+   */
+  | { revertRestarts: string; atLeast?: number; exactly?: number };
 
 export type Step =
   /** Creates an issue with a body, puts the label on it (a route of LABEL_ROUTES starts a run) and remembers its number as `as`. */
@@ -74,8 +79,8 @@ function checkText(where: string, value: unknown, known: Set<string>, field: str
 
 function checkPredicate(where: string, value: unknown, known: Set<string>): Predicate {
   if (!isRecord(value)) fail(where, 'a predicate must be an object');
-  const kinds = ['issue', 'pull', 'findPull', 'mergeCommit', 'branch', 'runs'].filter((key) => key in (value as object));
-  if (kinds.length !== 1) fail(where, 'a predicate needs exactly one of issue, pull, findPull, mergeCommit, branch or runs');
+  const kinds = ['issue', 'pull', 'findPull', 'mergeCommit', 'branch', 'runs', 'revertRestarts'].filter((key) => key in (value as object));
+  if (kinds.length !== 1) fail(where, 'a predicate needs exactly one of issue, pull, findPull, mergeCommit, branch, runs or revertRestarts');
   const kind = kinds[0];
   const p = value as Record<string, unknown>;
   const state = (allowed: string[]) => {
@@ -94,6 +99,12 @@ function checkPredicate(where: string, value: unknown, known: Set<string>): Pred
     return { contains: checkText(where, c.contains, known, 'comment.contains'), ...(min === undefined ? {} : { min }), ...(max === undefined ? {} : { max }) };
   };
   const label = (name: unknown) => { if (typeof name !== 'string' || !name.trim()) fail(where, 'hasLabel must be a label name'); return name as string; };
+  const counts = (kind: string): { atLeast?: number; exactly?: number } => {
+    const atLeast = p.atLeast === undefined ? undefined : Number(p.atLeast);
+    const exactly = p.exactly === undefined ? undefined : Number(p.exactly);
+    if (atLeast === undefined && exactly === undefined) fail(where, kind + ' needs atLeast or exactly');
+    return { atLeast, exactly };
+  };
   switch (kind) {
     case 'issue': return { issue: checkText(where, p.issue, known, 'issue'), ...(state(['open', 'closed']) ? { state: p.state as 'open' | 'closed' } : {}),
       ...(p.hasLabel === undefined ? {} : { hasLabel: label(p.hasLabel) }), ...(comment() ? { comment: comment() } : {}) };
@@ -102,10 +113,12 @@ function checkPredicate(where: string, value: unknown, known: Set<string>): Pred
     case 'findPull': return { findPull: checkText(where, p.findPull, known, 'findPull'), ...(state(STATES) ? { state: p.state as 'open' | 'closed' | 'merged' } : {}) };
     case 'mergeCommit': return { mergeCommit: checkText(where, p.mergeCommit, known, 'mergeCommit'), status: checkText(where, p.status, known, 'status') };
     case 'branch': return { branch: checkText(where, p.branch, known, 'branch'), status: checkText(where, p.status, known, 'status') };
+    case 'revertRestarts': {
+      const { atLeast, exactly } = counts(kind);
+      return { revertRestarts: checkText(where, p.revertRestarts, known, 'revertRestarts'), ...(atLeast === undefined ? {} : { atLeast }), ...(exactly === undefined ? {} : { exactly }) };
+    }
     default: {
-      const atLeast = p.atLeast === undefined ? undefined : Number(p.atLeast);
-      const exactly = p.exactly === undefined ? undefined : Number(p.exactly);
-      if (atLeast === undefined && exactly === undefined) fail(where, 'runs needs atLeast or exactly');
+      const { atLeast, exactly } = counts(kind);
       return { runs: checkText(where, p.runs, known, 'runs'), ...(p.label === undefined ? {} : { label: label(p.label) }),
         ...(atLeast === undefined ? {} : { atLeast }), ...(exactly === undefined ? {} : { exactly }) };
     }

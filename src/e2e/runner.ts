@@ -41,13 +41,16 @@ export interface ScenarioResult {
   cleanup_reason: string | null;
   /** A difference the run did not cause and the cleanup left alone (a path the run did not touch); the cleanup still counts as ok. */
   cleanup_note: string | null;
+  /** What the run started, per ticket, read from the ledger after the cleanup: every run and its origin (see TicketRun.why). Runs beyond the
+   * first one are allowed (a hand-back escalation, a delivery retry) and are reported here, not failed. Null when the ledger has nothing. */
+  notes: string | null;
 }
 
 // A step that does not hold: its message is the reason the report gives.
 class StepFailed extends Error {}
 
 const pause = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
-const PREDICATE_KINDS = ['issue', 'pull', 'findPull', 'mergeCommit', 'branch', 'runs'] as const;
+const PREDICATE_KINDS = ['issue', 'pull', 'findPull', 'mergeCommit', 'branch', 'runs', 'revertRestarts'] as const;
 const MINUTE = 60000;
 /** How long a run of the suite's ticket may wait queued before its wait fails (E2E_QUEUE_MINUTES sets it in production). */
 const DEFAULT_QUEUE_MS = 60 * MINUTE;
@@ -289,7 +292,7 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
     const waitStart = now();
     const fixedLimit = step.timeoutMinutes === undefined ? deadline : Math.min(deadline, waitStart + step.timeoutMinutes * 60000);
     const runMs = step.timeoutMinutes === undefined ? deadline - waitStart : step.timeoutMinutes * 60000;
-    const runDependent = 'runs' in step.for || 'findPull' in step.for;
+    const runDependent = 'runs' in step.for || 'revertRestarts' in step.for || 'findPull' in step.for;
     let verdict: Verdict = { ok: false, detail: 'not checked yet' };
     for (;;) {
       const rejected = await rejectedTicket();
@@ -373,7 +376,20 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
     cleanup: outcome.problem === null ? 'ok' : 'failed',
     cleanup_reason: outcome.problem,
     cleanup_note: outcome.note,
+    notes: runNotes(options.ledger, repository, tickets),
   };
+}
+
+/** The runs each ticket of a run got, in the words of TicketRun.why, for the scenario's notes. Null when no ticket has a run in the ledger. */
+export function runNotes(ledger: LedgerPort, repository: string, tickets: number[]): string | null {
+  const parts: string[] = [];
+  for (const number of tickets) {
+    let runs: TicketRun[];
+    try { runs = ledger.runsStateOf(repository, number); } catch { continue; }
+    if (!runs.length) continue;
+    parts.push('#' + number + ': ' + runs.length + ' run(s) (' + runs.map((run) => run.label + ', ' + run.status + ', ' + run.why).join('; ') + ')');
+  }
+  return parts.length ? parts.join(' | ') : null;
 }
 
 // What a run created and must undo. `tickets` are the issues it opened; `baseline` the commit the default branch had at the start.
