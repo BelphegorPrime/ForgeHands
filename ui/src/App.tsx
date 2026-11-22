@@ -4,6 +4,7 @@ import {
   ArrowUpRight,
   CircleCheck,
   CircleDashed,
+  ClipboardCheck,
   Clock3,
   Coins,
   GitPullRequest,
@@ -31,6 +32,11 @@ import {
   TableRow,
 } from "./components/ui/table.tsx";
 import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs.tsx";
+import {
+  FactoryHealth,
+  WaitingForHuman,
+} from "./components/factory-health.tsx";
+import { listedIssues } from "./factory-view.ts";
 import { matchesFilter } from "./ticket-filter.ts";
 import type { IssueFilter } from "./ticket-filter.ts";
 import type { DashboardStatus, Issue, Summary } from "./types.ts";
@@ -211,7 +217,7 @@ function App() {
     { merged: 0, blocked: 0, cost: 0 },
   );
   const visibleIssues =
-    status?.issues.filter(
+    listedIssues(status?.issues ?? []).filter(
       (issue) =>
         matchesFilter(issue, filter, waitingForHuman) &&
         (
@@ -264,6 +270,9 @@ function App() {
         </a>
         <a className="nav-item" href="#repositories">
           <Layers3 size={17} /> Repositories <span>{entries.length}</span>
+        </a>
+        <a className="nav-item" href="#factory">
+          <ClipboardCheck size={17} /> Factory health
         </a>
         <div className="sidebar-bottom">
           <div className="sidebar-status">
@@ -340,6 +349,8 @@ function App() {
               {error}
             </div>
           )}
+
+          {status && <WaitingForHuman status={status} />}
 
           <section className="metric-grid" aria-label="Summary metrics">
             <Metric
@@ -513,6 +524,8 @@ function App() {
             </Card>
           </div>
 
+          {status && <FactoryHealth status={status} />}
+
           <Card className="panel tickets-panel" id="tickets">
             <CardHeader className="tickets-header">
               <div>
@@ -548,6 +561,12 @@ function App() {
                   ))}
                 </TabsList>
               </Tabs>
+              {status && status.factory.deleted_in_forge > 0 && (
+                <p className="table-muted deleted-note">
+                  {status.factory.deleted_in_forge} deleted in the forge, not
+                  listed
+                </p>
+              )}
               {visibleIssues.length ? (
                 <Table className="ticket-table">
                   <TableHeader>

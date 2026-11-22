@@ -294,6 +294,8 @@ export class TicketPreflight {
   logger: Logger;
   now: () => number;
   tell: PreflightDeps['tell'];
+  // The advisory notes of the tickets checked since the start, per ticket ("repo#n", lower case), the last 100 (the status page shows them).
+  advisories = new Map<string, { notes: string[]; at: number }>();
 
   constructor(deps: PreflightDeps) {
     this.config = deps.config;
@@ -354,6 +356,13 @@ export class TicketPreflight {
     return splitViolations(await this.violationsOf(event), this.config.ticketPreflightBlock).advisory.map((violation) => violation.note);
   }
 
+  // Keeps the advisory notes of a ticket for the status page (at most 100 tickets, the oldest go first); a ticket without them is removed.
+  noteAdvisories(name: string, advisory: Violation[]): void {
+    this.advisories.delete(name);
+    if (advisory.length) this.advisories.set(name, { notes: advisory.map((violation) => violation.note), at: this.now() });
+    while (this.advisories.size > 100) this.advisories.delete(this.advisories.keys().next().value as string);
+  }
+
   // Counts the advisory findings of a ticket, once per rule. They are counted when the ticket is checked, not when its run starts.
   countAdvised(advisory: Violation[]): void {
     for (const rule of new Set(advisory.map((violation) => violation.rule))) metrics.inc('forgehands_preflight_total', { result: 'advised', rule: String(rule) });
@@ -368,11 +377,14 @@ export class TicketPreflight {
     const repository = event.repository.full_name;
     const number = event.issue.number;
     const found = await this.violationsOf(event);
+    const name = repository.toLowerCase() + '#' + number;
     if (!found.length) {
+      this.advisories.delete(name);
       metrics.inc('forgehands_preflight_total', { result: 'ok', rule: 'none' });
       return false;
     }
     const { blocking: violations, advisory } = splitViolations(found, this.config.ticketPreflightBlock);
+    this.noteAdvisories(name, advisory);
     // Advisory findings alone never reject, and need no look at the open pull requests.
     if (!violations.length) {
       this.countAdvised(advisory);

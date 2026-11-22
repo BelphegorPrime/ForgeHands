@@ -10,6 +10,9 @@ import { behindBlocked, blockedTickets, stalledTickets } from '../agent/stuck.ts
 import { revertRate } from '../agent/revert-rate.ts';
 import type { RevertRate } from '../agent/revert-rate.ts';
 import type { EpicGapRecord, MergeRecord } from '../types.ts';
+import type { TicketPreflight } from '../agent/preflight.ts';
+import { buildFactory } from './factory.ts';
+import type { Factory } from './factory.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -53,6 +56,8 @@ export interface Status {
   idle?: { since: string; reasons: IdleCounts; quota_tiers: string[]; cycles: string[] };
   // The end-to-end suite (E2E_REPO): null while it is off. Added by the server, which owns the controller (see app.ts).
   e2e?: E2eState | null;
+  // The factory health section: what the dashboard shows about the watchdogs, merge decisions, hand-backs, pre-flight, epic review and deletions (see factory.ts).
+  factory: Factory;
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -221,7 +226,7 @@ function stateOf(runs: Run[], maxRounds: number, rounds: number, hold: string | 
 }
 
 export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now(), dry?: DryLog, waiting: { repository: string; issue: number; pr: number; since: number; reason: string }[] = [], workspace: WorkspaceState | null = null,
-  options: { all?: boolean; idle?: IdleState | null; decisions?: Map<string, { reason: string; at: number }> } = {}): Status {
+  options: { all?: boolean; idle?: IdleState | null; decisions?: Map<string, { reason: string; at: number }>; preflight?: TicketPreflight | null } = {}): Status {
   const byIssue = new Map<string, { key: string; title: string; issueUrl: string | null; prUrl: string | null; runs: Run[]; last: number }>();
   for (const job of jobs.list()) {
     const base = job.key.split(':')[0];
@@ -318,6 +323,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       ...[...jobs.epicGaps.values()].filter((record: EpicGapRecord) => record.human && !closed.has(record.repository + '#' + record.issue))
         .map((record: EpicGapRecord) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'epic stays open after its review: ' + record.reason }))],
     workspace,
+    factory: buildFactory(config, jobs, issues, closed, options.preflight ?? null),
     ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers, cycles: options.idle.cycles } } : {})
   };
 }
