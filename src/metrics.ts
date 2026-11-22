@@ -86,11 +86,23 @@ export const known = (value: unknown, set: Iterable<string>, fallback = 'other')
 
 class Metrics {
   counters = new Map<string, number>(); // series -> value
+  // series -> metric name and labels, so that the status page can read the counters without parsing the text format.
+  private meta = new Map<string, { name: string; labels: Labels }>();
+  // When the counters started (the process start; a reset does not move it).
+  readonly startedAt = new Date().toISOString();
   buckets = new Map<string, { counts: number[]; sum: number; count: number; labels: Labels }>();
 
   inc(name: string, labels: Labels = {}, by = 1): void {
     const key = series(name, labels);
     this.counters.set(key, (this.counters.get(key) || 0) + by);
+    if (!this.meta.has(key)) this.meta.set(key, { name, labels });
+  }
+  // Every series of a counter with its labels and value (for /status.json; the same numbers as /metrics).
+  read(name: string): { labels: Labels; value: number }[] {
+    return [...this.counters].flatMap(([key, value]) => {
+      const entry = this.meta.get(key);
+      return entry && entry.name === name ? [{ labels: entry.labels, value }] : [];
+    });
   }
   // Counts a merge refusal and passes the reason on: `return metrics.refused('ci_not_green')`.
   refused(reason: string): string {
@@ -113,6 +125,7 @@ class Metrics {
   }
   reset(): void {
     this.counters.clear();
+    this.meta.clear();
     this.buckets.clear();
   }
 

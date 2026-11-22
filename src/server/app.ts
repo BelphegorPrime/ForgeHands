@@ -83,7 +83,7 @@ export function createApp(
       dispatcher!.dry,
       [...dispatcher!.reminder.waiting.values()],
       dispatcher!.workspace.state(),
-      { all, idle: dispatcher!.idleState(), decisions: dispatcher!.merger.decisions },
+      { all, idle: dispatcher!.idleState(), decisions: dispatcher!.merger.decisions, preflight: dispatcher!.preflight },
     ),
     e2e: e2e?.state() ?? null,
   });
