@@ -36,7 +36,7 @@ export interface E2eState {
   scenarios: string[];
   version: string;
   running: { trigger: 'start' | 'manual'; since: string } | null;
-  last: { version: string; trigger: 'start' | 'manual'; at: string; error: string | null; results: { scenario: string; ok: boolean; reason: string | null; cleanup: 'ok' | 'failed'; cleanup_reason: string | null; cleanup_note: string | null; failed_step: number | null; at: string }[] } | null;
+  last: { version: string; trigger: 'start' | 'manual'; at: string; error: string | null; results: { scenario: string; ok: boolean; reason: string | null; cleanup: 'ok' | 'failed'; cleanup_reason: string | null; cleanup_note: string | null; notes: string | null; failed_step: number | null; at: string }[] } | null;
 }
 
 /** Why a run did not start: the suite is off, this repository is in a dry run, the forge cannot run it (GitLab), or a run is going. */
@@ -57,6 +57,10 @@ export function ledgerOf(jobs: JobStore, routes: Map<string, { kind?: string }>,
       return ticketJobs(repository, issue)
         .filter((job) => (label === undefined ? isIssueRoute(job.label) : job.label === label) && started(job.status, job.started)).length;
     },
+    revertRestartsOf(repository, issue) {
+      return ticketJobs(repository, issue)
+        .filter((job) => isIssueRoute(job.label) && job.event?.revert_retry === true && started(job.status, job.started)).length;
+    },
     runsStateOf(repository, issue) {
       const active = jobs.list(true);
       return ticketJobs(repository, issue).filter((job) => isIssueRoute(job.label)).map((job): TicketRun => ({
@@ -69,6 +73,7 @@ export function ledgerOf(jobs: JobStore, routes: Map<string, { kind?: string }>,
         ahead: job.status === 'queued' || job.status === 'waiting'
           ? active.filter((other) => other !== job && (other.status === 'running' || (other.status === 'queued' && other.created < job.created))).length
           : 0,
+        why: job.event?.revert_retry === true ? 'revert restart' : job.escalated ? 'escalated after ' + (job.escalated_after || 'an empty run') : job.delivery_retry ? 'delivery retry' : 'first run',
       }));
     },
     dropQueued: (repository, issue) => dropQueued(repository, issue),
@@ -140,7 +145,7 @@ export class E2eController {
     const link = config.forgejo ? config.forgejo.url + '/' + repository : undefined;
     for (const result of results) {
       if (result.ok && result.cleanup === 'ok') {
-        logger.log?.('e2e: ' + result.scenario + ' ok' + (result.cleanup_note ? ' (cleanup: ' + result.cleanup_note + ')' : ''));
+        logger.log?.('e2e: ' + result.scenario + ' ok' + (result.cleanup_note ? ' (cleanup: ' + result.cleanup_note + ')' : '') + (result.notes ? ' (runs: ' + result.notes + ')' : ''));
         continue;
       }
       // A scenario whose steps held and whose cleanup did not is reported as such: the steps are not what failed.
@@ -205,7 +210,7 @@ export class E2eController {
         at: iso(record.finished),
         error: record.error,
         results: record.results.map((result) => ({ scenario: result.scenario, ok: result.ok, reason: result.reason, cleanup: result.cleanup,
-          cleanup_reason: result.cleanup_reason, cleanup_note: result.cleanup_note ?? null, failed_step: result.failed_step, at: iso(result.finished) })),
+          cleanup_reason: result.cleanup_reason, cleanup_note: result.cleanup_note ?? null, notes: result.notes ?? null, failed_step: result.failed_step, at: iso(result.finished) })),
       } : null,
     };
   }

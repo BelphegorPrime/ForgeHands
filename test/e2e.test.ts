@@ -199,10 +199,15 @@ class FakeLedger {
   runsOf(_, issue, label) {
     return this.runsStateOf(null, issue).filter((run) => (label === undefined || run.label === label) && (run.started !== undefined || ['running', 'done', 'failed'].includes(run.status))).length;
   }
+  revertRestartsOf(_, issue) {
+    this.onSync(this);
+    return this.jobs.filter((job) => job.issue === issue && job.revert && (job.started !== undefined || ['running', 'done', 'failed'].includes(job.status))).length;
+  }
   runsStateOf(_, issue) {
     this.onSync(this);
     return this.jobs.filter((job) => job.issue === issue).map((job) => ({ label: job.label, status: job.status, created: job.created,
-      ...(job.started === undefined ? {} : { started: job.started }), ...(job.finished === undefined ? {} : { finished: job.finished }), ahead: 0 }));
+      ...(job.started === undefined ? {} : { started: job.started }), ...(job.finished === undefined ? {} : { finished: job.finished }), ahead: 0,
+      why: job.why ?? 'first run' }));
   }
   async dropQueued(_, issue) {
     let dropped = 0;
@@ -980,6 +985,90 @@ test('the revert scenario counts its runs across the issue routes, not under one
   const revert = SCENARIOS.find((entry) => entry.name === 'revert-on-red');
   const predicates = revert.steps.filter((step) => step.do === 'wait' || step.do === 'assert').map((step) => step.for ?? step.that);
   const runs = predicates.filter((predicate) => 'runs' in predicate);
-  assert.equal(runs.length, 2, 'the restart wait and the exact-count assert');
-  for (const predicate of runs) assert.equal('label' in predicate, false, 'no label: ' + JSON.stringify(predicate));
+  // The restart is counted by its marker (revertRestarts), the hand-back escalation after it is not counted: no runs count is asserted.
+  const restarts = predicates.filter((predicate) => 'revertRestarts' in predicate);
+  assert.equal(restarts.length, 2, 'the restart wait and the exactly-one assert');
+  assert.equal(predicates.filter((predicate) => 'runs' in predicate).length, 0, 'no runs count: a hand-back escalation is allowed');
+  for (const predicate of restarts) assert.equal('label' in predicate, false, 'no label: ' + JSON.stringify(predicate));
+  assert.deepEqual(restarts.find((predicate) => 'exactly' in predicate), { revertRestarts: '$ticket', exactly: 1 });
+});
+
+// The revert scenario's last steps, on the fake port: the ticket has a first run, and the revert restart (its event carries the marker) comes
+// after it; `extra` are more runs of the ticket (the hand-back escalation, or a second restart).
+const revertSteps = [
+  ticketStep,
+  { do: 'wait', timeoutMinutes: 15, for: { revertRestarts: '$ticket', atLeast: 1 } },
+  { do: 'settle', seconds: 180 },
+  { do: 'assert', that: { revertRestarts: '$ticket', exactly: 1 }, message: 'the revert did not restart the ticket exactly once' },
+];
+function playRuns(forge, ledger, runsOf) {
+  // The dispatcher: the ticket's runs appear in the ledger once, as the ticket is created, and are done at once.
+  ledger.onSync = () => {
+    for (const issue of forge.issues.values()) {
+      if (issue.state !== 'open' || ledger.jobs.some((job) => job.issue === issue.number)) continue;
+      ledger.jobs.push(...runsOf(issue.number));
+    }
+  };
+}
+const firstRun = (issue) => ({ issue, label: 'ai:ready', status: 'done', created: 1, started: 2, finished: 3, why: 'first run' });
+const revertRestart = (issue, at) => ({ issue, label: 'ai:escalate', status: 'done', created: at, started: at + 1, finished: at + 2, revert: true, why: 'revert restart' });
+const handBack = (issue, at) => ({ issue, label: 'ai:escalate', status: 'done', created: at, started: at + 1, finished: at + 2, why: 'escalated after handback' });
+
+test('revert restart once, then a hand-back escalation: the scenario passes, and the notes list both runs', async () => {
+  const forge = new FakeForge();
+  const ledger = new FakeLedger();
+  playRuns(forge, ledger, (issue) => [firstRun(issue), revertRestart(issue, 4), handBack(issue, 7)]);
+  const result = await runScenario(scenario(revertSteps), runOptions(forge, { ledger, timeoutMs: 10 * 60000 }));
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.cleanup, 'ok', result.cleanup_reason);
+  assert.match(result.notes, /revert restart/);
+  assert.match(result.notes, /escalated after handback/);
+  assert.match(result.notes, /3 run\(s\)/);
+});
+
+test('two revert restarts: the scenario fails at its exactly-one assert, and the reason names the count', async () => {
+  const forge = new FakeForge();
+  const ledger = new FakeLedger();
+  playRuns(forge, ledger, (issue) => [firstRun(issue), revertRestart(issue, 4), revertRestart(issue, 7)]);
+  const result = await runScenario(scenario(revertSteps), runOptions(forge, { ledger, timeoutMs: 10 * 60000 }));
+  assert.equal(result.ok, false);
+  assert.equal(result.failed_step, 3);
+  assert.match(result.reason, /the revert did not restart the ticket exactly once: #\d+: revert restarts 2, wanted exactly 1/);
+});
+
+test('no revert restart at all: the wait for it times out with the last state, and the scenario fails', async () => {
+  const forge = new FakeForge();
+  const ledger = new FakeLedger();
+  playRuns(forge, ledger, (issue) => [firstRun(issue), handBack(issue, 7)]);
+  const result = await runScenario(scenario(revertSteps), runOptions(forge, { ledger, timeoutMs: 50, sleep: async () => {} }));
+  assert.equal(result.ok, false);
+  assert.equal(result.failed_step, 1);
+  assert.match(result.reason, /revert restarts 0, wanted at least 1/);
+});
+
+test('revertRestartsOf counts only started runs whose event carries the marker, under the issue routes; the notes name each run origin', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'e2e-revert-'));
+  try {
+    const jobs = new JobStore(join(dir, 'jobs.json'));
+    jobs.add({ key: 'owner/hello#7:ai:ready', label: 'ai:ready', event: {}, status: 'done', created: 1, started: 2, finished: 3 });
+    jobs.add({ key: 'owner/hello#7:ai:escalate', label: 'ai:escalate', event: { revert_retry: true }, status: 'done', created: 4, started: 5, finished: 6 });
+    jobs.add({ key: 'owner/hello#7:ai:escalate', label: 'ai:escalate', event: {}, status: 'queued', created: 8, escalated: true, escalated_after: 'handback' });
+    jobs.add({ key: 'owner/hello#8:ai:ready', label: 'ai:ready', event: { revert_retry: true }, status: 'running', created: 9, started: 10 });
+    jobs.add({ key: 'owner/hello#7:ai:review', label: 'ai:review', event: { revert_retry: true }, status: 'done', created: 11, started: 11 });
+    const routes = new Map([['ai:ready', { kind: 'issue' }], ['ai:escalate', { kind: 'issue' }], ['ai:review', { kind: 'pull_request' }]]);
+    const ledger = ledgerOf(jobs, routes, async () => 0);
+    assert.equal(ledger.revertRestartsOf('Owner/Hello', 7), 1, 'the restart run; the queued hand-back escalation and the review are not counted');
+    assert.equal(ledger.revertRestartsOf('owner/hello', 8), 1, 'another ticket has its own restarts');
+    assert.deepEqual(ledger.runsStateOf('owner/hello', 7).map((run) => run.why), ['first run', 'revert restart', 'escalated after handback']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the format accepts revertRestarts with atLeast or exactly, and refuses it without a count', () => {
+  const parsed = parseScenario({ name: 'ok', title: 't', description: 'd', steps: [{ do: 'ticket', as: 't', title: 'T', body: 'B', label: 'ai:ready' },
+    { do: 'assert', that: { revertRestarts: '$t', exactly: 1 } }] });
+  assert.deepEqual(parsed.steps[1].that, { revertRestarts: '$t', exactly: 1 });
+  assert.throws(() => parseScenario({ name: 'bad', title: 't', description: 'd', steps: [{ do: 'ticket', as: 't', title: 'T', body: 'B', label: 'ai:ready' },
+    { do: 'assert', that: { revertRestarts: '$t' } }] }), /revertRestarts needs atLeast or exactly/);
 });

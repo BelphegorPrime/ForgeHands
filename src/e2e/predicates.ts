@@ -120,6 +120,14 @@ export async function probe(predicate: Predicate, p: Probe): Promise<Verdict> {
     const status = await p.forge.commitStatus(p.repository, tip);
     return { ok: status.state === predicate.status, detail: 'tip of ' + name + ' is ' + status.state + ' (wanted ' + predicate.status + ')' };
   }
+  if ('revertRestarts' in predicate) {
+    const number = numberOf(predicate.revertRestarts, p.vars);
+    const restarts = p.ledger.revertRestartsOf(p.repository, number);
+    const problems: string[] = [];
+    if (predicate.exactly !== undefined && restarts !== predicate.exactly) problems.push('revert restarts ' + restarts + ', wanted exactly ' + predicate.exactly);
+    if (predicate.atLeast !== undefined && restarts < predicate.atLeast) problems.push('revert restarts ' + restarts + ', wanted at least ' + predicate.atLeast);
+    return problems.length ? { ok: false, detail: '#' + number + ': ' + problems.join('; ') } : { ok: true, detail: '#' + number + ': ' + restarts + ' revert restart(s)' };
+  }
   const number = numberOf(predicate.runs, p.vars);
   const runs = p.ledger.runsOf(p.repository, number, predicate.label);
   const where = '#' + number + (predicate.label ? ' ' + predicate.label : ' (all issue routes)');
@@ -135,6 +143,7 @@ export async function probe(predicate: Predicate, p: Probe): Promise<Verdict> {
  */
 export async function runTicketOf(predicate: Predicate, p: Probe): Promise<number | null> {
   if ('runs' in predicate) return numberOf(predicate.runs, p.vars);
+  if ('revertRestarts' in predicate) return numberOf(predicate.revertRestarts, p.vars);
   if (!('findPull' in predicate)) return null;
   const head = expand(predicate.findPull, p.vars);
   const issue = /^ai\/issue-(\d+)$/.exec(head);
