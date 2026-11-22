@@ -83,20 +83,20 @@ test("factory health lists the stalled, stuck and epic records that are still op
   assert.equal(factory.stalled_tickets.count, 1); // #2 is handed to the human; #5 is closed and left out
   assert.deepEqual(factory.stalled_tickets.actions, { restart: 1, human: 1 });
   assert.deepEqual(factory.stalled_tickets.list, [
-    { issue: repo + "#2", action: "human", restarts: 1, run: "run-b", since: new Date(NOW - 3 * HOUR).toISOString() },
-    { issue: repo + "#1", action: "restart", restarts: 1, run: "run-a", since: new Date(NOW - HOUR).toISOString() },
+    { issue: repo + "#2", issue_url: null, action: "human", restarts: 1, run: "run-b", since: new Date(NOW - 3 * HOUR).toISOString() },
+    { issue: repo + "#1", issue_url: null, action: "restart", restarts: 1, run: "run-a", since: new Date(NOW - HOUR).toISOString() },
   ]);
 
   assert.equal(factory.stuck_pull_requests.count, 1); // pr 11 is not blocked
   assert.deepEqual(factory.stuck_pull_requests.blocks, { stuck_verdict: 1 });
   assert.deepEqual(factory.stuck_pull_requests.list, [
-    { issue: repo + "#1", pr: 10, reason: "stuck_verdict", since: new Date(NOW - 2 * HOUR).toISOString() },
+    { issue: repo + "#1", issue_url: null, pr: 10, pr_url: null, reason: "stuck_verdict", since: new Date(NOW - 2 * HOUR).toISOString() },
   ]);
 
   assert.equal(factory.epic_gaps.count, 1);
   assert.deepEqual(factory.epic_gaps.actions, { replanned: 0, handed: 1 });
   assert.deepEqual(factory.epic_gaps.list, [
-    { issue: repo + "#9", action: "handed", replans: 1, reason: "The criteria of sub-issue 4 are missing", since: new Date(NOW - DAY).toISOString() },
+    { issue: repo + "#9", issue_url: null, action: "handed", replans: 1, reason: "The criteria of sub-issue 4 are missing", reason_links: {}, since: new Date(NOW - DAY).toISOString() },
   ]);
 });
 
@@ -108,7 +108,7 @@ test("merge decisions give the last refusal of each open ticket's pull request a
   const { factory } = buildStatus(loadConfig(env()), ledger(), NOW, undefined, [], null, { decisions });
 
   assert.deepEqual(factory.merge_decisions.open, [
-    { issue: repo + "#1", pr: 10, reason: "ci_not_green", at: new Date(NOW - HOUR).toISOString() },
+    { issue: repo + "#1", issue_url: null, pr: 10, pr_url: null, reason: "ci_not_green", at: new Date(NOW - HOUR).toISOString() },
   ]);
   assert.deepEqual(factory.merge_decisions.counts, { merged: 1, not_merged: { ci_not_green: 2 } });
 });
@@ -128,7 +128,7 @@ test("hand-backs, pre-flight results, advisory notes and deleted tickets are cou
   assert.equal(factory.handbacks.blocked, 0);
   assert.deepEqual(factory.preflight.results, { ok: 2, rejected: 0, advised: 1, skipped: 0 });
   assert.deepEqual(factory.preflight.rules.filter((entry) => entry.rule === "4"), [{ rule: "4", result: "advised", count: 1 }]);
-  assert.deepEqual(factory.preflight.notes, [{ issue: repo + "#2", notes: ["the Files list is empty"], at: new Date(NOW).toISOString() }]);
+  assert.deepEqual(factory.preflight.notes, [{ issue: repo + "#2", issue_url: null, notes: ["the Files list is empty"], notes_links: {}, at: new Date(NOW).toISOString() }]);
   assert.equal(factory.deleted_in_forge, 1);
   assert.equal(factory.revert_rate.alert_percent, null);
 });

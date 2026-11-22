@@ -507,3 +507,66 @@ test("ForgeHands notes merges, blocks and splits on the ticket; a human merge do
   const week = buildStatus(config, jobs, NOW).summary[repo].last_7_days;
   assert.deepEqual([week.merged, week.merged_without_human], [2, 1]); // #5 was blocked on the way
 });
+
+test("status.json gives the forge addresses of tickets, pull requests and the numbers in state lines (Forgejo and GitLab)", () => {
+  const forgejo = loadConfig(env({ FORGE_URL: "https://forge.example/", FORGE_TOKEN: "forge-token" }));
+  const gitlab = loadConfig(env({ FORGE: "gitlab", FORGE_URL: "https://gitlab.example/", FORGE_TOKEN: "glpat-token" }));
+  const jobs = new JobStore(join(dir, "addresses.json"));
+  jobs.add({
+    key: repo + "#7:ai:ready",
+    label: "ai:ready",
+    status: "waiting",
+    waiting_for: [54, 55],
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 7, title: "Ticket 7" } },
+  });
+  jobs.add({
+    key: repo + "#8:ai:ready",
+    label: "ai:ready",
+    status: "done",
+    delivered_on: 8,
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 8, title: "Ticket 8" }, pull_request: { number: 80 } },
+  });
+  jobs.stuck.set(repo + "#pr80", { repository: repo, issue: 8, number: 80, sha: "a".repeat(40), why: "stuck_verdict", blocked: true, eligible_at: NOW - HOUR, blocked_at: NOW - HOUR });
+
+  for (const [config, base, issues, pulls] of [
+    [forgejo, "https://forge.example/owner/hello", "/issues/", "/pulls/"],
+    [gitlab, "https://gitlab.example/owner/hello", "/-/issues/", "/-/merge_requests/"],
+  ]) {
+    const status = buildStatus(config, jobs, NOW, undefined, [{ repository: repo, issue: 7, pr: 70, since: NOW - HOUR, reason: "label" }]);
+    const ticket = status.issues.find((row) => row.issue === repo + "#7");
+    assert.equal(ticket.state, "waiting for #54, #55");
+    assert.deepEqual(ticket.state_links, { 54: base + issues + "54", 55: base + issues + "55" });
+    assert.equal(ticket.issue_url, base + issues + "7");
+    assert.equal(ticket.pr_url, null);
+
+    const waiting = status.waiting_for_human[0];
+    assert.equal(waiting.issue_url, base + issues + "7");
+    assert.equal(waiting.pr_url, base + pulls + "70");
+    assert.deepEqual(waiting.reason_links, {});
+
+    const stuck = status.factory.stuck_pull_requests.list[0];
+    assert.deepEqual([stuck.issue_url, stuck.pr_url], [base + issues + "8", base + pulls + "80"]);
+    assert.equal(status.factory.merge_decisions.open.length, 0);
+  }
+});
+
+test("without a forge the status gives no addresses, and a state keeps its plain numbers", () => {
+  const jobs = new JobStore(join(dir, "no-forge.json"));
+  jobs.add({
+    key: repo + "#7:ai:ready",
+    label: "ai:ready",
+    status: "waiting",
+    waiting_for: [54],
+    created: NOW,
+    event: { repository: { full_name: repo }, issue: { number: 7, title: "Ticket 7" } },
+  });
+  const status = buildStatus(loadConfig(env()), jobs, NOW, undefined, [{ repository: repo, issue: 7, pr: 70, since: NOW - HOUR, reason: "epic stays open after its review: #9 open" }]);
+  const ticket = status.issues[0];
+  assert.equal(ticket.state, "waiting for #54");
+  assert.equal(ticket.issue_url, null);
+  assert.deepEqual(ticket.state_links, {});
+  assert.equal(status.waiting_for_human[0].pr_url, null);
+  assert.equal(status.waiting_for_human[0].issue_url, null);
+});

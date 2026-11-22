@@ -4,6 +4,7 @@ import {
   ageText,
   countRows,
   isDeletedInForge,
+  linkParts,
   listedIssues,
   percent,
   reasonLabel,
@@ -87,4 +88,21 @@ test("a scenario reads as ok or failed with its cleanup", () => {
     scenarioText({ ok: false, reason: "merge_timeout", cleanup: "failed", cleanup_reason: "branch kept" }),
     "failed: merge timeout, cleanup failed: branch kept",
   );
+});
+
+test("a state line links its '#n' numbers that have a forge address and keeps the rest as text", () => {
+  const links = { "54": "https://forge.example/owner/hello/issues/54" };
+  assert.deepEqual(linkParts("waiting for #54, #55", links), [
+    { text: "waiting for " },
+    { text: "#54", href: "https://forge.example/owner/hello/issues/54" },
+    { text: ", " },
+    { text: "#55" },
+  ]);
+  assert.deepEqual(linkParts("delivered as a comment on #54"), [{ text: "delivered as a comment on " }, { text: "#54" }]);
+  assert.deepEqual(linkParts("idle"), [{ text: "idle" }]);
+  // Only whole numbers are references: "#5a" stays text, "#123" links.
+  assert.deepEqual(linkParts("#5a and #123", { "5": "x", "123": "y" }), [
+    { text: "#5a and " },
+    { text: "#123", href: "y" },
+  ]);
 });

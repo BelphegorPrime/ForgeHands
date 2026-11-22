@@ -36,6 +36,7 @@ import {
   FactoryHealth,
   WaitingForHuman,
 } from "./components/factory-health.tsx";
+import { LinkedText } from "./components/forge-link.tsx";
 import { listedIssues } from "./factory-view.ts";
 import { matchesFilter } from "./ticket-filter.ts";
 import type { IssueFilter } from "./ticket-filter.ts";
@@ -621,7 +622,7 @@ function App() {
                           </TableCell>
                           <TableCell>
                             <Badge variant={issueVariant(issue)}>
-                              {issue.state}
+                              <LinkedText text={issue.state} links={issue.state_links} />
                             </Badge>
                           </TableCell>
                           <TableCell>

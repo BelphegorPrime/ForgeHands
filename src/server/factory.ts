@@ -6,11 +6,14 @@ import type { DirectConfig, EpicGapRecord, StalledRecord, StuckRecord } from '..
 import type { JobStore } from '../store/jobs.ts';
 import type { TicketPreflight } from '../agent/preflight.ts';
 import { metrics } from '../metrics.ts';
+import { forgeItemUrl, issueLinksIn } from './forge-links.ts';
 
 // The part of a ticket row that the health section uses (see status.ts, Status.issues).
 export interface FactoryIssue {
   issue: string;
+  issue_url: string | null;
   pr: number | null;
+  pr_url: string | null;
   closed?: true;
   state: string;
   merge_decision?: { reason: string; at: string };
@@ -24,18 +27,18 @@ export interface Factory {
     // by action, from the counter: restart (started once more) or human (the human was called)
     actions: Record<string, number>;
     // open tickets the watchdog acted on; `action` is what it did last, `since` when
-    list: { issue: string; action: 'restart' | 'human'; restarts: number; run: string; since: string }[];
+    list: { issue: string; issue_url: string | null; action: 'restart' | 'human'; restarts: number; run: string; since: string }[];
   };
   stuck_pull_requests: {
     count: number;
     // blocks by reason since the start (stuck_rounds, stuck_verdict, ...)
     blocks: Record<string, number>;
     // blocked pull requests now; `reason` is the reason the watchdog blocked them for
-    list: { issue: string; pr: number; reason: string; since: string }[];
+    list: { issue: string; issue_url: string | null; pr: number; pr_url: string | null; reason: string; since: string }[];
   };
   merge_decisions: {
     // open pull requests of the tickets whose last decision was a refusal ('not merged: <reason>')
-    open: { issue: string; pr: number; reason: string; at: string }[];
+    open: { issue: string; issue_url: string | null; pr: number; pr_url: string | null; reason: string; at: string }[];
     // since the start: merges, and refusals by reason
     counts: { merged: number; not_merged: Record<string, number> };
   };
@@ -46,17 +49,18 @@ export interface Factory {
     results: Record<string, number>;
     rules: { rule: string; result: string; count: number }[];
     // advisory notes of the open tickets the pre-flight checked since the start
-    notes: { issue: string; notes: string[]; at: string }[];
+    // notes_links: the '#n' numbers the notes name, mapped to their issue addresses (see forge-links.ts)
+    notes: { issue: string; issue_url: string | null; notes: string[]; notes_links: Record<string, string>; at: string }[];
   };
   epic_gaps: {
     count: number;
     // since the start, by action: replanned (back to the planner) or handed (the human was called)
     actions: Record<string, number>;
-    list: { issue: string; action: 'replanned' | 'handed'; replans: number; reason: string; since: string }[];
+    list: { issue: string; issue_url: string | null; action: 'replanned' | 'handed'; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
   };
   deleted_in_forge: number;
   // Tickets labelled OPERATOR_LABEL that wait for a person (see agent/operator.ts): open ones, with their titles, oldest first.
-  operator_tickets: { count: number; list: { issue: string; title: string; since: string }[] };
+  operator_tickets: { count: number; list: { issue: string; issue_url: string | null; title: string; since: string }[] };
   revert_rate: { alert_percent: number | null };
 }
 
@@ -78,18 +82,20 @@ const iso = (at: number): string => new Date(at).toISOString();
 
 export function buildFactory(config: DirectConfig, jobs: JobStore, issues: FactoryIssue[], closed: Set<string>, preflight: TicketPreflight | null): Factory {
   const open = (repository: string, number: number): boolean => !closed.has(repository.toLowerCase() + '#' + number);
+  const issueUrl = (cfg: DirectConfig, repository: string, number: number): string | null => forgeItemUrl(cfg, repository, 'issue', number);
+  const keyUrl = (cfg: DirectConfig, key: string): string | null => issueUrl(cfg, repositoryOf(key), issueNumberOf(key));
 
   // Stalled tickets: the records the watchdog keeps until the ticket is closed or the human takes its label off.
   const stalled = [...jobs.stalled.values()].filter((record: StalledRecord) => open(record.repository, record.issue));
   const stalledList = stalled
-    .map((record) => ({ issue: record.repository + '#' + record.issue, action: (record.human ? 'human' : 'restart') as 'restart' | 'human', restarts: record.restarts, run: record.run, since: iso(record.at), at: record.at }))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: issueUrl(config, record.repository, record.issue), action: (record.human ? 'human' : 'restart') as 'restart' | 'human', restarts: record.restarts, run: record.run, since: iso(record.at), at: record.at }))
     .sort((a, b) => ascending(a.at, b.at))
     .map(({ at: _at, ...entry }) => entry);
 
   // Stuck pull requests: the blocked ones (the gauge counts the same).
   const stuck = [...jobs.stuck.values()].filter((record: StuckRecord) => record.blocked && record.issue > 0);
   const stuckList = stuck
-    .map((record) => ({ issue: record.repository + '#' + record.issue, pr: record.number, reason: record.why, since: iso(record.blocked_at ?? record.eligible_at), at: record.blocked_at ?? record.eligible_at }))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: issueUrl(config, record.repository, record.issue), pr: record.number, pr_url: forgeItemUrl(config, record.repository, 'pr', record.number), reason: record.why, since: iso(record.blocked_at ?? record.eligible_at), at: record.blocked_at ?? record.eligible_at }))
     .sort((a, b) => ascending(a.at, b.at))
     .map(({ at: _at, ...entry }) => entry);
 
@@ -106,14 +112,14 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
   // The epics the review found open (EPIC_GAP_REPLAN), per epic, kept until the epic closes.
   const gaps = [...jobs.epicGaps.values()].filter((record: EpicGapRecord) => open(record.repository, record.issue));
   const gapList = gaps
-    .map((record) => ({ issue: record.repository + '#' + record.issue, action: (record.human ? 'handed' : 'replanned') as 'replanned' | 'handed', replans: record.replans, reason: record.reason, since: iso(record.at), at: record.at }))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: issueUrl(config, record.repository, record.issue), action: (record.human ? 'handed' : 'replanned') as 'replanned' | 'handed', replans: record.replans, reason: record.reason, reason_links: issueLinksIn(config, record.repository, record.reason), since: iso(record.at), at: record.at }))
     .sort((a, b) => ascending(a.at, b.at))
     .map(({ at: _at, ...entry }) => entry);
 
   // Advisory notes of the tickets the pre-flight checked: only open tickets, and only while the ticket is still in the ledger's list.
   const notes = [...(preflight?.advisories ?? new Map<string, { notes: string[]; at: number }>())]
     .filter(([name]) => !closed.has(name))
-    .map(([name, entry]) => ({ issue: name, notes: entry.notes, at: iso(entry.at), order: entry.at }))
+    .map(([name, entry]) => ({ issue: name, issue_url: keyUrl(config, name), notes: entry.notes, notes_links: issueLinksIn(config, repositoryOf(name), entry.notes.join(' ')), at: iso(entry.at), order: entry.at }))
     .sort((a, b) => ascending(b.order, a.order))
     .map(({ order: _order, ...entry }) => entry);
 
@@ -129,17 +135,17 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
     preflight: { results: byLabel('forgehands_preflight_total', 'result', RESULTS), rules, notes },
     epic_gaps: { count: gapList.length, actions: byLabel('forgehands_epic_gaps_total', 'action', ['replanned', 'handed']), list: gapList },
     deleted_in_forge: issues.filter((issue) => !issue.closed && issue.state === 'deleted in the forge').length,
-    operator_tickets: operatorTickets(jobs, closed),
+    operator_tickets: operatorTickets(config, jobs, closed),
     revert_rate: { alert_percent: config.revertRateAlert > 0 ? config.revertRateAlert : null }
   };
 }
 
 // The operator tickets ForgeHands has seen and that are not closed yet (the ledger drops one when it is closed), oldest first.
-function operatorTickets(jobs: JobStore, closed: Set<string>): Factory['operator_tickets'] {
+function operatorTickets(config: DirectConfig, jobs: JobStore, closed: Set<string>): Factory['operator_tickets'] {
   const list = [...jobs.operatorTickets.values()]
     .filter((record) => !closed.has(record.repository.toLowerCase() + '#' + record.issue))
     .sort((a, b) => ascending(a.at, b.at))
-    .map((record) => ({ issue: record.repository + '#' + record.issue, title: record.title, since: iso(record.at) }));
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: forgeItemUrl(config, record.repository, 'issue', record.issue), title: record.title, since: iso(record.at) }));
   return { count: list.length, list };
 }
 
@@ -147,6 +153,10 @@ function operatorTickets(jobs: JobStore, closed: Set<string>): Factory['operator
 function openDecisions(issues: FactoryIssue[]): Factory['merge_decisions']['open'] {
   return issues
     .filter((issue) => !issue.closed && issue.pr !== null && issue.merge_decision)
-    .map((issue) => ({ issue: issue.issue, pr: issue.pr as number, reason: issue.merge_decision!.reason, at: issue.merge_decision!.at }))
+    .map((issue) => ({ issue: issue.issue, issue_url: issue.issue_url, pr: issue.pr as number, pr_url: issue.pr_url, reason: issue.merge_decision!.reason, at: issue.merge_decision!.at }))
     .sort((a, b) => b.at.localeCompare(a.at));
 }
+
+// The repository and the number of a ticket key (repo#n, or repo#n:label, repo#n!pr...).
+const repositoryOf = (key: string): string => key.split(/[#!]/)[0] as string;
+const issueNumberOf = (key: string): number => Number(key.split(/[#!:]/)[1] ?? 0);
