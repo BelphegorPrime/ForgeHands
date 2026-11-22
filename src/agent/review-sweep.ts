@@ -5,7 +5,7 @@ import { metrics } from '../metrics.ts';
 import { holdKey } from './merge.ts';
 import type { Merger } from './merge.ts';
 import type { Forge } from '../types/forge.ts';
-import type { DirectConfig, ForgeEvent, Json, Job, Logger } from '../types.ts';
+import type { DirectConfig, ForgeEvent, Json, Job, Logger, StalledRecord } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 
 const FIRST_PASS_MS = 90000;
@@ -60,6 +60,7 @@ export class ReviewSweep {
   hooks: StuckHooks;
   running: Promise<number> | null = null;
   cooldown = new Map<string, number>(); // repository#pr@sha -> until when it is not tried again
+  stallCursor = new Map<string, number>(); // repository -> where the next ticket watchdog pass starts its reads (see watchStalled)
   approvalCooldown = new Map<string, number>(); // repository#pr@sha -> until when the approval is not handed to the merger again
   timer: NodeJS.Timeout | undefined;
   firstTimer: NodeJS.Timeout | undefined;
@@ -273,8 +274,10 @@ export class ReviewSweep {
       runs.set(number, [...(runs.get(number) ?? []), job]);
     }
     const numbers = new Set([...runs.keys(), ...[...this.jobs.stalled.values()].filter((record) => record.repository.toLowerCase() === name).map((record) => record.issue)]);
-    let reads = 0;
     let acted = 0;
+    let dirty = false;
+    // The cheap decisions come first (no forge read): what still needs a read is a candidate, and the candidates are read oldest finished run first.
+    const candidates: { number: number; key: string; record: StalledRecord | undefined; own: Job[]; last: Job }[] = [];
     for (const number of [...numbers].sort((a, b) => a - b)) {
       const key = name + '#' + number;
       const record = this.jobs.stalled.get(key);
@@ -287,16 +290,39 @@ export class ReviewSweep {
       if (agent.has(number)) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
       const last = own.reduce<Job | null>((newest, job) => (!newest || endOf(job) > endOf(newest) ? job : newest), null);
       if (!last || (last.status !== 'done' && last.status !== 'failed')) { if (!last && record) this.jobs.stalled.delete(key); continue; }
+      // The ledger knows the ticket as closed (every job marked archived_view, see JobStore.markClosed) or deleted in the forge: it is not read at all.
+      if (own.every((job) => job.archived_view) || this.jobs.isDeletedInForge(key)) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
+      // Without a record only a restart can come of a read, and a run that ended less than the stall time ago is not stalled yet.
+      if (!record && now - endOf(last) < minutes * MINUTE_MS) continue;
+      candidates.push({ number, key, record, own, last });
+    }
+    // A pass reads at most STALL_MAX_READS open tickets. The pass starts where the last one stopped (a cursor per repository), so that every
+    // candidate is reached within a bounded number of passes, however many there are.
+    candidates.sort((a, b) => endOf(a.last) - endOf(b.last));
+    const start = candidates.length ? (this.stallCursor.get(name) ?? 0) % candidates.length : 0;
+    const order = [...candidates.slice(start), ...candidates.slice(0, start)];
+    let reads = 0;
+    let visited = 0;
+    for (const { number, key, record, own, last } of order) {
       if (reads >= STALL_MAX_READS) break;
-      reads += 1;
-      let issue: Json;
+      visited += 1;
+      let issue: Json | null;
       try {
         issue = await this.forge.getIssue(repository, number);
       } catch (error) {
+        reads += 1;
         this.logger.error('ticket watchdog: could not read ' + repository + '#' + number + ':', error.message);
         continue;
       }
-      if (!issue || issue.state !== 'open') { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
+      if (!issue || issue.state !== 'open') {
+        // Closed in the forge: the ledger marks the jobs of the ticket closed, so no later pass reads it again. A closed read does not use up the
+        // reads of the pass (it happens once per ticket).
+        if (issue?.state === 'closed' && this.jobs.markClosed(own[0].key.split(':')[0])) dirty = true;
+        else reads += 1;
+        if (record) { this.jobs.stalled.delete(key); acted += 1; }
+        continue;
+      }
+      reads += 1;
       const labels: string[] = (issue.labels || []).map((label: Json) => label?.name);
       if (labels.some((label) => this.config.epicLabels.has(label) || label === this.config.splitLabel)) continue; // epics and planner tickets: the epic-gap path
       // The human took BLOCKED_LABEL off: the record goes, and the ticket is looked at afresh.
@@ -330,7 +356,8 @@ export class ReviewSweep {
       acted += 1;
       await this.hooks.block(this.ticketEvent(last.event), this.stalledText(number, minutes, 'the run started once more ended the same way'), 'stalled_ticket');
     }
-    if (acted) {
+    if (candidates.length) this.stallCursor.set(name, (start + visited) % candidates.length);
+    if (acted || dirty) {
       try { await this.jobs.persist(now); }
       catch (error) { this.logger.error('ticket watchdog: could not save the ledger:', error.message); }
     }
