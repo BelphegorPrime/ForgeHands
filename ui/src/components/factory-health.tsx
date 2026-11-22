@@ -13,9 +13,11 @@ import {
 import type { ReactNode } from "react";
 import { Badge } from "./ui/badge.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card.tsx";
+import { ForgeLink, LinkedText } from "./forge-link.tsx";
 import {
   ageText,
   countRows,
+  operatorRows,
   percent,
   reasonLabel,
   revertRows,
@@ -107,7 +109,9 @@ function StalledCard({ status }: { status: DashboardStatus }) {
         <ul className="health-list">
           {stalled.list.map((entry) => (
             <li key={entry.issue + entry.run}>
-              <strong>{entry.issue}</strong>{" "}
+              <strong>
+                <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+              </strong>{" "}
               <Badge variant={entry.action === "human" ? "danger" : "warning"}>
                 {entry.action === "human" ? "handed to human" : "restarted"}
               </Badge>
@@ -146,7 +150,10 @@ function StuckCard({ status }: { status: DashboardStatus }) {
         <ul className="health-list">
           {stuck.list.map((entry) => (
             <li key={entry.issue + "#" + entry.pr}>
-              <strong>{entry.issue}</strong> <span className="pr-tag">PR #{entry.pr}</span>{" "}
+              <strong>
+                <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+              </strong>{" "}
+              <ForgeLink href={entry.pr_url} className="pr-tag">PR #{entry.pr}</ForgeLink>{" "}
               <Badge variant="danger">{reasonLabel(entry.reason)}</Badge>
               <span className="table-muted"> blocked {ageText(entry.since, status.generated)}</span>
             </li>
@@ -180,7 +187,10 @@ function MergeCard({ status }: { status: DashboardStatus }) {
         <ul className="health-list">
           {decisions.open.map((entry) => (
             <li key={entry.issue + "#" + entry.pr}>
-              <strong>{entry.issue}</strong> <span className="pr-tag">PR #{entry.pr}</span>{" "}
+              <strong>
+                <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+              </strong>{" "}
+              <ForgeLink href={entry.pr_url} className="pr-tag">PR #{entry.pr}</ForgeLink>{" "}
               <Badge variant="warning">not merged: {entry.reason}</Badge>
               <span className="table-muted"> {shortDate(entry.at)}</span>
             </li>
@@ -298,10 +308,14 @@ function PreflightCard({ status }: { status: DashboardStatus }) {
         <ul className="health-list">
           {preflight.notes.map((entry) => (
             <li key={entry.issue}>
-              <strong>{entry.issue}</strong>
+              <strong>
+                <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+              </strong>
               <ul className="health-notes">
                 {entry.notes.map((note, index) => (
-                  <li key={index}>{note}</li>
+                  <li key={index}>
+                    <LinkedText text={note} links={entry.notes_links} />
+                  </li>
                 ))}
               </ul>
             </li>
@@ -337,7 +351,9 @@ function EpicCard({ status }: { status: DashboardStatus }) {
         <ul className="health-list">
           {gaps.list.map((entry) => (
             <li key={entry.issue}>
-              <strong>{entry.issue}</strong>{" "}
+              <strong>
+                <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+              </strong>{" "}
               <Badge variant={entry.action === "handed" ? "danger" : "warning"}>
                 {entry.action === "handed" ? "handed to human" : "replanned"}
               </Badge>
@@ -345,7 +361,11 @@ function EpicCard({ status }: { status: DashboardStatus }) {
                 {" "}
                 {ageText(entry.since, status.generated)}, replans {entry.replans}
               </span>
-              {entry.reason && <p className="health-note">{entry.reason}</p>}
+              {entry.reason && (
+                <p className="health-note">
+                  <LinkedText text={entry.reason} links={entry.reason_links} />
+                </p>
+              )}
             </li>
           ))}
         </ul>
@@ -431,6 +451,49 @@ function CountList({
   );
 }
 
+// The operator prerequisites: tickets labelled for the operator, that wait for a person. Shown right under "Waiting for a human".
+export function OperatorCard({ status }: { status: DashboardStatus }) {
+  const { operator_tickets: operator } = status.factory;
+  const rows = operatorRows(operator.list, status.generated);
+  return (
+    <Card className="panel waiting-panel" id="waiting-operator">
+      <CardHeader className="panel-header">
+        <div>
+          <CardTitle>Waiting for you: operator prerequisites</CardTitle>
+          <p className="panel-subtitle">
+            {rows.length ? "Oldest first" : "Nothing waits for you"}
+          </p>
+        </div>
+        <span className="panel-icon warm">
+          <UserRound size={17} />
+        </span>
+      </CardHeader>
+      <CardContent className="health-body">
+        <p className="health-count">
+          <strong>{operator.count}</strong>
+          <span>open</span>
+        </p>
+        {rows.length ? (
+          <ul className="health-list waiting-list">
+            {rows.map((row) => (
+              <li key={row.key}>
+                <ForgeLink href={row.href}>
+                  #{row.number} {row.title || "Untitled ticket"}
+                </ForgeLink>{" "}
+                <span className="table-muted">
+                  {row.repository} · open {row.age}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <None text="None" />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // The waiting list, first on the page: the reasons are shown as words, unknown ones too.
 export function WaitingForHuman({ status }: { status: DashboardStatus }) {
   const entries = status.waiting_for_human;
@@ -455,10 +518,16 @@ export function WaitingForHuman({ status }: { status: DashboardStatus }) {
             {entries.map((entry) => (
               <li key={entry.repository + "#" + entry.issue + "#" + entry.reason}>
                 <strong>
-                  {entry.repository}
-                  {entry.pr ? " PR #" + entry.pr : " #" + entry.issue}
+                  {entry.repository}{" "}
+                  {entry.pr ? (
+                    <ForgeLink href={entry.pr_url}>PR #{entry.pr}</ForgeLink>
+                  ) : (
+                    <ForgeLink href={entry.issue_url}>#{entry.issue}</ForgeLink>
+                  )}
                 </strong>{" "}
-                <Badge variant="warning">{reasonLabel(entry.reason)}</Badge>
+                <Badge variant="warning">
+                  <LinkedText text={reasonLabel(entry.reason)} links={entry.reason_links} />
+                </Badge>
                 <span className="table-muted"> since {entry.since}</span>
               </li>
             ))}

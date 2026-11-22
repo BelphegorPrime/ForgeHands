@@ -172,7 +172,7 @@ test('/status shows what waits for a human since when', async () => {
   comments[101] = [comment('@marcel ForgeHands: handed over', clock - 4 * DAY)];
   await dispatcher.tick();
   const status = buildStatus(config, jobs, clock, undefined, [...dispatcher.reminder.waiting.values()]);
-  assert.deepEqual(status.waiting_for_human, [{ repository: repo, issue: 1, pr: 101, since: '2026-11-12', reason: 'it is marked ai:blocked' }]);
+  assert.deepEqual(status.waiting_for_human, [{ repository: repo, issue: 1, pr: 101, since: '2026-11-12', reason: 'it is marked ai:blocked', issue_url: 'https://forge.example/owner/hello/issues/1', pr_url: 'https://forge.example/owner/hello/pulls/101', reason_links: {} }]);
   assert.match(renderStatus(status), /waiting for a human since 2026-11-12/);
 });
 

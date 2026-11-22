@@ -51,6 +51,8 @@ export interface Issue {
   pr_url: string | null;
   rounds: number;
   state: string;
+  /** The '#n' numbers of the state line mapped to their issue addresses (same repository). */
+  state_links?: Record<string, string>;
   /** The blocked pull requests (their issue numbers) this ticket waits behind, directly or through other tickets. */
   blocked_by_stuck?: number[];
   blocked_by_epic_gaps?: number[];
@@ -66,29 +68,30 @@ export interface FactoryStatus {
   stalled_tickets: {
     count: number;
     actions: Record<string, number>;
-    list: { issue: string; action: "restart" | "human"; restarts: number; run: string; since: string }[];
+    list: { issue: string; issue_url: string | null; action: "restart" | "human"; restarts: number; run: string; since: string }[];
   };
   stuck_pull_requests: {
     count: number;
     blocks: Record<string, number>;
-    list: { issue: string; pr: number; reason: string; since: string }[];
+    list: { issue: string; issue_url: string | null; pr: number; pr_url: string | null; reason: string; since: string }[];
   };
   merge_decisions: {
-    open: { issue: string; pr: number; reason: string; at: string }[];
+    open: { issue: string; issue_url: string | null; pr: number; pr_url: string | null; reason: string; at: string }[];
     counts: { merged: number; not_merged: Record<string, number> };
   };
   handbacks: Record<string, number>;
   preflight: {
     results: Record<string, number>;
     rules: { rule: string; result: string; count: number }[];
-    notes: { issue: string; notes: string[]; at: string }[];
+    notes: { issue: string; issue_url: string | null; notes: string[]; notes_links: Record<string, string>; at: string }[];
   };
   epic_gaps: {
     count: number;
     actions: Record<string, number>;
-    list: { issue: string; action: "replanned" | "handed"; replans: number; reason: string; since: string }[];
+    list: { issue: string; issue_url: string | null; action: "replanned" | "handed"; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
   };
   deleted_in_forge: number;
+  operator_tickets: { count: number; list: { issue: string; issue_url: string | null; title: string; since: string }[] };
   revert_rate: { alert_percent: number | null };
 }
 
@@ -143,9 +146,12 @@ export interface DashboardStatus {
   waiting_for_human: {
     repository: string;
     issue: number;
+    issue_url: string | null;
     pr: number | null;
+    pr_url: string | null;
     since: string;
     reason: string;
+    reason_links: Record<string, string>;
   }[];
   factory: FactoryStatus;
   e2e: E2eStatus | null;

@@ -34,8 +34,10 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs.tsx";
 import {
   FactoryHealth,
+  OperatorCard,
   WaitingForHuman,
 } from "./components/factory-health.tsx";
+import { LinkedText } from "./components/forge-link.tsx";
 import { listedIssues } from "./factory-view.ts";
 import { matchesFilter } from "./ticket-filter.ts";
 import type { IssueFilter } from "./ticket-filter.ts";
@@ -351,6 +353,7 @@ function App() {
           )}
 
           {status && <WaitingForHuman status={status} />}
+          {status && <OperatorCard status={status} />}
 
           <section className="metric-grid" aria-label="Summary metrics">
             <Metric
@@ -621,7 +624,7 @@ function App() {
                           </TableCell>
                           <TableCell>
                             <Badge variant={issueVariant(issue)}>
-                              {issue.state}
+                              <LinkedText text={issue.state} links={issue.state_links} />
                             </Badge>
                           </TableCell>
                           <TableCell>

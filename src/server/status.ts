@@ -13,6 +13,7 @@ import type { EpicGapRecord, MergeRecord } from '../types.ts';
 import type { TicketPreflight } from '../agent/preflight.ts';
 import { buildFactory } from './factory.ts';
 import type { Factory } from './factory.ts';
+import { forgeItemUrl, issueLinksIn } from './forge-links.ts';
 
 interface Run {
   label: string; kind: string; status: string; result: string | undefined; conversation: string | null; pr: number | null;
@@ -45,11 +46,13 @@ export interface Status {
   // blocked_by_stuck: the issues of the blocked pull requests this ticket waits behind (directly or through other tickets); state says so too.
   // blocked_by_epic_gaps: the same for the epics the epic review found open (see epic-gaps.ts).
   // merge_decision: on an open pull request, the last decision of the merger on it (why an approved pull request waits; see Merger.report).
-  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; blocked_by_stuck: number[]; blocked_by_epic_gaps: number[]; merge_decision?: { reason: string; at: string }; closed?: true; runs: Omit<Run, 'created'>[] }[];
+  // state_links: the '#n' numbers of the state line mapped to their issue addresses (the same repository); the dashboard links them.
+  issues: { issue: string; issue_url: string | null; title: string; pr: number | null; pr_url: string | null; rounds: number; state: string; state_links: Record<string, string>; blocked_by_stuck: number[]; blocked_by_epic_gaps: number[]; merge_decision?: { reason: string; at: string }; closed?: true; runs: Omit<Run, 'created'>[] }[];
   // Closed tickets left out of `issues` because their last activity is older than STATUS_HIDE_DAYS (?all=1 shows them). Counters are not affected.
   hidden: number;
   // Pull requests that wait for the human (REMIND_AFTER_DAYS), as the last daily look found them; epics the review found open wait too (pr: null).
-  waiting_for_human: { repository: string; issue: number; pr: number | null; since: string; reason: string; title?: string }[];
+  // issue_url / pr_url: the forge addresses of the ticket and its pull request (null without a forge); reason_links: as state_links.
+  waiting_for_human: { repository: string; issue: number; issue_url: string | null; pr: number | null; pr_url: string | null; since: string; reason: string; reason_links: Record<string, string>; title?: string }[];
   // The workspace cleanup (WORKSPACE_CLEANUP_DIR): the last pass, what it cleaned, the disk usage and a hold; null when it is off.
   workspace: WorkspaceState | null;
   // Only while work waits and nothing could start (the last dispatch pass): since when, what holds it back, and the tiers of the quota holds.
@@ -72,13 +75,14 @@ function webUrl(value: unknown): string | null {
   }
 }
 
-function forgeItemUrl(config: DirectConfig, repository: string, type: 'issue' | 'pr', number: number): string | null {
-  if (!config.forgejo) return null;
-  const path = repository.split('/').map(encodeURIComponent).join('/');
-  const suffix = config.forge === 'gitlab'
-    ? type === 'issue' ? '/-/issues/' : '/-/merge_requests/'
-    : type === 'issue' ? '/issues/' : '/pulls/';
-  return config.forgejo.url.replace(/\/$/, '') + '/' + path + suffix + number;
+// One row of `waiting_for_human` with the forge addresses of its ticket and pull request, and the '#n' numbers of its reason.
+function waitingRow(config: DirectConfig, row: { repository: string; issue: number; pr: number | null; since: string; reason: string; title?: string }) {
+  return {
+    ...row,
+    issue_url: forgeItemUrl(config, row.repository, 'issue', row.issue),
+    pr_url: row.pr ? forgeItemUrl(config, row.repository, 'pr', row.pr) : null,
+    reason_links: issueLinksIn(config, row.repository, row.reason)
+  };
 }
 
 // Nearest rank percentile of a sorted list; null for an empty one.
@@ -288,7 +292,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       title: entry.title,
       pr,
       pr_url: entry.prUrl || (pr ? forgeItemUrl(config, entry.key.split(/[#!]/)[0], 'pr', pr) : null),
-      rounds, state, blocked_by_stuck: chain, blocked_by_epic_gaps: gaps,
+      rounds, state, state_links: issueLinksIn(config, entry.key.split(/[#!]/)[0] as string, state), blocked_by_stuck: chain, blocked_by_epic_gaps: gaps,
       ...(decision ? { merge_decision: { reason: decision.reason, at: new Date(decision.at).toISOString() } } : {}),
       ...(closed.has(entry.key) ? { closed: true as const } : {}),
       runs: entry.runs.map(({ created: _created, ...run }) => run),
@@ -318,11 +322,11 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier], tokens: tokensWeek[repo]?.[tier] || emptyTokens() }])) }])),
     issues,
     hidden,
-    waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => ({ repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason, ...(entry.title ? { title: entry.title } : {}) })),
+    waiting_for_human: [...waiting.filter((entry) => !closed.has(entry.repository.toLowerCase() + '#' + entry.issue)).map((entry) => waitingRow(config, { repository: entry.repository, issue: entry.issue, pr: entry.pr, since: new Date(entry.since).toISOString().slice(0, 10), reason: entry.reason, ...(entry.title ? { title: entry.title } : {}) })),
       ...[...jobs.stalled.values()].filter((record) => record.human && !closed.has(record.repository.toLowerCase() + '#' + record.issue))
-        .map((record) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'stalled_ticket' })),
+        .map((record) => waitingRow(config, { repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'stalled_ticket' })),
       ...[...jobs.epicGaps.values()].filter((record: EpicGapRecord) => record.human && !closed.has(record.repository + '#' + record.issue))
-        .map((record: EpicGapRecord) => ({ repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'epic stays open after its review: ' + record.reason }))],
+        .map((record: EpicGapRecord) => waitingRow(config, { repository: record.repository, issue: record.issue, pr: null, since: new Date(record.at).toISOString().slice(0, 10), reason: 'epic stays open after its review: ' + record.reason }))],
     workspace,
     factory: buildFactory(config, jobs, issues, closed, options.preflight ?? null),
     ...(options.idle ? { idle: { since: new Date(options.idle.since).toISOString(), reasons: options.idle.reasons, quota_tiers: options.idle.tiers, cycles: options.idle.cycles } } : {})
@@ -381,16 +385,27 @@ function renderWorkspace(status: Status): string {
     + escape(disk) + (w.hold ? '. <strong>' + escape(w.hold) + ': no new run starts</strong>' : '') + '.</p>';
 }
 
+// A link to a forge item (same window and rel as the dashboard's), or the escaped text without an address.
+const linkTo = (url: string | null | undefined, text: string): string => url
+  ? '<a href="' + escape(url) + '" target="_blank" rel="noopener noreferrer">' + escape(text) + '</a>'
+  : escape(text);
+
+// Escaped text whose '#n' numbers become links when `links` has their address (keyed by the number, see forge-links.ts).
+const linkedText = (text: string, links: Record<string, string> = {}): string => text.split(/(#\d+\b)/).map((part) => {
+  const match = /^#(\d+)$/.exec(part);
+  return match && links[match[1] as string] ? linkTo(links[match[1] as string], part) : escape(part);
+}).join('');
+
 export function renderStatus(status: Status): string {
-  const line = (issue: Status['issues'][number]) => '<tr><td>' + escape(issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? '#' + issue.pr : '') + '</td><td>'
-    + escape(issue.state) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
+  const line = (issue: Status['issues'][number]) => '<tr><td>' + linkTo(issue.issue_url, issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? linkTo(issue.pr_url, '#' + issue.pr) : '') + '</td><td>'
+    + linkedText(issue.state, issue.state_links) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
   const head = '<table><tr><th>Issue</th><th>Title</th><th>PR</th><th>State</th><th>Rounds</th><th>Runs</th></tr>\n';
   const closedIssues = status.issues.filter((issue) => issue.closed);
   const closedSection = closedIssues.length ? '<details><summary>Closed (' + closedIssues.length + ')</summary>' + head + closedIssues.map(line).join('\n') + '</table></details>' : '';
   const rows = status.issues.filter((issue) => !issue.closed).map(line).join('\n');
   const hiddenNote = status.hidden ? '<p><a href="?all=1">' + status.hidden + ' older closed ticket(s) hidden: show all</a></p>' : '';
-  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + (entry.pr ? ' #' + entry.pr : '')
-    + ' (issue #' + entry.issue + '): waiting for a human since ' + escape(entry.since) + ', ' + escape(entry.reason) + '</li>').join('') + '</ul>' : '';
+  const waiting = status.waiting_for_human.length ? '<h2>Waiting for a human</h2><ul>' + status.waiting_for_human.map((entry) => '<li>' + escape(entry.repository) + (entry.pr ? ' ' + linkTo(entry.pr_url, '#' + entry.pr) : '')
+    + ' (' + linkTo(entry.issue_url, 'issue #' + entry.issue) + '): waiting for a human since ' + escape(entry.since) + ', ' + linkedText(entry.reason, entry.reason_links) + '</li>').join('') + '</ul>' : '';
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
