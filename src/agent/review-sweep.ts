@@ -279,6 +279,9 @@ export class ReviewSweep {
       const key = name + '#' + number;
       const record = this.jobs.stalled.get(key);
       const own = runs.get(number) ?? [];
+      // A ticket that waits for an open operator ticket (OPERATOR_LABEL, see agent/operator.ts) is not stalled: a person has to do the operator's
+      // part first, and the ticket starts when that is closed. Its record, if any, goes.
+      if (own.some((job) => (job.waiting_for ?? []).some((waited) => this.jobs.operatorTickets.has(name + '#' + waited)))) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
       // A run that waits, is queued or runs: the ticket moves on (its record, if any, stays).
       if (own.some((job) => ACTIVE.has(job.status))) continue;
       if (agent.has(number)) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }

@@ -123,6 +123,8 @@ export interface DirectConfig extends BaseConfig {
   /** API access (FORGE_URL and FORGE_TOKEN, or FORGEJO_URL and FORGEJO_TOKEN); the field keeps its first name. */
   forgejo: ForgejoAccess | null;
   blockedLabel: string;
+  /** OPERATOR_LABEL: a ticket with this label is work for an operator; no run starts on it (see agent/operator.ts). */
+  operatorLabel: string;
   updateBranches: boolean;
   /** REVIEW_WITHOUT_CI: a pull request in a repository without any workflow file is reviewed without waiting for a green CI run. */
   reviewWithoutCi: boolean;
@@ -385,6 +387,15 @@ export interface Hold {
 /** An epic (EPIC_LABEL) that the epic review found still open, kept in the ledger per epic ("repo#n", lower case) until it is closed (see epic-gaps.ts).
  * `sha` is the default branch's head the last decision was taken at; `replans` counts the times the epic went back to the planner (EPIC_GAP_REPLAN);
  * `human` is true once the human was called (at `sha`), so the epic waits for him. `reason` is the first lines of the reviewer's comment. */
+/** A ticket labelled OPERATOR_LABEL that ForgeHands has seen ("repo#n", lower case), kept until it is closed (see agent/operator.ts). `at` is when it was
+ * first seen: the human is told once, and /status lists the ticket until it is closed. `title` is the ticket's title as the forge had it. */
+export interface OperatorRecord {
+  repository: string;
+  issue: number;
+  title: string;
+  at: number;
+}
+
 export interface EpicGapRecord {
   repository: string;
   issue: number;

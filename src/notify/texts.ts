@@ -59,6 +59,8 @@ const T = {
     handoverDone: (security: Security) => 'Reviewed, CI green. Security review: ' + { ok: 'no concerns', concerns: 'CONCERNS, read it before you merge', none: 'none' }[security] + '.',
     handoverWhy: (reason: string) => 'Why you: ' + reason,
     epicSubject: 'stays open after the epic review',
+    operatorSubject: 'needs an operator (a prerequisite only a person can set up)',
+    operatorText: 'The plan needs something only an operator can set up. The tickets that depend on this one wait until it is closed.',
     epicGaps: 'The review found the epic still open, after the planner had its try. A human decides: close it, add sub-issues for what is missing, or change its criteria.',
     epicReviewer: (reason: string) => 'Reviewer: ' + reason,
     protectedPaths: 'it touches protected paths',
@@ -98,6 +100,8 @@ const T = {
     handoverDone: (security: Security) => 'Geprüft, CI grün. Sicherheitsprüfung: ' + { ok: 'ohne Bedenken', concerns: 'BEDENKEN, vor dem Merge lesen', none: 'keine' }[security] + '.',
     handoverWhy: (reason: string) => 'Warum du: ' + reason,
     epicSubject: 'bleibt nach der Epic-Prüfung offen',
+    operatorSubject: 'braucht einen Operator (eine Voraussetzung, die nur ein Mensch einrichten kann)',
+    operatorText: 'Der Plan braucht etwas, das nur ein Operator einrichten kann. Die Tickets, die davon abhängen, warten, bis dieses Ticket geschlossen ist.',
     epicGaps: 'Die Prüfung hat das Epic offen gelassen, nachdem der Planer es versucht hatte. Eine Entscheidung von dir: schließen, Unter-Issues für das Fehlende anlegen oder die Kriterien ändern.',
     epicReviewer: (reason: string) => 'Prüfer: ' + reason,
     protectedPaths: 'er berührt geschützte Pfade',
@@ -143,6 +147,7 @@ function immediatePlain(language: NotifyLanguage, kind: string, facts: Facts): N
   const t = T[language];
   const title = cleanTitle(facts.title);
   const base = { kind, ...link(facts) };
+  if (kind === 'handover' && facts.why === 'operator_prerequisite') return { ...base, subject: head(facts) + ' ' + t.operatorSubject, text: lines(title, t.operatorText) };
   if (kind === 'handover' && facts.why === 'epic_gaps') {
     const reviewer = String(facts.reason ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim().slice(0, 300);
     return { ...base, subject: head(facts) + ' ' + t.epicSubject, text: lines(title, t.epicGaps, reviewer ? t.epicReviewer(reviewer) : '') };

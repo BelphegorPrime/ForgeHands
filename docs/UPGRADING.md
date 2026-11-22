@@ -435,3 +435,15 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Pull requests are unchanged.** A pull request answering 404 still drops its queued jobs at once.
 - **What to check.** After the first pass on the new version, the eight tickets that were deleted (openapi-generator and levelUp in the v0.9.16 report) should read `deleted in the forge` on the second pass, with one log line each, and the `could not read` lines should be gone. A ticket that is open in the forge but shows `deleted in the forge` is a bug to report: look at the `could not read` line of the sweep, if any, and the forge's answer to `GET /issues/<n>`.
 - **Rollback.** Go back to the previous version. It ignores the new keys, but the jobs of a deleted issue keep their `archived_view` flag (a closed ticket on the status page), so the ticket stays closed there, and its waiting jobs stay `deleted`.
+
+# Upgrading to the next version: operator prerequisites
+
+**New behaviour, one label.** Work that needs something only a person can set up (a token or secret, a forge, registry or runner setting, an access right) used to make the worker end without a pull request, and the ticket went back and forth. Now such an item is a ticket labelled `OPERATOR_LABEL` (default `needs:operator`).
+
+- **Nothing to set for the default.** The label is read from `OPERATOR_LABEL`; without it the name is `needs:operator`. Create the label in the repositories where you want it, or let the planner create it on its first operator ticket (it does so when it is missing). A comma in the name is refused at the start, as is a name of more than 50 characters.
+- **Planners and workers get new instructions.** The planner lists the operator items before it splits a plan and makes the work depend on them; a worker that finds such a need creates the ticket, depends on it and finishes once. Prompts of your own agent profiles that say the same thing can be shortened.
+- **Operator tickets start no run**, even with a route label added by mistake. Each is announced once by a `handover` notification and shows in `/status.json` under `waiting_for_human` with `reason: "operator_prerequisite"` and its `title`. The list is kept in the ledger (`operator_tickets` in `jobs.json`) and loses a ticket when it is closed.
+- **A worker run that ends waiting for such a ticket** is no longer a hand-back or a `no_delivery`: it waits and starts again when the ticket is closed.
+- **What to check.** Put one test ticket with the label on a repository, check that no run starts and that the notification and the `/status.json` entry appear, then close it and check that the tickets that depend on it start.
+- **The ticket watchdog (`TICKET_STALL_MINUTES`) leaves such a ticket alone**: a ticket that waits for an open operator ticket is not stalled, and no restart is started for it.
+- **Rollback.** Go back to the previous version. It ignores `operator_tickets`; a ticket that waits for an operator ticket then waits for the forge's dependency, which the older version reads as before. Remove the label from the tickets, or close them, first if you want the old behaviour.

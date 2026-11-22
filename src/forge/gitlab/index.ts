@@ -61,6 +61,8 @@ export function gitlabAgentApi(repository: string): AgentApi {
     addLabelsBody: '{"add_labels":"<id>"}',
     addLabelsMethod: 'PUT',
     removeLabelMethod: 'PUT',
+    issues: () => api + '/issues',
+    issueCreateBody: '{"title":"<title>","description":"<body>","labels":"<label name>"}',
     closeBody: '{"state_event":"close"}',
     closeMethod: 'PUT'
   };

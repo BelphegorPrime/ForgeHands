@@ -130,6 +130,14 @@ export interface AgentApi {
   addLabelsMethod: string;
   /** The HTTP method that takes a label off (to the URL `issueLabel` / `pullLabel` gave). */
   removeLabelMethod: string;
+  /** The issues of the repository: GET with a query (state, labels) lists them, POST creates one. Absent where the agent cannot create issues. */
+  issues?(): string;
+  /** The body that creates an issue (title, body, labels), as JSON text: the label is named the way the forge takes it (an id or a name). */
+  issueCreateBody?: string;
+  /** The URL that makes issue `number` depend on another issue (POST, with dependencyBody). Absent where the forge has no such dependency API. */
+  dependencyAdd?(number: number | string): string;
+  /** The body of that POST: the issue it depends on as `index` (the same repository), as JSON text. */
+  dependencyBody?: string;
   /** The body that closes an issue, as JSON text, and the HTTP method it goes with. */
   closeBody: string;
   closeMethod: string;
