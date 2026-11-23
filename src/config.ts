@@ -430,6 +430,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // EPIC_GAP_REPLAN (default 1, 0 = off, at most 5): an epic the review found open goes back to the planner this many times (per epic, until it closes)
     // before the human is called. See src/agent/epic-gaps.ts.
     epicGapReplan: wholeOf(env.EPIC_GAP_REPLAN, 1, 'EPIC_GAP_REPLAN', 5),
+    // EPIC_GAP_STALL_MINUTES (default 180, 0 = off, at most 10080): after its replan run ended this long without new open sub-issues, an epic is decided
+    // by the sweep of the dispatcher's tick (src/agent/epic-gaps.ts).
+    epicGapStallMinutes: wholeOf(env.EPIC_GAP_STALL_MINUTES, 180, 'EPIC_GAP_STALL_MINUTES', 10080),
     // RECURRING_REASON_MIN (default 0 = off, at most 50): the same NOT OK point this many times in 14 days files one ticket for a check (src/agent/recurring.ts).
     recurringReasonMin: wholeOf(env.RECURRING_REASON_MIN, 0, 'RECURRING_REASON_MIN', 50),
     // DELETE_AFTER_DAYS (0 = off): the step after archiving, the OpenHands conversation of an archived run goes. A failed run may keep its

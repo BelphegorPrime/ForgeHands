@@ -167,6 +167,9 @@ export interface DirectConfig extends BaseConfig {
   ticketStallMinutes: number;
   /** EPIC_GAP_REPLAN (default 1, 0 = off, at most 5): how often an epic that the review found open goes back to the planner before a human is called. See epic-gaps.ts. */
   epicGapReplan: number;
+  /** EPIC_GAP_STALL_MINUTES (default 180, 0 = off, at most 10080): how long after its replan run ended an epic without new open sub-issues waits before
+   * ForgeHands decides (re-review or human). See epic-gaps.ts (sweep). */
+  epicGapStallMinutes: number;
   /** DELETE_AFTER_DAYS (0 = off): an archived run that ended this long ago loses its conversation in OpenHands. See Dispatcher.deleteOld. */
   deleteAfterDays: number;
   /** The days after which a failed (or deleted) run's conversation goes: DELETE_FAILED_AFTER_DAYS, or DELETE_AFTER_DAYS when that is 0. */
@@ -404,6 +407,10 @@ export interface EpicGapRecord {
   replans: number;
   human: boolean;
   reason: string;
+  /** Set when the epic review was started once more after a replan run without new open sub-issues: the review that ends next decides with no
+   * further replan (a human, when the epic is still open). `rereview_at` is when it was started. */
+  rereview?: boolean;
+  rereview_at?: number;
 }
 
 /** A blocked agent pull request, kept in the ledger per pull request ("repo#pr<n>") while it is blocked or a human may unblock it (see stuck.ts).

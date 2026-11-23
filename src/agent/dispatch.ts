@@ -200,7 +200,12 @@ export class Dispatcher {
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
     this.handback = new HandbackRouter({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts),
       note: (event, patch) => this.noteTicket(this.issueKey(event), patch), secrets: () => this.secretValues() });
-    this.epicGaps = new EpicGaps(config, jobs, this.forge, logger, now, { hand: (event, text, reason, facts) => this.markForHuman(event, text, reason, facts) });
+    this.epicGaps = new EpicGaps(config, jobs, this.forge, logger, now, {
+      hand: (event, text, reason, facts) => this.markForHuman(event, text, reason, facts),
+      created: (planner, dependencies) => this.plannerCreated(planner, dependencies),
+      isPlanner: (label) => this.isPlannerLabel(label),
+      startReview: (event, epic) => this.startEpicReview(event, epic)
+    });
     this.recurring = new RecurringFindings(config, jobs, this.forge, logger, now);
   }
 
@@ -1650,6 +1655,7 @@ export class Dispatcher {
     if (await this.archiveOld(now)) changed = true;
     if (await this.deleteOld(now)) changed = true;
     if (await this.sweepClosed(now)) changed = true;
+    if (await this.epicGaps.sweep(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
     if (await this.checkRevertRate(now)) changed = true;
@@ -2429,6 +2435,8 @@ export class Dispatcher {
       else if (done === 'issue') await this.checkDelivery(job);
       else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
       else if (done === 'epic_done') await this.epicGaps.review(job);
+      // A replan run of an epic (EPIC_GAP_REPLAN) that ended: its sub-issues decide whether the epic waits, is reviewed once more, or goes to a human.
+      await this.epicGaps.afterReplan(job, now);
       return true;
     }
     // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).

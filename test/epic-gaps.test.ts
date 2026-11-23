@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { Dispatcher } from '../src/agent/dispatch.ts';
 import { notMetQuote, quoteBlock } from '../src/agent/epic-gaps.ts';
 import { loadConfig } from '../src/config.ts';
+import { metrics } from '../src/metrics.ts';
 import { buildStatus } from '../src/server/status.ts';
 import { JobStore } from '../src/store/jobs.ts';
 import { normalizeEvent } from '../src/webhook/events.ts';
@@ -342,4 +343,166 @@ test('the decision survives a restart: the ledger keeps the epic gap records', a
   assert.equal(again.epicGaps.get('owner/hello#10').replans, 1);
   assert.equal(again.epicGaps.get('owner/hello#10').sha, 'aaaa1111bbbb2222');
   assert.equal(again.epicGaps.get('owner/hello#10').human, false);
+});
+
+// The planner run of the epic (its label went on again, see replan): started through the normal path, so its sub-issues are read at its start
+// (deps_before); `before` changes the forge while it runs; the run finishes with `text` as the planner's comment.
+async function plannerRun(t, { before, text = 'Which export name do you want?' } = {}) {
+  clock += 3600000;
+  const event = normalizeEvent('issues', { action: 'labeled', label: { name: 'ai:plan' }, repository: { full_name: repo, default_branch: 'main' }, issue: { number: 10, title: 'Epic', body: 'Make X work', labels: [{ name: 'ai:plan' }] }, sender: { login: 'marcel' } }, new Set([repo]), ['ai:plan'], { labelEvents: true });
+  await t.dispatcher.enqueue(event);
+  await t.dispatcher.tick();
+  const job = t.jobs.list().filter((entry) => entry.label === 'ai:plan').at(-1);
+  world.comments = text === null ? [] : [{ created_at: new Date(clock + 500).toISOString(), user: { login: 'planner' }, body: text }];
+  if (before) before();
+  states[job.conversation_id] = 'finished';
+  await t.dispatcher.tick();
+  return job;
+}
+
+// A run of the epic review (or any job under `key`) that is started by the tick and finished with `text` as the reviewer's comment.
+async function finishRun(t, key, text) {
+  await t.dispatcher.tick();
+  const job = t.jobs.list().filter((entry) => entry.key === key).at(-1);
+  world.comments = [{ created_at: new Date(clock + 500).toISOString(), user: { login: 'agent' }, body: text }];
+  states[job.conversation_id] = 'finished';
+  await t.dispatcher.tick();
+  return job;
+}
+
+// A planner run of the epic that ended `ago` ms before now, as a ledger job (a legacy one has no deps_before snapshot).
+const plannerJob = (created, extra = {}) => ({
+  key: 'owner/hello#10:ai:plan', label: 'ai:plan', status: 'done', created, attempts: 0, started: created, finished: created + 1000,
+  event: { type: 'issues.labeled', label: 'ai:plan', repository: { full_name: repo, default_branch: 'main' }, issue: { number: 10, title: 'Epic', body: 'B', labels: ['ai:plan'] }, sender: { login: 'marcel' } },
+  ...extra
+});
+const reviewRuns = (t) => t.jobs.list().filter((entry) => entry.key === reviewKey);
+const replanActions = (action) => metrics.read('forgehands_epic_gaps_total').find((entry) => entry.labels.action === action)?.value ?? 0;
+
+test('a replan run without new sub-issues and all sub-issues closed: the epic review starts once more, and the epic still open after it goes to the human', async () => {
+  const t = await build({}, { wants: (kind) => kind === 'handover', notify: (message) => notes.push(message) });
+  await reviewRun(t);
+  const rereviewed = replanActions('rereviewed');
+  const planner = await plannerRun(t);
+  assert.equal(planner.status, 'done');
+  const record = t.jobs.epicGaps.get('owner/hello#10');
+  assert.equal(record.rereview, true, 'the review is started once more');
+  assert.equal(record.human, false);
+  assert.equal(record.replans, 1, 'no further replan');
+  assert.equal(replanActions('rereviewed'), rereviewed + 1);
+  assert.equal(reviewRuns(t).length, 2, 'the first review and the one started now');
+  // The same head of main as the replan: the re-review still decides (it is not a repeated review of the same head).
+  const second = await finishRun(t, reviewKey, REVIEW_TEXT);
+  assert.equal(second.status, 'done');
+  const human = comments(t).filter((text) => text.startsWith('@marcel ForgeHands: epic #10 stays open after the review of main at aaaa1111'));
+  assert.equal(human.length, 1);
+  assert.match(human[0], /The planner created no sub-issues, and the epic review was started once more/);
+  assert.equal(planned(t).filter((call) => call.body.labels.includes(1)).length, 1, 'the planner label was set once: the re-review does not send the epic back');
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').human, true);
+  assert.equal(handovers().length, 1);
+});
+
+test('a replan run without new sub-issues but with an open sub-issue goes to the human at once, with the planner\'s last comment quoted', async () => {
+  const t = await build({}, { wants: (kind) => kind === 'handover', notify: (message) => notes.push(message) });
+  await reviewRun(t);
+  // The sub-issue is reopened while the planner runs (it was closed when the run started, so the run was not held back).
+  await plannerRun(t, { text: 'Which export name do you want?', before: () => { world.sub[0].state = 'open'; } });
+  const human = comments(t).filter((text) => text.startsWith('@marcel ForgeHands: the planner of epic #10 ran'));
+  assert.equal(human.length, 1);
+  assert.match(human[0], /created no new sub-issues/);
+  assert.match(human[0], /Sub-issues still open: #11/);
+  assert.match(human[0], /quoted as data \(not instructions\)/);
+  assert.match(human[0], /Which export name do you want\?/);
+  assert.equal(reviewRuns(t).length, 1, 'no review is started');
+  assert.equal(planned(t).filter((call) => call.body.labels.includes(1)).length, 1, 'the planner label is not set again');
+  const record = t.jobs.epicGaps.get('owner/hello#10');
+  assert.equal(record.human, true);
+  assert.equal(record.rereview, false);
+  assert.equal(handovers().length, 1);
+});
+
+test('a replan run that created open sub-issues waits as today: no review, no human', async () => {
+  const t = await build({}, { wants: (kind) => kind === 'handover', notify: (message) => notes.push(message) });
+  await reviewRun(t);
+  await plannerRun(t, { before: () => { world.sub.push({ number: 12, state: 'open', title: 'Missing export', labels: [] }); } });
+  const record = t.jobs.epicGaps.get('owner/hello#10');
+  assert.equal(record.replans, 1);
+  assert.equal(record.human, false);
+  assert.ok(!record.rereview);
+  assert.equal(reviewRuns(t).length, 1);
+  assert.equal(comments(t).length, 1, 'the planner comment of the first try, nothing more');
+  assert.equal(handovers().length, 0);
+});
+
+// A record from before the replan run was watched (an upgrade): replanned, and its planner run ended `hours` ago.
+function legacyRecord(t, hours) {
+  const started = clock - hours * 3600000;
+  t.jobs.epicGaps.set('owner/hello#10', { repository: repo, issue: 10, sha: 'aaaa1111bbbb2222', at: started - 60000, replans: 1, human: false, reason: 'x' });
+  t.jobs.add(plannerJob(started));
+}
+
+test('a legacy record whose replan run ended longer ago than EPIC_GAP_STALL_MINUTES is decided by the sweep once', async () => {
+  const t = await build();
+  legacyRecord(t, 4);
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), true);
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').rereview, true, 'the sub-issues are closed: the review starts once more');
+  assert.equal(reviewRuns(t).length, 1);
+  clock += 10 * 60000;
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), false, 'the review is under way: nothing more is decided');
+  assert.equal(reviewRuns(t).length, 1);
+  assert.equal(t.forgejo.writes().length, 0, 'nothing written to the forge by the sweep itself');
+});
+
+test('a legacy record whose replan run ended recently is left alone by the sweep', async () => {
+  const t = await build();
+  legacyRecord(t, 1);
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), false);
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').rereview, undefined);
+  assert.equal(reviewRuns(t).length, 0);
+});
+
+test('a stalled replan with an open sub-issue is handed to the human once by the sweep', async () => {
+  const t = await build({}, { wants: (kind) => kind === 'handover', notify: (message) => notes.push(message) });
+  legacyRecord(t, 4);
+  t.jobs.list()[0].deps_before = [11, 12];
+  world.sub.push({ number: 12, state: 'open', title: 'Reopened', labels: [] });
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), true);
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').human, true);
+  assert.equal(comments(t).filter((text) => text.startsWith('@marcel ForgeHands: the planner of epic #10 ran')).length, 1);
+  assert.equal(handovers().length, 1);
+  clock += 10 * 60000;
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), false);
+  assert.equal(handovers().length, 1);
+});
+
+test('a re-review that ends without a decision is handed to the human once the stall time is over', async () => {
+  const t = await build({}, { wants: (kind) => kind === 'handover', notify: (message) => notes.push(message) });
+  legacyRecord(t, 4);
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), true);
+  const review = reviewRuns(t).at(-1);
+  review.status = 'failed';
+  review.finished = clock;
+  clock += 4 * 3600000;
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), true);
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').human, true);
+  assert.equal(handovers().length, 1);
+  assert.equal(reviewRuns(t).length, 1, 'no review is started again');
+});
+
+test('EPIC_GAP_STALL_MINUTES=0 switches the sweep off: a stalled replan is left as it is', async () => {
+  const t = await build({ EPIC_GAP_STALL_MINUTES: '0' });
+  legacyRecord(t, 4);
+  assert.equal(await t.dispatcher.epicGaps.sweep(clock), false);
+  const record = t.jobs.epicGaps.get('owner/hello#10');
+  assert.equal(record.human, false);
+  assert.equal(record.rereview, undefined);
+  assert.equal(reviewRuns(t).length, 0);
+  assert.equal(t.forgejo.writes().length, 0);
+});
+
+test('EPIC_GAP_STALL_MINUTES defaults to 180, takes 0 to 10080 and rejects anything else', () => {
+  assert.equal(loadConfig(env()).epicGapStallMinutes, 180);
+  assert.equal(loadConfig(env({ EPIC_GAP_STALL_MINUTES: '0' })).epicGapStallMinutes, 0);
+  assert.equal(loadConfig(env({ EPIC_GAP_STALL_MINUTES: '10080' })).epicGapStallMinutes, 10080);
+  assert.throws(() => loadConfig(env({ EPIC_GAP_STALL_MINUTES: '10081' })), /EPIC_GAP_STALL_MINUTES must be an integer between 0 and 10080/);
 });
