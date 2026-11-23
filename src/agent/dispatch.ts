@@ -147,6 +147,7 @@ export class Dispatcher {
   nextClosedSweep = 0;
   closedChecked = new Map<string, number>();
   closeRefused = new Map<string, number>(); // repository#issue -> until when a refused close is not tried again
+  revertsInFlight = new Set<string>(); // repository#pull request n -> its revert is being handled now (see revertMerged); in memory only
   lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
   mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
@@ -1001,6 +1002,9 @@ export class Dispatcher {
     }
     const ticket = /^ai\/issue-(\d+)$/.exec(branch);
     if (!ticket) return undefined;
+    // The await above lets another event make the record meanwhile: that one is used, not a second record for the same merge.
+    const existing = this.revertOf(repository, number);
+    if (existing) return existing;
     const record: RevertRecord = { repository: name, number, issue: Number(ticket[1]), sha: String(merge.sha || ''), state: 'started', at: this.now() };
     this.jobs.reverts.push(record);
     this.logger.error(name + '#' + number + ': the record of its revert was missing, made again from the ledger (ticket #' + record.issue + ')');
@@ -1011,7 +1015,21 @@ export class Dispatcher {
   // the ticket is reopened (its work was undone), one comment says what broke and quotes the revert's own account (redacted), and the worker route
   // starts again, as a newly added label does, while REVERT_RETRIES allows it. Then the ticket gets BLOCKED_LABEL and the human is called. Each step
   // is recorded, so a step that failed is tried again on the next push, and the steps done are not repeated. Returns whether it closed something.
+  // Pushes are handled concurrently (the server does not wait for closeMergedTickets), so two events can see the same revert before either has
+  // recorded a step: the first one in flight does the work, a second one for the same merge returns at once (false), and a step that failed is
+  // left for a later push, as before.
   async revertMerged(repository: string, revert: Json, number: number): Promise<boolean> {
+    const key = repository.toLowerCase() + '#' + number;
+    if (this.revertsInFlight.has(key)) return false;
+    this.revertsInFlight.add(key);
+    try {
+      return await this.revertMergedNow(repository, revert, number);
+    } finally {
+      this.revertsInFlight.delete(key);
+    }
+  }
+
+  private async revertMergedNow(repository: string, revert: Json, number: number): Promise<boolean> {
     const record = this.revertOf(repository, number) ?? await this.recoverRevert(repository, number);
     if (!record || record.state === 'handled' || !this.config.forgejo) return false;
     const name = repository.toLowerCase();
