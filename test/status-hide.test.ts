@@ -75,7 +75,7 @@ test('the summary counters are not affected by hiding', async () => {
 
 test('/status.json returns the hidden count, and ?all=1 returns every ticket (the route compares the path, not the whole URL)', async () => {
   const t = await setup();
-  const dispatcher = { jobs: t.jobs, dry: undefined, merger: { decisions: new Map() }, reminder: { waiting: new Map() }, operatorWaiting: () => [], workspace: { state: () => null, enabled: false }, cooldowns: new Map(), idleState: () => null };
+  const dispatcher = { jobs: t.jobs, now: () => NOW, dry: undefined, merger: { decisions: new Map() }, reminder: { waiting: new Map() }, operatorWaiting: () => [], workspace: { state: () => null, enabled: false }, cooldowns: new Map(), idleState: () => null };
   const server = createApp(t.config, { acquire: () => 'new', mark: async () => {}, release: () => {} }, fetch, { error() {} }, dispatcher);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = 'http://127.0.0.1:' + server.address().port;

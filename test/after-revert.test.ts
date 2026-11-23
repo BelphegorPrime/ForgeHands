@@ -51,7 +51,8 @@ function freshWorld() {
     closed: [],
     statuses: {},
     writes: [],
-    reopenFails: false
+    reopenFails: false,
+    commentFails: false
   };
 }
 async function send(url, request) {
@@ -62,6 +63,7 @@ async function send(url, request) {
   }
   const path = u.pathname.replace(API, '');
   const body = request.body ? JSON.parse(request.body) : undefined;
+  if (request.method === 'POST' && path === '/issues/26/comments' && world.commentFails) return answer({ __status: 500 });
   if (request.method !== 'GET') world.writes.push({ method: request.method, path, body });
   if (request.method === 'GET') {
     if (path === '/pulls') return answer(world.closed);
@@ -403,4 +405,58 @@ test('a revert with no merge in the ledger at all is not recorded either', async
   await t.dispatcher.closeMergedTickets(pushDefault());
   assert.equal(t.jobs.reverts.length, 0);
   assert.equal(reopens().length, 0);
+});
+
+test('two pushes that see the same merged revert at once: one cause comment, one reopen, one restart', async () => {
+  const t = await build();
+  seed(t);
+  await t.dispatcher.enqueue(red());
+  merged(40, 27);
+  const [first, second] = await Promise.all([
+    t.dispatcher.closeMergedTickets(pushDefault()),
+    t.dispatcher.closeMergedTickets(pushDefault())
+  ]);
+  assert.equal(first + second, 1, 'one of the two does the work');
+  assert.equal(reopens().length, 1, 'one reopen');
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1, 'one cause comment');
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1, 'one restart');
+  assert.equal(t.jobs.reverts.length, 1, 'one record');
+  assert.equal(t.jobs.reverts[0].restarted, true);
+  assert.equal(t.jobs.reverts[0].state, 'handled');
+});
+
+test('two pushes that see a missing record at once: one record, one cause comment, one restart', async () => {
+  const t = await build();
+  seed(t); // no red run was recorded: the record is made from the ledger by recoverRevert
+  t.jobs.merges[0].branch = 'refs/pull/27/head'; // its branch is read from the forge, which waits: both events reach recoverRevert
+  world.pulls[27] = forgejoShape(27, 'ai/issue-26');
+  mergedAsForgejo(40, 27);
+  await Promise.all([
+    t.dispatcher.closeMergedTickets(pushDefault()),
+    t.dispatcher.closeMergedTickets(pushDefault())
+  ]);
+  assert.equal(t.jobs.reverts.length, 1, 'one record for the merge');
+  assert.equal(reopens().length, 1);
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+});
+
+test('the cause comment fails once: the next push comments once, and the restart happens then, not twice', async () => {
+  const t = await build();
+  seed(t);
+  await t.dispatcher.enqueue(red());
+  merged(40, 27);
+  world.commentFails = true;
+  assert.equal(await t.dispatcher.closeMergedTickets(pushDefault()), 0);
+  assert.ok(logs.some((line) => /could not comment on #26 after its revert/.test(line)));
+  assert.equal(comments().filter((text) => /turned the CI/.test(text)).length, 0);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 0, 'no restart before the comment');
+  assert.equal(t.jobs.reverts[0].commented, undefined);
+  world.commentFails = false;
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1);
+  assert.equal(t.jobs.list().filter((job) => job.event.revert_retry).length, 1);
+  await t.dispatcher.closeMergedTickets(pushDefault());
+  assert.equal(comments().filter((text) => /turned the CI of main red/.test(text)).length, 1);
+  assert.equal(reopens().length, 1);
 });
