@@ -94,7 +94,7 @@ test("factory health lists the stalled, stuck and epic records that are still op
   ]);
 
   assert.equal(factory.epic_gaps.count, 1);
-  assert.deepEqual(factory.epic_gaps.actions, { replanned: 0, handed: 1 });
+  assert.deepEqual(factory.epic_gaps.actions, { replanned: 0, rereviewed: 0, handed: 1, handed_no_plan: 0 });
   assert.deepEqual(factory.epic_gaps.list, [
     { issue: repo + "#9", issue_url: null, action: "handed", replans: 1, reason: "The criteria of sub-issue 4 are missing", reason_links: {}, since: new Date(NOW - DAY).toISOString() },
   ]);
@@ -146,6 +146,6 @@ test("with nothing recorded every list is empty and every count is zero", () => 
   assert.deepEqual(factory.merge_decisions, { open: [], counts: { merged: 0, not_merged: {} } });
   assert.deepEqual(factory.handbacks, { retry: 0, escalate: 0, planner: 0, blocked: 0 });
   assert.deepEqual(factory.preflight, { results: { ok: 0, rejected: 0, advised: 0, skipped: 0 }, rules: [], notes: [] });
-  assert.deepEqual(factory.epic_gaps, { count: 0, actions: { replanned: 0, handed: 0 }, list: [] });
+  assert.deepEqual(factory.epic_gaps, { count: 0, actions: { replanned: 0, rereviewed: 0, handed: 0, handed_no_plan: 0 }, list: [] });
   assert.equal(factory.deleted_in_forge, 0);
 });

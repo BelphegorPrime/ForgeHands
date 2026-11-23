@@ -337,7 +337,8 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **The reviewer no longer mentions the human.** The epic review's prompt used to tell the reviewer to start its comment with `@HUMAN_LOGIN` when a gap was found, which mailed the human at once. Now only ForgeHands does, and only when a human is needed.
 - **Epics that were already left open are not picked up.** The new decision is taken when an epic review run finishes. An epic whose review ran before the upgrade has no record and no run of its own, so nothing starts for it: a human has to close it, add its sub-issues or change its criteria.
 - **Rollback.** `EPIC_GAP_REPLAN=0` calls the human at once instead of trying the planner first. Running the previous version restores the former silence. The ledger gains `epic_gaps`, which the previous version ignores.
-- **Metric.** `forgehands_epic_gaps_total{action}` (`replanned`, `handed`) is new.
+- **Metric.** `forgehands_epic_gaps_total{action}` (`replanned`, `handed`, and since the replan-run check `rereviewed`, `handed_no_plan`) is new.
+- **A replan that went nowhere.** An epic that was sent back to its planner before the upgrade and whose planner run created no sub-issues used to wait for ever. The tick now decides it once the planner run ended `EPIC_GAP_STALL_MINUTES` ago (default `180`, `0` = off): the epic review starts once more, or the human is called. Nothing else changes; the ledger gains `rereview` and `rereview_at` on the records, which the previous version ignores.
 
 # Upgrading to the next version: the notice about an empty issue run names the escalation
 

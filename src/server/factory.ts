@@ -54,9 +54,10 @@ export interface Factory {
   };
   epic_gaps: {
     count: number;
-    // since the start, by action: replanned (back to the planner) or handed (the human was called)
+    // since the start, by action: replanned (back to the planner), rereviewed (reviewed once more after a replan without sub-issues), handed (the human
+    // was called) or handed_no_plan (the human was called at once after a replan without new open sub-issues)
     actions: Record<string, number>;
-    list: { issue: string; issue_url: string | null; action: 'replanned' | 'handed'; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
+    list: { issue: string; issue_url: string | null; action: 'replanned' | 'rereviewed' | 'handed'; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
   };
   deleted_in_forge: number;
   // Tickets labelled OPERATOR_LABEL that wait for a person (see agent/operator.ts): open ones, with their titles, oldest first.
@@ -112,7 +113,7 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
   // The epics the review found open (EPIC_GAP_REPLAN), per epic, kept until the epic closes.
   const gaps = [...jobs.epicGaps.values()].filter((record: EpicGapRecord) => open(record.repository, record.issue));
   const gapList = gaps
-    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: issueUrl(config, record.repository, record.issue), action: (record.human ? 'handed' : 'replanned') as 'replanned' | 'handed', replans: record.replans, reason: record.reason, reason_links: issueLinksIn(config, record.repository, record.reason), since: iso(record.at), at: record.at }))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: issueUrl(config, record.repository, record.issue), action: (record.human ? 'handed' : record.rereview ? 'rereviewed' : 'replanned') as 'replanned' | 'rereviewed' | 'handed', replans: record.replans, reason: record.reason, reason_links: issueLinksIn(config, record.repository, record.reason), since: iso(record.at), at: record.at }))
     .sort((a, b) => ascending(a.at, b.at))
     .map(({ at: _at, ...entry }) => entry);
 
@@ -133,7 +134,7 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
     merge_decisions: { open: decisions, counts: { merged, not_merged: notMerged } },
     handbacks: byLabel('forgehands_handbacks_total', 'kind', HANDBACK_KINDS),
     preflight: { results: byLabel('forgehands_preflight_total', 'result', RESULTS), rules, notes },
-    epic_gaps: { count: gapList.length, actions: byLabel('forgehands_epic_gaps_total', 'action', ['replanned', 'handed']), list: gapList },
+    epic_gaps: { count: gapList.length, actions: byLabel('forgehands_epic_gaps_total', 'action', ['replanned', 'rereviewed', 'handed', 'handed_no_plan']), list: gapList },
     deleted_in_forge: issues.filter((issue) => !issue.closed && issue.state === 'deleted in the forge').length,
     operator_tickets: operatorTickets(config, jobs, closed),
     revert_rate: { alert_percent: config.revertRateAlert > 0 ? config.revertRateAlert : null }
