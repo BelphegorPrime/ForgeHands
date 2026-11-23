@@ -79,7 +79,7 @@ export function createApp(
     ...buildStatus(
       config as DirectConfig,
       dispatcher!.jobs,
-      Date.now(),
+      dispatcher!.now(),
       dispatcher!.dry,
       [...dispatcher!.reminder.waiting.values(), ...dispatcher!.operatorWaiting()],
       dispatcher!.workspace.state(),
