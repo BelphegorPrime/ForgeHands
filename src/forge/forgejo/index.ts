@@ -127,6 +127,12 @@ export class ForgejoForge implements Forge {
     const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
     return commit?.created || commit?.commit?.committer?.date || null;
   }
+  // Forgejo's git commit lists its parents as objects with a sha; the first is the commit the merge was made on.
+  async commitParents(repository: string, sha: string): Promise<string[]> {
+    const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
+    if (!Array.isArray(commit?.parents)) throw new Error('GET /git/commits/' + sha + ' did not name its parents');
+    return commit.parents.map((parent: Json) => String(parent?.sha || '')).filter(Boolean);
+  }
   // A 404 means the folder is absent. Any other failure, or an answer that is no folder listing, throws: "unknown" must never read as "no CI".
   async hasWorkflows(repository: string, sha: string): Promise<boolean> {
     for (const dir of WORKFLOW_DIRS) {

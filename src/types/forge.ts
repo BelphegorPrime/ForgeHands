@@ -196,6 +196,11 @@ export interface Forge {
   /** The creation time of a commit (ISO text), or null when the forge does not say. */
   commitTime(repository: string, sha: string): Promise<string | null>;
   /**
+   * The parents of a commit (the first one is the branch it was merged into). Absent where ForgeHands cannot tell: a red default branch then
+   * cannot be compared with the commit before the merge (see Dispatcher.preExistingFailure). Throws when the forge cannot say.
+   */
+  commitParents?(repository: string, sha: string): Promise<string[]>;
+  /**
    * Does the repository have workflow files (a CI that can run) at this commit? Throws when the forge cannot say. Absent on a forge where
    * ForgeHands cannot tell: there a pull request is only ever reviewed after a CI run (REVIEW_WITHOUT_CI has no effect).
    */

@@ -356,6 +356,8 @@ export interface MergeRecord {
   reverted_by?: number;
   /** A red default branch after this merge needed a human: no revert route, a revert that went red, or a ticket blocked after its revert. */
   needed_human?: boolean;
+  /** The red default branch after this merge was already red on the commit before it (a pre-existing failure): not reverted, not a revert cause. */
+  pre_existing?: boolean;
 }
 
 /** A revert of a merge that turned the default branch red (REVERT_RETRIES): the original ticket, the merge, and where the revert got to. */

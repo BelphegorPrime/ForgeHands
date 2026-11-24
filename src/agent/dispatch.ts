@@ -27,7 +27,7 @@ import { isBotPull } from './bot.ts';
 import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RevertRecord } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
-import type { Issue } from '../types/forge.ts';
+import type { CommitStatus, Issue } from '../types/forge.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
 import { behindBlocked, blockedTickets } from './stuck.ts';
 import { markReverted, revertRate } from './revert-rate.ts';
@@ -110,6 +110,10 @@ function idleLine(reasons: IdleCounts, tiers: string[]): string {
     + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '')
     + (reasons.stuck ? ', ' + reasons.stuck + ' behind a blocked pull request' : '');
 }
+
+// The verdict of preExistingFailure (REVERT_ON_RED): regression, a check that was green before the merge and is red after it; pre_existing, a red
+// check that was not green before it; unknown, the commit before the merge could not be read; recovered, the commit is green on the second read.
+type PreExisting = { verdict: 'regression' | 'pre_existing' | 'unknown' | 'recovered'; parent?: string; checks: string[] };
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
 export class Dispatcher {
@@ -1174,6 +1178,39 @@ export class Dispatcher {
       this.tell('failed', told, { why: 'revert_red' });
       return { status: 'revert_red_told' };
     }
+    // A red check that was already red on the commit before the merge (or cannot be compared with it) is not this merge's doing: no revert.
+    const cause = await this.preExistingFailure(event, repository, sha);
+    if (cause.verdict === 'recovered') {
+      // Green on the second read: nothing to do. The key is dropped, so a red run of this commit that comes again is judged again.
+      this.jobs.dedupe.delete(key);
+      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+      return { status: 'ci_not_red' };
+    }
+    if (cause.verdict === 'pre_existing') {
+      merge.pre_existing = true;
+      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+      this.tell('failed', told, { why: 'pre_existing' });
+      const checks = cause.checks.length ? ' (' + cause.checks.map((name) => name.slice(0, 200)).join(', ') + ')' : '';
+      try {
+        await this.forge.addComment(repository, number, 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), but it already failed on the commit before it'
+          + ' (' + String(cause.parent).slice(0, 8) + ')' + checks + '. A pre-existing failure: no revert is started.');
+      } catch (error) {
+        this.logger.error('could not comment on #' + number + ':', error.message);
+      }
+      return { status: 'pre_existing' };
+    }
+    if (cause.verdict === 'unknown') {
+      // Without the commit before the merge a revert could undo a change that was not at fault: the human decides.
+      this.tell('failed', told, { why: 'unknown_cause' });
+      try {
+        await this.forge.addComment(repository, number, mentionOf(this.config) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), and the commit before it'
+          + ' could not be read, so it is not known whether this merge caused it. No revert is started. A human has to look at it.');
+      } catch (error) {
+        this.logger.error('could not comment on #' + number + ':', error.message);
+      }
+      await this.markNeededHuman(repository, number);
+      return { status: 'unknown_cause' };
+    }
     const route = [...this.config.routes].find(([, entry]) => entry.kind === 'main_red')?.[0];
     this.tell('failed', told, { why: 'main_red' });
     try {
@@ -1203,6 +1240,41 @@ export class Dispatcher {
     }
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
+  }
+
+  // REVERT_ON_RED, the first-parent check: a red default branch is this merge's doing only when a check that is red on the merge commit was green
+  // on the commit before it (its first parent). A check that was red there too, or is not reported there, is pre-existing. The commit is read
+  // once more first: green then (a re-run that passed) is recovered. A parent that cannot be read gives unknown, and nothing is reverted.
+  async preExistingFailure(event: ForgeEvent, repository: string, sha: string): Promise<PreExisting> {
+    const unknown: PreExisting = { verdict: 'unknown', checks: [] };
+    let current: CommitStatus;
+    try {
+      current = await this.forge.commitStatus(repository, sha);
+    } catch (error) {
+      this.logger.error('commit status failed:', error.message);
+      return unknown;
+    }
+    if (current?.state === 'pending' || current?.state === 'success') return { verdict: 'recovered', checks: [] };
+    if (!this.forge.commitParents) return unknown;
+    let before: CommitStatus;
+    let parent: string;
+    try {
+      [parent] = await this.forge.commitParents(repository, sha);
+      if (!parent) return unknown;
+      before = await this.forge.commitStatus(repository, parent);
+    } catch (error) {
+      this.logger.error('could not read the commit before ' + sha.slice(0, 8) + ':', error.message);
+      return unknown;
+    }
+    // The state of one check on a commit; without the per-check list the combined state stands for every check.
+    const stateOf = (status: CommitStatus, context: string | undefined): string | undefined => status.statuses?.length
+      ? status.statuses.find((check) => check.context === context)?.status ?? status.statuses.find((check) => check.context === context)?.state
+      : status.state;
+    const reds = (current?.statuses ?? []).filter((check) => (check.status ?? check.state) === 'failure' || (check.status ?? check.state) === 'error');
+    if (!reds.length) return { verdict: before.state === 'success' ? 'regression' : 'pre_existing', parent, checks: [] };
+    const checks = reds.map((check) => String(check.context || 'check'));
+    const regressed = reds.some((check) => stateOf(before, check.context) === 'success');
+    return { verdict: regressed ? 'regression' : 'pre_existing', parent, checks };
   }
 
   // A CI outcome kept while an agent worked on the issue. Once no run of the issue is active any more it is judged as if it had just
