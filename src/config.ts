@@ -486,6 +486,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     // day, once REVERT_RATE_MIN_MERGES merges (default 10) are in the window. See src/agent/revert-rate.ts.
     revertRateAlert: revertRateAlertOf(env.REVERT_RATE_ALERT),
     revertRateMinMerges: wholeOf(env.REVERT_RATE_MIN_MERGES, 10, 'REVERT_RATE_MIN_MERGES', 1000),
+    // RERUN_TIMEOUT_MINUTES (default 30, 0 = off): a failed run that was green before the merge is rerun once; it may take this long. See Dispatcher.rerunBeforeRevert.
+    rerunTimeoutMinutes: wholeOf(env.RERUN_TIMEOUT_MINUTES, 30, 'RERUN_TIMEOUT_MINUTES', 1440),
     // The labels that mark an issue to be reviewed and closed when its last dependency closes (route "on": "epic_done"): ai:plan, whose
     // planner run comes first, and ai:close, which has no run of its own and only asks for that closing review.
     // Pull requests of dependency bots (Renovate): Forgejo logins and, optionally, head branch prefixes (comma separated). They get the same

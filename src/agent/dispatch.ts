@@ -24,10 +24,10 @@ import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '..
 import type { Facts } from '../notify/texts.ts';
 import { known, metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RevertRecord } from '../types.ts';
+import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RerunRecord, RevertRecord } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
-import type { Issue } from '../types/forge.ts';
+import type { CommitStatus, Issue } from '../types/forge.ts';
 import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
 import { behindBlocked, blockedTickets } from './stuck.ts';
 import { markReverted, revertRate } from './revert-rate.ts';
@@ -110,6 +110,19 @@ function idleLine(reasons: IdleCounts, tiers: string[]): string {
     + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '')
     + (reasons.stuck ? ', ' + reasons.stuck + ' behind a blocked pull request' : '');
 }
+
+// The note a revert's comment carries when the failed run could not turn green on a rerun (RERUN_TIMEOUT_MINUTES).
+const RERUN_NOTE: Record<'red' | 'timeout' | 'unavailable', string> = {
+  red: 'A rerun of the failed run did not turn it green.',
+  timeout: 'A rerun of the failed run did not finish within RERUN_TIMEOUT_MINUTES.',
+  unavailable: 'No rerun of the failed run could be started.'
+};
+// Action run states that are not finished yet: a rerun is waited for while its run is in one of them.
+const RUN_UNFINISHED = new Set(['running', 'waiting', 'queued', 'pending', 'blocked']);
+
+// The verdict of preExistingFailure (REVERT_ON_RED): regression, a check that was green before the merge and is red after it; pre_existing, a red
+// check that was not green before it; unknown, the commit before the merge could not be read; recovered, the commit is green on the second read.
+type PreExisting = { verdict: 'regression' | 'pre_existing' | 'unknown' | 'recovered'; parent?: string; checks: string[] };
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
 export class Dispatcher {
@@ -1174,11 +1187,52 @@ export class Dispatcher {
       this.tell('failed', told, { why: 'revert_red' });
       return { status: 'revert_red_told' };
     }
+    // A red check that was already red on the commit before the merge (or cannot be compared with it) is not this merge's doing: no revert.
+    const cause = await this.preExistingFailure(event, repository, sha);
+    if (cause.verdict === 'recovered') {
+      // Green on the second read: nothing to do. The key is dropped, so a red run of this commit that comes again is judged again.
+      this.jobs.dedupe.delete(key);
+      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+      return { status: 'ci_not_red' };
+    }
+    if (cause.verdict === 'pre_existing') {
+      merge.pre_existing = true;
+      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+      this.tell('failed', told, { why: 'pre_existing' });
+      const checks = cause.checks.length ? ' (' + cause.checks.map((name) => name.slice(0, 200)).join(', ') + ')' : '';
+      try {
+        await this.forge.addComment(repository, number, 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), but it already failed on the commit before it'
+          + ' (' + String(cause.parent).slice(0, 8) + ')' + checks + '. A pre-existing failure: no revert is started.');
+      } catch (error) {
+        this.logger.error('could not comment on #' + number + ':', error.message);
+      }
+      return { status: 'pre_existing' };
+    }
+    if (cause.verdict === 'unknown') {
+      // Without the commit before the merge a revert could undo a change that was not at fault: the human decides.
+      this.tell('failed', told, { why: 'unknown_cause' });
+      try {
+        await this.forge.addComment(repository, number, mentionOf(this.config) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), and the commit before it'
+          + ' could not be read, so it is not known whether this merge caused it. No revert is started. A human has to look at it.');
+      } catch (error) {
+        this.logger.error('could not comment on #' + number + ':', error.message);
+      }
+      await this.markNeededHuman(repository, number);
+      return { status: 'unknown_cause' };
+    }
+    // RERUN_TIMEOUT_MINUTES: the failed run is rerun once before a revert (a failure that was green before the merge may be flaky).
+    let rerunNote = '';
+    if (cause.verdict === 'regression' && this.config.rerunTimeoutMinutes) {
+      const rerun = await this.rerunBeforeRevert(event, repository, sha, number);
+      if ('status' in rerun) return { status: 'rerun_started' };
+      if (rerun.state === 'green') return { status: 'ci_not_red' };
+      rerunNote = ' ' + RERUN_NOTE[rerun.state];
+    }
     const route = [...this.config.routes].find(([, entry]) => entry.kind === 'main_red')?.[0];
     this.tell('failed', told, { why: 'main_red' });
     try {
       await this.forge.addComment(repository, number, (route ? '' : mentionOf(this.config)) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + ').'
-        + (route ? ' A revert is started.' : ' A human has to look at it.'));
+        + (route ? ' A revert is started.' : ' A human has to look at it.') + rerunNote);
     } catch (error) {
       this.logger.error('could not comment on #' + number + ':', error.message);
     }
@@ -1203,6 +1257,89 @@ export class Dispatcher {
     }
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
+  }
+
+  // RERUN_TIMEOUT_MINUTES: a red default branch that was green before the merge gets one rerun of its failed run, once per commit (the ledger's
+  // reruns). The run is rerun and the event waits (checkReruns resumes it when the run has finished or the time is up). When no rerun can be
+  // started, the caller reverts as it did before reruns existed, and says so in its comment.
+  async rerunBeforeRevert(event: ForgeEvent, repository: string, sha: string, number: number): Promise<{ status: 'started' } | { state: 'red' | 'timeout' | 'unavailable' | 'green' }> {
+    const name = repository.toLowerCase();
+    const known = this.jobs.reruns.find((entry) => entry.repository === name && entry.sha === sha);
+    if (known) return known.state === 'running' ? { status: 'started' } : { state: known.state as 'red' | 'timeout' | 'unavailable' | 'green' };
+    const runId = event.ci?.run_id ?? null;
+    const record: RerunRecord = { repository: name, number, sha, run_id: runId, at: this.now(), state: 'running', event };
+    if (runId === null || !this.forge.rerunRun) record.state = 'unavailable';
+    else {
+      try { await this.forge.rerunRun(repository, runId); } catch (error) {
+        this.logger.error('could not rerun run ' + runId + ' of ' + repository + ':', error.message);
+        record.state = 'unavailable';
+      }
+    }
+    this.jobs.reruns.push(record);
+    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
+    if (record.state === 'running') return { status: 'started' };
+    return { state: record.state as 'unavailable' };
+  }
+
+  // The reruns that run (RERUN_TIMEOUT_MINUTES): a finished run resumes its red default branch event. Green ends it with no revert; red or
+  // timeout reverts, once. The commit's key is dropped first, so the event is judged again. A run the forge cannot read is looked at again.
+  async checkReruns(now: number): Promise<boolean> {
+    const limit = this.config.rerunTimeoutMinutes * 60000;
+    let changed = false;
+    for (const record of this.jobs.reruns.filter((entry) => entry.state === 'running')) {
+      const repository = record.event.repository.full_name;
+      let state: RerunRecord['state'] | null = null;
+      if (now - record.at > limit) state = 'timeout';
+      else {
+        try {
+          const status = await this.forge.runStatus?.(repository, record.run_id as number | string);
+          if (status && !RUN_UNFINISHED.has(status)) state = status === 'success' ? 'green' : 'red';
+        } catch (error) {
+          this.logger.error('could not read run ' + record.run_id + ' of ' + repository + ':', error.message);
+        }
+      }
+      if (!state) continue;
+      record.state = state;
+      changed = true;
+      this.jobs.dedupe.delete('main_red:' + record.repository + '@' + record.sha);
+      try { await this.onMainFailure(record.event); } catch (error) { this.logger.error('rerun outcome failed:', error.message); }
+    }
+    return changed;
+  }
+
+  // REVERT_ON_RED, the first-parent check: a red default branch is this merge's doing only when a check that is red on the merge commit was green
+  // on the commit before it (its first parent). A check that was red there too, or is not reported there, is pre-existing. The commit is read
+  // once more first: green then (a re-run that passed) is recovered. A parent that cannot be read gives unknown, and nothing is reverted.
+  async preExistingFailure(event: ForgeEvent, repository: string, sha: string): Promise<PreExisting> {
+    const unknown: PreExisting = { verdict: 'unknown', checks: [] };
+    let current: CommitStatus;
+    try {
+      current = await this.forge.commitStatus(repository, sha);
+    } catch (error) {
+      this.logger.error('commit status failed:', error.message);
+      return unknown;
+    }
+    if (current?.state === 'pending' || current?.state === 'success') return { verdict: 'recovered', checks: [] };
+    if (!this.forge.commitParents) return unknown;
+    let before: CommitStatus;
+    let parent: string;
+    try {
+      [parent] = await this.forge.commitParents(repository, sha);
+      if (!parent) return unknown;
+      before = await this.forge.commitStatus(repository, parent);
+    } catch (error) {
+      this.logger.error('could not read the commit before ' + sha.slice(0, 8) + ':', error.message);
+      return unknown;
+    }
+    // The state of one check on a commit; without the per-check list the combined state stands for every check.
+    const stateOf = (status: CommitStatus, context: string | undefined): string | undefined => status.statuses?.length
+      ? status.statuses.find((check) => check.context === context)?.status ?? status.statuses.find((check) => check.context === context)?.state
+      : status.state;
+    const reds = (current?.statuses ?? []).filter((check) => (check.status ?? check.state) === 'failure' || (check.status ?? check.state) === 'error');
+    if (!reds.length) return { verdict: before.state === 'success' ? 'regression' : 'pre_existing', parent, checks: [] };
+    const checks = reds.map((check) => String(check.context || 'check'));
+    const regressed = reds.some((check) => stateOf(before, check.context) === 'success');
+    return { verdict: regressed ? 'regression' : 'pre_existing', parent, checks };
   }
 
   // A CI outcome kept while an agent worked on the issue. Once no run of the issue is active any more it is judged as if it had just
@@ -1659,6 +1796,7 @@ export class Dispatcher {
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
     if (await this.checkRevertRate(now)) changed = true;
+    if (await this.checkReruns(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
   }
 

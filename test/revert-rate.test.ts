@@ -21,6 +21,7 @@ const quiet = { error() {} };
 const DAY = 24 * 3600000;
 const MINUTE = 60000;
 const SHA = 'abcdef0123456789abcdef0123456789abcdef01';
+const PARENT = '7777777777777777777777777777777777777777';
 const RATE_SERIES = 'forgehands_merges_reverted_total{repository="owner/hello"}';
 let dir; let clock; let world; let openhands; let counter = 0;
 const logger = quiet;
@@ -29,6 +30,7 @@ const fakeChannel = () => ({ name: 'fake', sent: [], async send(message) { this.
 
 const ROUTES = { 'ai:ready': { profile: WORKER, tier: 'free' }, 'main:red': { profile: REVERTER, tier: 'free', on: 'main_red' } };
 const env = (extra = {}) => ({
+  RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
   FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
@@ -57,6 +59,8 @@ async function send(url, request) {
     if (path === '/pulls') return answer(world.closed);
     const one = /^\/pulls\/(\d+)$/.exec(path);
     if (one) return answer(world.pulls[one[1]] ?? { __status: 404 });
+    if (path === '/git/commits/' + SHA) return answer({ parents: [{ sha: PARENT }] });
+    if (path === '/commits/' + PARENT + '/status') return answer({ state: 'success', total_count: 2 });
     if (/^\/commits\/[0-9a-f]+\/status$/.test(path)) return answer({ state: 'failure', total_count: 2 });
     if (path.endsWith('/dependencies') || path.endsWith('/blocks') || path.endsWith('/labels')) return answer([]);
     if (/^\/issues\/\d+$/.test(path)) return answer({ number: Number(path.split('/').pop()), title: 'Change', body: '', state: 'closed', labels: [] });

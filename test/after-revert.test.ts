@@ -20,6 +20,7 @@ const quiet = { error() {} };
 const MINUTE = 60000;
 const SHA = 'abcdef0123456789abcdef0123456789abcdef01';
 const SHA2 = '0123456789abcdef0123456789abcdef01234567';
+const PARENT = '7777777777777777777777777777777777777777'; // the first parent of every merge commit in these tests: green unless a test says otherwise
 let dir; let clock; let world; let openhands; let counter = 0; let logs;
 const logger = { error(...args) { logs.push(args.join(' ')); } };
 
@@ -29,6 +30,7 @@ const env = (extra = {}) => ({
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo,
+  RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
   LABEL_ROUTES: JSON.stringify({
     'ai:ready': { profile: WORKER, tier: 'free' },
     'ai:changes': { profile: WORKER, tier: 'free', on: 'pull_request' },
@@ -49,7 +51,7 @@ function freshWorld() {
     issue: { number: 26, title: 'Add the feature', body: 'Do the thing', state: 'closed', labels: [], html_url: 'https://forge.example/owner/hello/issues/26' },
     pulls: {},
     closed: [],
-    statuses: {},
+    statuses: { [PARENT]: { state: 'success', total_count: 1 } },
     writes: [],
     reopenFails: false,
     commentFails: false
@@ -69,6 +71,7 @@ async function send(url, request) {
     if (path === '/pulls') return answer(world.closed);
     const one = /^\/pulls\/(\d+)$/.exec(path);
     if (one) return answer(world.pulls[one[1]] ?? { __status: 404 });
+    if (/^\/git\/commits\/[0-9a-f]+$/.test(path)) return answer({ parents: [{ sha: PARENT }] });
     const status = /^\/commits\/([0-9a-f]+)\/status$/.exec(path);
     if (status) return answer(world.statuses[status[1]] || { state: 'failure', total_count: 2 });
     if (path === '/issues/26') return answer(world.issue);

@@ -213,6 +213,8 @@ export interface DirectConfig extends BaseConfig {
   revertRateAlert: number;
   /** REVERT_RATE_MIN_MERGES: the revert rate alert waits until this many merges are in the 30-day window. */
   revertRateMinMerges: number;
+  /** RERUN_TIMEOUT_MINUTES (0 = off, at most 1440): how long a rerun of a failed run may take before the red default branch is reverted. See Dispatcher.rerunBeforeRevert. */
+  rerunTimeoutMinutes: number;
   botAuthors: Set<string>;
   botBranchPrefixes: string[];
   botRepos: Set<string>;
@@ -356,6 +358,21 @@ export interface MergeRecord {
   reverted_by?: number;
   /** A red default branch after this merge needed a human: no revert route, a revert that went red, or a ticket blocked after its revert. */
   needed_human?: boolean;
+  /** The red default branch after this merge was already red on the commit before it (a pre-existing failure): not reverted, not a revert cause. */
+  pre_existing?: boolean;
+}
+
+/** A rerun of the failed run of a red default branch that was green before the merge (RERUN_TIMEOUT_MINUTES), kept 30 days. Once per commit. */
+export interface RerunRecord {
+  repository: string;
+  number: number;
+  sha: string;
+  run_id: number | string | null;
+  at: number;
+  /** running: the rerun was started; green or red: the run finished; timeout: it did not finish in time; unavailable: no rerun could be started. */
+  state: 'running' | 'green' | 'red' | 'timeout' | 'unavailable';
+  /** The event that found the red branch: a finished rerun resumes it (Dispatcher.checkReruns). */
+  event: ForgeEvent;
 }
 
 /** A revert of a merge that turned the default branch red (REVERT_RETRIES): the original ticket, the merge, and where the revert got to. */

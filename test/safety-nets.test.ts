@@ -43,6 +43,7 @@ const env = (extra = {}) => ({
   SECURITY_TOKEN: 'security-token-value',
   SECURITY_REVIEWERS: 'security-bot',
   HUMAN_LOGIN: 'marcel',
+  RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
   APPROVAL_GRACE_SECONDS: '0',
   MERGE_POLICY: TWO_POLICY,
   DATA_FILE: join(dir, 'deliveries.json'),
@@ -62,6 +63,8 @@ function forge(state) {
     ['GET ' + API + '/pulls/34/files']: state.files.map((filename) => ({ filename })),
     ['GET ' + API + '/git/commits/cafe0000cafe']: { created: '2026-11-15T10:00:00Z' },
     ['GET ' + API + '/git/commits/beef0000beef']: { created: '2026-11-15T12:00:00Z' },
+    // the merge commit's first parent is green (beef0000beef above): the failure is new, so it may be reverted
+    ['GET ' + API + '/git/commits/' + MAIN_SHA]: { parents: [{ sha: 'beef0000beef' }] },
     ['GET ' + API + '/issues/34/comments']: () => state.comments,
     ['PATCH ' + API + '/pulls/34']: {}, ['POST ' + API + '/pulls/34/merge']: {}, ['POST ' + API + '/issues/34/comments']: {}, ['PATCH ' + API + '/issues/26']: {},
     ['GET ' + API + '/labels']: [{ id: 9, name: 'ai:hold' }], ['POST ' + API + '/labels']: { id: 10, name: 'ai:hold' }
