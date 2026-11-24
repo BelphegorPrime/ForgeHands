@@ -43,6 +43,7 @@ const env = (extra = {}) => ({
   SECURITY_TOKEN: 'security-token-value',
   SECURITY_REVIEWERS: 'security-bot',
   HUMAN_LOGIN: 'marcel',
+  RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
   APPROVAL_GRACE_SECONDS: '0',
   MERGE_POLICY: TWO_POLICY,
   DATA_FILE: join(dir, 'deliveries.json'),

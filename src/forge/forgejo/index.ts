@@ -127,6 +127,14 @@ export class ForgejoForge implements Forge {
     const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));
     return commit?.created || commit?.commit?.committer?.date || null;
   }
+  // A rerun of a finished run (POST .../actions/runs/{id}/rerun answers 204).
+  async rerunRun(repository: string, runId: number | string): Promise<void> {
+    await this.call(repository, 'POST', '/actions/runs/' + encodeURIComponent(String(runId)) + '/rerun');
+  }
+  async runStatus(repository: string, runId: number | string): Promise<string | null> {
+    const run = await this.call(repository, 'GET', '/actions/runs/' + encodeURIComponent(String(runId)));
+    return typeof run?.status === 'string' ? run.status : null;
+  }
   // Forgejo's git commit lists its parents as objects with a sha; the first is the commit the merge was made on.
   async commitParents(repository: string, sha: string): Promise<string[]> {
     const commit = await this.call(repository, 'GET', '/git/commits/' + encodeURIComponent(sha));

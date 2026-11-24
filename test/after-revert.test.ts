@@ -30,6 +30,7 @@ const env = (extra = {}) => ({
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo,
+  RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
   LABEL_ROUTES: JSON.stringify({
     'ai:ready': { profile: WORKER, tier: 'free' },
     'ai:changes': { profile: WORKER, tier: 'free', on: 'pull_request' },

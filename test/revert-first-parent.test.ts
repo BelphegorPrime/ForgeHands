@@ -1,5 +1,6 @@
 // @ts-nocheck -- fixtures and fakes are deliberately loose; typing them is a follow-up (src/ is checked strictly).
-// REVERT_ON_RED compares the red check with the commit before the merge: a failure that was already there is not reverted.
+// REVERT_ON_RED compares the red check with the commit before the merge: a failure that was already there is not reverted, and a failure that
+// was green before the merge gets one rerun of its run (RERUN_TIMEOUT_MINUTES) before the revert.
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -17,17 +18,19 @@ const MINUTE = 60000;
 const SHA = 'abcdef0123456789abcdef0123456789abcdef01';
 const PARENT = '7777777777777777777777777777777777777777';
 const CHECK = 'image / image (push)';
+const RUN = 1;
 const red = (sha = SHA) => ({ type: 'ci.main_failure', source: 'forgejo', action: 'action_run_failure', label: 'main:red', repository: { full_name: repo, default_branch: 'main' },
   issue: { number: 0, title: '', body: '', html_url: null, comments: 0, labels: [] }, ci: { run_id: 1, workflow: 'image.yaml', commit_sha: sha, status: 'failure', html_url: null }, sender: { login: null } });
 // A combined status as Forgejo answers it: `state` and the per-check list.
 const combined = (state, checks) => ({ state, total_count: checks.length, statuses: checks.map((status) => ({ context: CHECK, status })) });
 let dir; let clock; let world; let logs; let counter = 0;
 
-const env = () => ({
+const env = (extra = {}) => ({
   FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0',
+  RERUN_TIMEOUT_MINUTES: '30',
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify({ 'main:red': { profile: REVERTER, tier: 'free', on: 'main_red' } }),
   ERROR_RETRIES: '0',
@@ -35,6 +38,7 @@ const env = () => ({
   FORGEJO_TOKEN: 'tok-secret-value',
   FORGEJO_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
+  ...extra
 });
 
 const answer = (value) => value && value.__status ? { ok: false, status: value.__status } : { ok: true, status: 200, json: async () => value };
@@ -46,7 +50,9 @@ function freshWorld() {
     statuses: { [SHA]: [combined('failure', ['failure'])], [PARENT]: [combined('success', ['success'])] },
     parents: { [SHA]: [PARENT] },
     reads: {},
-    writes: []
+    writes: [],
+    run: { status: 'failure' },
+    rerunFails: false
   };
 }
 async function send(url, request) {
@@ -56,7 +62,14 @@ async function send(url, request) {
     return { ok: true, status: 200, json: async () => ({ execution_status: 'running', metrics: null, stats: { usage_to_metrics: {} } }) };
   }
   const path = u.pathname.replace(API, '');
+  if (request.method === 'POST' && path === '/actions/runs/' + RUN + '/rerun') {
+    world.rerunCalls = (world.rerunCalls ?? 0) + 1;
+    if (world.rerunFails) return { ok: false, status: 503 };
+    world.run = { status: 'running' };
+    return answer({});
+  }
   if (request.method !== 'GET') { world.writes.push({ method: request.method, path, body: request.body ? JSON.parse(request.body) : undefined }); return answer({}); }
+  if (path === '/actions/runs/' + RUN) return answer({ status: world.run.status });
   const one = /^\/pulls\/(\d+)$/.exec(path);
   if (one) return answer(world.pulls[one[1]] ?? { __status: 404 });
   const status = /^\/commits\/([0-9a-f]+)\/status$/.exec(path);
@@ -84,6 +97,8 @@ async function build() {
   return { config, jobs, dispatcher };
 }
 const comments = () => world.writes.filter((write) => write.method === 'POST' && /\/comments$/.test(write.path)).map((write) => write.body.body);
+const rerunRecords = (t) => t.jobs.reruns.filter((entry) => entry.repository === repo.toLowerCase());
+const rerunCalls = () => world.rerunCalls ?? 0;
 const revertRuns = (t) => t.jobs.list().filter((job) => job.label === 'main:red');
 
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'forgehands-first-parent-')); clock = Date.parse('2026-11-18T12:00:00Z'); world = freshWorld(); logs = []; });
@@ -105,13 +120,82 @@ test('pre-existing red: the check was already red on the first parent, so no rev
   assert.equal(comments().length, 1, 'one comment');
 });
 
-test('green before, red after: the check was green on the first parent and is red on the merge, so the merge is reverted', async () => {
+test('green before, red after: one rerun of the failed run is started, and no revert yet', async () => {
+  const t = await build();
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'rerun_started');
+  assert.equal(rerunCalls(), 1, 'one rerun');
+  assert.equal(rerunRecords(t)[0].state, 'running');
+  assert.equal(rerunRecords(t)[0].run_id, RUN);
+  assert.equal(revertRuns(t).length, 0, 'no revert while the rerun runs');
+  assert.equal(comments().length, 0);
+});
+
+test('rerun green: the rerun passed, so no revert and no comment', async () => {
+  const t = await build();
+  await t.dispatcher.enqueue(red());
+  world.run = { status: 'success' };
+  world.statuses[SHA] = [combined('success', ['success'])];
+  assert.equal(await t.dispatcher.checkReruns(clock), true);
+  assert.equal(rerunRecords(t)[0].state, 'green');
+  assert.equal(revertRuns(t).length, 0, 'no revert');
+  assert.equal(t.jobs.reverts.length, 0);
+  assert.equal(comments().length, 0, 'no comment');
+  assert.equal(t.jobs.merges[0].reverted_by, undefined);
+});
+
+test('rerun red: the rerun failed too, so the merge is reverted and the comment says the rerun did not help', async () => {
+  const t = await build();
+  await t.dispatcher.enqueue(red());
+  world.run = { status: 'failure' };
+  assert.equal(await t.dispatcher.checkReruns(clock), true);
+  assert.equal(rerunRecords(t)[0].state, 'red');
+  assert.equal(revertRuns(t).length, 1, 'one revert run');
+  assert.equal(comments().length, 1);
+  assert.match(comments()[0], /A revert is started\. A rerun of the failed run did not turn it green\./);
+});
+
+test('rerun still running past RERUN_TIMEOUT_MINUTES: it is given up and the merge is reverted, with a note', async () => {
+  const t = await build();
+  await t.dispatcher.enqueue(red());
+  assert.equal(await t.dispatcher.checkReruns(clock + 29 * MINUTE), false, 'still within the time');
+  assert.equal(revertRuns(t).length, 0);
+  assert.equal(await t.dispatcher.checkReruns(clock + 31 * MINUTE), true);
+  assert.equal(rerunRecords(t)[0].state, 'timeout');
+  assert.equal(revertRuns(t).length, 1);
+  assert.match(comments()[0], /did not finish within RERUN_TIMEOUT_MINUTES/);
+});
+
+test('rerun unavailable (the forge refuses it): the merge is reverted at once, with a note, and no rerun is tried again', async () => {
+  world.rerunFails = true;
   const t = await build();
   assert.equal((await t.dispatcher.enqueue(red())).status, 'queued');
+  assert.equal(rerunRecords(t)[0].state, 'unavailable');
   assert.equal(revertRuns(t).length, 1, 'one revert run');
-  assert.equal(t.jobs.merges[0].pre_existing, undefined);
-  assert.equal(comments().length, 1);
-  assert.match(comments()[0], /A revert is started\./);
+  assert.match(comments()[0], /No rerun of the failed run could be started\./);
+  world.rerunFails = false;
+  await t.dispatcher.checkReruns(clock + 60 * MINUTE);
+  assert.equal(rerunCalls(), 1, 'the forge was asked once');
+});
+
+test('rerun unavailable without a run id in the event: reverted at once', async () => {
+  const t = await build();
+  const event = red();
+  event.ci.run_id = null;
+  assert.equal((await t.dispatcher.enqueue(event)).status, 'queued');
+  assert.equal(rerunCalls(), 0);
+  assert.equal(rerunRecords(t)[0].state, 'unavailable');
+});
+
+test('a redelivery does not rerun twice: while the rerun runs, after it went red, and after the revert', async () => {
+  const t = await build();
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'rerun_started');
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'duplicate', 'a redelivery while the rerun runs');
+  assert.equal(rerunCalls(), 1);
+  world.run = { status: 'failure' };
+  await t.dispatcher.checkReruns(clock);
+  assert.equal((await t.dispatcher.enqueue(red())).status, 'duplicate', 'a redelivery after the outcome');
+  assert.equal(rerunCalls(), 1, 'still one rerun');
+  assert.equal(revertRuns(t).length, 1, 'still one revert');
 });
 
 test('red once, green on the rerun: a check that passes on the second read is not reverted and nothing is commented', async () => {

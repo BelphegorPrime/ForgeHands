@@ -200,6 +200,10 @@ export interface Forge {
    * cannot be compared with the commit before the merge (see Dispatcher.preExistingFailure). Throws when the forge cannot say.
    */
   commitParents?(repository: string, sha: string): Promise<string[]>;
+  /** Starts a rerun of a finished action run (its id from the run event). Absent where the forge cannot rerun a run. */
+  rerunRun?(repository: string, runId: number | string): Promise<void>;
+  /** The status of an action run (Forgejo: success, failure, running, waiting, ...), or null when the forge does not say. Absent where unknown. */
+  runStatus?(repository: string, runId: number | string): Promise<string | null>;
   /**
    * Does the repository have workflow files (a CI that can run) at this commit? Throws when the forge cannot say. Absent on a forge where
    * ForgeHands cannot tell: there a pull request is only ever reviewed after a CI run (REVIEW_WITHOUT_CI has no effect).
