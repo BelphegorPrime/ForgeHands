@@ -319,3 +319,18 @@ test('a closed epic costs no read once the ledger marks it closed, and an open o
   await pass(t);
   assert.equal(reviews(t).length, 1);
 });
+
+test('the listing of an epic label keeps only open issues that carry that label (Forgejo answers every issue for an unknown label)', async () => {
+  const t = await build();
+  run(t, 'owner/hello#3:ai:ready', 'ai:ready', 'done', clock - 2 * HOUR, { event: { ...ticketEvent(3), label: 'ai:ready' } });
+  const issue = (number, state, labels, extra = {}) => ({ number, state, title: 'Other', body: '', labels: labels.map((name) => ({ name })), html_url: null, ...extra });
+  // Decoys the listing returns for any label: another label, a pull request, a closed issue.
+  const decoys = [issue(13, 'open', ['ai:changes']), issue(14, 'open', ['ai:plan'], { pull_request: {} }), issue(15, 'closed', ['ai:plan'])];
+  for (const decoy of decoys) routes['GET ' + API + '/issues/' + decoy.number] = () => decoy;
+  world.listed = [...decoys, world.issue];
+  await pass(t);
+  const read = (number) => t.forgejo.forgeCalls.some((call) => call.method === 'GET' && call.path === API + '/issues/' + number);
+  assert.equal(read(13) || read(14) || read(15), false, 'the decoys are never read as epics');
+  assert.equal(read(10), true, 'the real epic is read');
+  assert.equal(reviews(t).length, 1);
+});

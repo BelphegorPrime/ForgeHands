@@ -185,8 +185,11 @@ export class ForgejoForge implements Forge {
   async reopenIssue(repository: string, number: number): Promise<void> { await this.call(repository, 'PATCH', '/issues/' + number, { state: 'open' }); }
   dependencies(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/dependencies'); }
   blocks(repository: string, number: number): Promise<Issue[]> { return this.call(repository, 'GET', '/issues/' + number + '/blocks'); }
-  issuesWithLabel(repository: string, label: string, limit: number): Promise<Issue[]> {
-    return this.call(repository, 'GET', '/issues?state=open&type=issues&labels=' + encodeURIComponent(label) + '&limit=' + limit);
+  // Forgejo answers every issue for a label the repository does not have, so the answer is filtered here: open, no pull request, carrying the label.
+  async issuesWithLabel(repository: string, label: string, limit: number): Promise<Issue[]> {
+    const issues: Json[] = await this.call(repository, 'GET', '/issues?state=open&type=issues&labels=' + encodeURIComponent(label) + '&limit=' + limit);
+    return (Array.isArray(issues) ? issues : []).filter((issue) => issue && issue.state === 'open' && !issue.pull_request
+      && Array.isArray(issue.labels) && issue.labels.some((entry: Json) => entry?.name === label));
   }
 
   listComments(repository: string, number: number, limit: number): Promise<Comment[]> { return this.call(repository, 'GET', '/issues/' + number + '/comments?limit=' + limit); }
