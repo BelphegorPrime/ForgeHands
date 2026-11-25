@@ -42,6 +42,8 @@ export interface Issue {
   labels?: Label[];
   /** ISO time of creation, when the forge gives it (Forgejo does). */
   created_at?: string;
+  /** ISO time of the close, when the forge gives it (Forgejo does); null while open. */
+  closed_at?: string | null;
   /** Set when the "issue" is a pull request. */
   pull_request?: unknown;
 }
@@ -228,6 +230,8 @@ export interface Forge {
   dependencies(repository: string, number: number): Promise<Issue[]>;
   /** Issues that depend on `number`. */
   blocks(repository: string, number: number): Promise<Issue[]>;
+  /** Open issues of the repository that carry this label (the epic sweep finds epics the ledger does not know). Absent where the forge has no such list. */
+  issuesWithLabel?(repository: string, label: string, limit: number): Promise<Issue[]>;
 
   // Comments and labels (issues and pull requests alike)
   listComments(repository: string, number: number, limit: number, on?: Subject): Promise<Comment[]>;

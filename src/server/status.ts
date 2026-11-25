@@ -8,6 +8,7 @@ import type { E2eState } from '../e2e/controller.ts';
 import { holdKey } from '../agent/merge.ts';
 import { behindBlocked, blockedTickets, stalledTickets } from '../agent/stuck.ts';
 import { revertRate } from '../agent/revert-rate.ts';
+import { pendingEpics } from '../agent/epic-sweep.ts';
 import type { RevertRate } from '../agent/revert-rate.ts';
 import type { EpicGapRecord, MergeRecord } from '../types.ts';
 import type { TicketPreflight } from '../agent/preflight.ts';
@@ -270,6 +271,9 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
   const behindGaps = behindBlocked(jobs.list(), new Set(jobs.epicGaps.keys()));
   // The same for the tickets the ticket watchdog called a human for (TICKET_STALL_MINUTES): "waiting behind stalled #n".
   const behindStalled = behindBlocked(jobs.list(), stalledTickets(jobs.stalled));
+  // The epics whose review is due (all sub-issues closed, no review since, see epic-sweep.ts): shown as "epic review pending", and the tickets that wait for them.
+  const pending = pendingEpics(config, jobs);
+  const behindPending = behindBlocked(jobs.list(), pending);
   let hidden = 0;
   const issues = [...byIssue.values()].map((entry) => {
     entry.runs.sort((a, b) => b.created - a.created);
@@ -281,11 +285,15 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     const stalled = closed.has(entry.key) ? [] : behindStalled.get(entry.key) ?? [];
     // The last merge decision of an open pull request (the merger keeps it by "repo#<pr>"; a merged one leaves it).
     const decision = pr && !closed.has(entry.key) ? options.decisions?.get(entry.key.split(/[#!]/)[0].toLowerCase() + '#' + pr) : undefined;
-    const base = jobs.isDeletedInForge(entry.key) ? 'deleted in the forge' : deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
+    const epicPending = pending.has(entry.key) && !entry.runs.some((run) => run.status === 'running' || run.status === 'queued');
+    const waitingPending = closed.has(entry.key) ? [] : behindPending.get(entry.key) ?? [];
+    const base = jobs.isDeletedInForge(entry.key) ? 'deleted in the forge' : deletedTicket(entry.runs) ? 'deleted' : closed.has(entry.key) ? 'closed'
+      : epicPending ? 'epic review pending' : holdState(config, jobs, entry.key, pr) ?? stateOf(entry.runs, config.maxRounds, rounds, workspace?.hold ?? null);
     // A ticket that waits (for a dependency or for the files of an older ticket) behind a blocked pull request says so, instead of only "waiting".
     const state = chain.length && base.startsWith('waiting for') ? 'waiting behind stuck ' + chain.map((number) => '#' + number).join(', ')
       : stalled.length && base.startsWith('waiting for') ? 'waiting behind stalled ' + stalled.map((number) => '#' + number).join(', ')
-      : gaps.length && base.startsWith('waiting for') ? 'waiting behind epic with gaps ' + gaps.map((number) => '#' + number).join(', ') : base;
+      : gaps.length && base.startsWith('waiting for') ? 'waiting behind epic with gaps ' + gaps.map((number) => '#' + number).join(', ')
+      : waitingPending.length && base.startsWith('waiting for') ? 'waiting behind epic review pending ' + waitingPending.map((number) => '#' + number).join(', ') : base;
     return {
       issue: entry.key,
       issue_url: entry.issueUrl || (issueNumber ? forgeItemUrl(config, entry.key.slice(0, entry.key.lastIndexOf('#')), 'issue', issueNumber) : null),

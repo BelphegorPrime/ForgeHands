@@ -430,6 +430,20 @@ export interface EpicGapRecord {
   rereview_at?: number;
 }
 
+/** An epic the epic sweep (REVIEW_SWEEP_MINUTES, see src/agent/epic-sweep.ts) looked at, kept per epic ("repo#n", lower case) while it is open.
+ * `open` are its sub-issues still open at the last look, `deps` how many it has, `last_closed` the latest close of them (ms; the look's time when
+ * the forge does not say). `sha` is the default branch's head the sweep last started the epic review at (`started_at`): one start per head. */
+export interface EpicSweepRecord {
+  repository: string;
+  issue: number;
+  deps: number;
+  open: number[];
+  last_closed: number;
+  checked_at: number;
+  sha: string | null;
+  started_at: number | null;
+}
+
 /** A blocked agent pull request, kept in the ledger per pull request ("repo#pr<n>") while it is blocked or a human may unblock it (see stuck.ts).
  * `why`: `label` (BLOCKED_LABEL was there when ForgeHands looked), `stuck_rounds` (rounds used up) or `stuck_verdict` (NOT OK, nothing moved on).
  * `blocked` is true while the label is on; `eligible_at` is when the watchdog may block it (for `stuck_*` reasons, after STUCK_PR_MINUTES). */

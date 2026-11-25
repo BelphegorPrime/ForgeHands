@@ -15,6 +15,7 @@ import { ReviewSweep, stallLine } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
 import { HandbackRouter, classifyHandback, handbackLine, handbackOf } from './handback.ts';
 import { EpicGaps } from './epic-gaps.ts';
+import { ledgerEpics } from './epic-sweep.ts';
 import { isOperatorTicket } from './operator.ts';
 import type { OperatorEntry } from './operator.ts';
 import { RecurringFindings } from './recurring.ts';
@@ -208,6 +209,8 @@ export class Dispatcher {
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
       block: (event, text, why) => this.markForHuman(event, text, why),
       rounds: (event) => this.rounds(event)
+    }, {
+      startReview: (event, epic) => this.startEpicReview(event, epic)
     });
     this.merger.note = (ticket, fact) => this.noteTicket(ticket, fact === 'merged' ? { merged_at: this.now(), merged_by: 'agent' } : { blocked_at: this.now() });
     this.preflight = new TicketPreflight({ config, jobs, forge: this.forge, logger, now, tell: (kind, event, facts) => this.tell(kind, event, facts) });
@@ -879,6 +882,13 @@ export class Dispatcher {
     return this.dropDeleted(match[1], Number(match[3]), match[2] === '!');
   }
 
+  // An epic: an issue with an epic label, or one the ledger knows as an epic (it had a run of an epic label or of the epic review, see epic-sweep.ts).
+  // An epic that carries another label (ai:changes after an earlier review) is an epic all the same.
+  isEpic(repository: string, issue: Json): boolean {
+    if ((issue.labels || []).some((label: Json) => this.config.epicLabels.has(label.name))) return true;
+    return ledgerEpics(this.config, this.jobs, repository).numbers.has(issue.number);
+  }
+
   // An issue closed: what depended on it may start now (a waiting job), and an epic whose last dependency this was is reviewed.
   async onClosed(event: ForgeEvent): Promise<string> {
     const ticket = event.repository.full_name.toLowerCase() + '#' + event.issue.number;
@@ -900,7 +910,7 @@ export class Dispatcher {
         for (const job of waiting) { job.status = 'queued'; delete job.waiting_for; }
         outcome.push('started #' + target.number);
         changed = true;
-      } else if ((target.labels || []).some((label: Json) => this.config.epicLabels.has(label.name))) {
+      } else if (this.isEpic(event.repository.full_name, target)) {
         if (await this.startEpicReview(event, target)) { outcome.push('epic #' + target.number + ' review'); changed = true; }
       }
     }
