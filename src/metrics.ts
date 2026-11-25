@@ -30,6 +30,7 @@ const COUNTERS: Record<string, string> = {
   forgehands_dry_run_writes_total: 'Writes that a dry run only logged (DRY_RUN).',
   forgehands_revert_retries_total: 'Tickets started again after their change was reverted for turning the default branch red (REVERT_RETRIES).',
   forgehands_review_sweep_starts_total: 'Reviews started by the review sweep for a head that had none in the ledger (REVIEW_SWEEP_MINUTES).',
+  forgehands_epic_sweep_starts_total: 'Epic reviews (epic_done) started by the epic sweep (REVIEW_SWEEP_MINUTES) because every sub-issue of an open epic was closed and no epic review had run since, once per default-branch head.',
   forgehands_conversations_deleted_total: 'Conversations deleted in OpenHands after DELETE_AFTER_DAYS (the ledger keeps the runs).',
   forgehands_comment_restarts_total: 'Runs started again because HUMAN_LOGIN commented on the issue of a failed or handed-over run (COMMENT_RESTARTS).',
   forgehands_plan_answer_restarts_total: 'Planners started again because HUMAN_LOGIN answered a plan that finished without sub-issues (PLAN_ANSWER_RESTARTS).',

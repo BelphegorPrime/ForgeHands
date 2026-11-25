@@ -328,16 +328,17 @@ function PreflightCard({ status }: { status: DashboardStatus }) {
   );
 }
 
-// Epics the epic review found still open: sent back to the planner, or handed to the human.
+// Epics the epic review found still open: sent back to the planner, or handed to the human. Also the epics whose review is due and not started
+// (every sub-issue closed, no review since): the sweep starts it, this lists the ones it has not.
 function EpicCard({ status }: { status: DashboardStatus }) {
-  const { epic_gaps: gaps } = status.factory;
+  const { epic_gaps: gaps, epic_reviews: reviews } = status.factory;
   return (
     <HealthCard
       id="factory-epics"
       icon={Layers3}
       title="Epic gaps"
-      subtitle="Epics the review found still open"
-      count={gaps.count}
+      subtitle="Epics the review found still open, and epic reviews pending"
+      count={gaps.count + reviews.count}
       countLabel="open"
     >
       <CountList
@@ -347,6 +348,25 @@ function EpicCard({ status }: { status: DashboardStatus }) {
           { label: "handed to the human", count: gaps.actions.handed ?? 0 },
         ]}
       />
+      {reviews.list.length ? (
+        <>
+          <p className="health-note">Epic review pending: every sub-issue is closed, and no epic review ran since</p>
+          <ul className="health-list">
+            {reviews.list.map((entry) => (
+              <li key={entry.issue}>
+                <strong>
+                  <ForgeLink href={entry.issue_url}>{entry.issue}</ForgeLink>
+                </strong>{" "}
+                <Badge variant="warning">epic review pending</Badge>
+                <span className="table-muted">
+                  {" "}
+                  {entry.sub_issues} sub-issue{entry.sub_issues === 1 ? "" : "s"}, last closed {shortDate(entry.closed_since)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
       {gaps.list.length ? (
         <ul className="health-list">
           {gaps.list.map((entry) => (

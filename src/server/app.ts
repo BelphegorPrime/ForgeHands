@@ -315,6 +315,9 @@ export function createApp(
       !((normalized as ForgeEvent).bot && normalized.type.startsWith("ci.")) &&
       // A failed default branch is judged by the ledger of ForgeHands' own merges, not by who triggered the run.
       normalized.type !== "ci.main_failure" &&
+      // A closed issue starts nothing a sender could steer: the dependents that wait for it and the epic review (see Dispatcher.onClosed).
+      // Whoever closed it (HUMAN_LOGIN, or the account that merged a pull request with "Closes #n") must not keep the review from starting.
+      normalized.type !== "issues.closed" &&
       !isBranchPush(normalized) &&
       !config.allowedSenders.has(
         String(normalized.sender.login || "").toLowerCase(),

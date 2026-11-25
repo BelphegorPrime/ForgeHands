@@ -1,5 +1,7 @@
 import { isBotPull, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { stuckKey } from './stuck.ts';
+import { sweepEpics } from './epic-sweep.ts';
+import type { EpicSweepHooks } from './epic-sweep.ts';
 import { isDry } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import { holdKey } from './merge.ts';
@@ -58,6 +60,7 @@ export class ReviewSweep {
   logger: Logger;
   now: () => number;
   hooks: StuckHooks;
+  epics: EpicSweepHooks;
   running: Promise<number> | null = null;
   cooldown = new Map<string, number>(); // repository#pr@sha -> until when it is not tried again
   stallCursor = new Map<string, number>(); // repository -> where the next ticket watchdog pass starts its reads (see watchStalled)
@@ -66,7 +69,7 @@ export class ReviewSweep {
   firstTimer: NodeJS.Timeout | undefined;
 
   constructor(config: DirectConfig, jobs: JobStore, forge: Forge, merger: Merger, enqueue: (event: ForgeEvent) => Promise<{ status: string }>, logger: Logger, now: () => number = Date.now,
-    hooks: StuckHooks = { block: async () => {}, rounds: () => 0 }) {
+    hooks: StuckHooks = { block: async () => {}, rounds: () => 0 }, epics: EpicSweepHooks = { startReview: async () => false }) {
     this.config = config;
     this.jobs = jobs;
     this.forge = forge;
@@ -75,6 +78,7 @@ export class ReviewSweep {
     this.logger = logger;
     this.now = now;
     this.hooks = hooks;
+    this.epics = epics;
   }
 
   // Needs the forge (FORGEJO_URL and FORGEJO_TOKEN) and a route of kind ci_success: without them a review has no way to start.
@@ -126,6 +130,7 @@ export class ReviewSweep {
       if (!Array.isArray(pulls)) continue;
       if (this.config.stuckPrMinutes) await this.watchStuck(repository, pulls, now);
       if (this.config.ticketStallMinutes) await this.watchStalled(repository, pulls, now);
+      await this.sweepEpicReviews(repository, now);
       await this.sweepApproved(repository, pulls, now);
       for (const pr of pulls) {
         if (starts >= MAX_STARTS) break;
@@ -157,6 +162,17 @@ export class ReviewSweep {
       }
     }
     return starts;
+  }
+
+  // The epic sweep (see epic-sweep.ts): the epic review of an epic whose sub-issues are all closed and that had no review since, once per head.
+  // The ledger is saved when it changed; a failed save is logged (the next pass saves again).
+  async sweepEpicReviews(repository: string, now: number): Promise<void> {
+    try {
+      const changed = await sweepEpics({ config: this.config, jobs: this.jobs, forge: this.forge, logger: this.logger, now, hooks: this.epics }, repository);
+      if (changed) await this.jobs.persist(now);
+    } catch (error) {
+      this.logger.error('epic sweep failed for ' + repository + ':', (error as Error).message);
+    }
   }
 
   // Is this an agent pull request (ai/issue-<n>, in the repository itself), a revert pull request, or a bot pull request the config lets through?

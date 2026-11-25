@@ -6,6 +6,7 @@ import type { DirectConfig, EpicGapRecord, StalledRecord, StuckRecord } from '..
 import type { JobStore } from '../store/jobs.ts';
 import type { TicketPreflight } from '../agent/preflight.ts';
 import { metrics } from '../metrics.ts';
+import { reviewPending } from '../agent/epic-sweep.ts';
 import { forgeItemUrl, issueLinksIn } from './forge-links.ts';
 
 // The part of a ticket row that the health section uses (see status.ts, Status.issues).
@@ -59,6 +60,8 @@ export interface Factory {
     actions: Record<string, number>;
     list: { issue: string; issue_url: string | null; action: 'replanned' | 'rereviewed' | 'handed'; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
   };
+  // Epics whose review is due and not started (all sub-issues closed, no review since, see epic-sweep.ts), oldest close first.
+  epic_reviews: { count: number; list: { issue: string; issue_url: string | null; sub_issues: number; closed_since: string }[] };
   deleted_in_forge: number;
   // Tickets labelled OPERATOR_LABEL that wait for a person (see agent/operator.ts): open ones, with their titles, oldest first.
   operator_tickets: { count: number; list: { issue: string; issue_url: string | null; title: string; since: string }[] };
@@ -135,10 +138,20 @@ export function buildFactory(config: DirectConfig, jobs: JobStore, issues: Facto
     handbacks: byLabel('forgehands_handbacks_total', 'kind', HANDBACK_KINDS),
     preflight: { results: byLabel('forgehands_preflight_total', 'result', RESULTS), rules, notes },
     epic_gaps: { count: gapList.length, actions: byLabel('forgehands_epic_gaps_total', 'action', ['replanned', 'rereviewed', 'handed', 'handed_no_plan']), list: gapList },
+    epic_reviews: epicReviews(config, jobs, closed),
     deleted_in_forge: issues.filter((issue) => !issue.closed && issue.state === 'deleted in the forge').length,
     operator_tickets: operatorTickets(config, jobs, closed),
     revert_rate: { alert_percent: config.revertRateAlert > 0 ? config.revertRateAlert : null }
   };
+}
+
+// The epics whose review is pending now: the sweep's record says every sub-issue is closed and no epic review ran since the last close.
+function epicReviews(config: DirectConfig, jobs: JobStore, closed: Set<string>): Factory['epic_reviews'] {
+  const list = [...jobs.epicSweeps.values()]
+    .filter((record) => !closed.has(record.repository.toLowerCase() + '#' + record.issue) && reviewPending(config, jobs, record))
+    .sort((a, b) => ascending(a.last_closed, b.last_closed))
+    .map((record) => ({ issue: record.repository + '#' + record.issue, issue_url: forgeItemUrl(config, record.repository, 'issue', record.issue), sub_issues: record.deps, closed_since: iso(record.last_closed) }));
+  return { count: list.length, list };
 }
 
 // The operator tickets ForgeHands has seen and that are not closed yet (the ledger drops one when it is closed), oldest first.

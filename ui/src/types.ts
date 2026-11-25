@@ -90,6 +90,10 @@ export interface FactoryStatus {
     actions: Record<string, number>;
     list: { issue: string; issue_url: string | null; action: "replanned" | "handed"; replans: number; reason: string; reason_links: Record<string, string>; since: string }[];
   };
+  epic_reviews: {
+    count: number;
+    list: { issue: string; issue_url: string | null; sub_issues: number; closed_since: string }[];
+  };
   deleted_in_forge: number;
   operator_tickets: { count: number; list: { issue: string; issue_url: string | null; title: string; since: string }[] };
   revert_rate: { alert_percent: number | null };
