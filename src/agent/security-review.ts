@@ -1,5 +1,4 @@
 // The security review (a route of kind sensitive_review): a green commit that touches a protected path gets a second, read-only review.
-import { Merger } from './merge.ts';
 import type { ForgeEvent, Job, Json } from '../types.ts';
 import type { Dispatcher } from './dispatch.ts';
 

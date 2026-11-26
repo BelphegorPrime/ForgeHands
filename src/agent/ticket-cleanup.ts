@@ -3,7 +3,6 @@
 import { isDry } from '../dry.ts';
 import { metrics } from '../metrics.ts';
 import type { Job, Json } from '../types.ts';
-import type { JobStore } from '../store/jobs.ts';
 import { ROUND_KINDS } from './run-states.ts';
 import type { Dispatcher } from './dispatch.ts';
 

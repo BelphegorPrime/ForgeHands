@@ -3,7 +3,7 @@
 import { parseDeclaredFiles } from './files.ts';
 import { anyOverlap } from '../utils/path-overlap.ts';
 import { pullBranch } from './bot.ts';
-import { known, metrics } from '../metrics.ts';
+import { metrics } from '../metrics.ts';
 import type { Job } from '../types.ts';
 import { ticketKey, waitGraph } from './waits.ts';
 import { FILE_PULLS_LOOKED_AT, ACTIVE_STATUSES, DEP_CACHE_MS, DEP_READS_PER_PASS } from './run-states.ts';

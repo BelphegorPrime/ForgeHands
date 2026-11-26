@@ -24,6 +24,26 @@ curl -s http://127.0.0.1:8080/status.json
 
 The gate sits in the transport (`src/forge/index.ts`, `src/dry.ts`), below the forge implementations, so new code that goes through the `Forge` interface is covered without any work. Code that makes a request on its own would bypass it: do not add one.
 
+## The agent modules
+
+`Dispatcher` (`src/agent/dispatch.ts`) takes the events (`enqueue`, `onClosed`, `onComment`, `onReview`, `onBranchPush`, ...), runs the pass loop (`tick`, `pass`) and wires its collaborators. The work is done in one module per concern, and each module reaches the dispatcher through a narrow host type (`Pick<Dispatcher, ...>`), reading config, logger and fakes on every call:
+
+| Module | Concern |
+| --- | --- |
+| `scheduler.ts` | which queued job starts next, limits and holds, quota cooldowns, starting a conversation |
+| `run-watcher.ts` | polling a running conversation; continuing, escalating, retrying or reporting a run that ended |
+| `delivery.ts` | what an ended worker or review run left behind (pull request, comment, verdict) |
+| `wait-keeper.ts` | same-files waits and dependency cycles |
+| `branch-refresh.ts` | bringing agent pull requests up to date when the default branch moves |
+| `revert-keeper.ts` | `REVERT_ON_RED`, the reruns before a revert and the revert rate |
+| `security-review.ts` | the second review of a protected path |
+| `ticket-cleanup.ts` | closed and deleted tickets, archiving and deleting old conversations |
+| `idle.ts` | the idle line, the idle state and the stall alert |
+| `nudge.ts` | `NUDGE_AT_PERCENT` |
+| `run-states.ts` | the run states and limits these modules share |
+
+The older collaborators (`review-sweep.ts`, `epic-gaps.ts`, `preflight.ts`, `handback.ts`, `ledger-sync.ts`, `remind.ts`, `workspace.ts`, `merge.ts`) take their dependencies one by one. Hand-overs to a human still go through `markForHuman` (dispatcher) and `remark` (`merge.ts`). New behaviour goes into the module of its concern, or into a new one built the same way.
+
 ## Replay tests
 
 `test/replay.test.ts` runs seeded random sequences of forge events (labels, comments, closes), ended conversations, passing time and restarts against the real dispatcher in a tiny fake world (`test/helpers/world.ts`). After every step it checks what must always hold: at most one active job per key, a running job has a conversation, a tier never runs more than its limit. At the end, once every issue is closed, nothing may be left active or held. A restart in the middle of a sequence must end in the same ledger as the run without it.

@@ -1,11 +1,10 @@
 // REVERT_ON_RED: a red default branch after a merge of ForgeHands is reverted (once, after a rerun of the failed run when it was green before
 // the merge), and the revert rate is watched.
-import { Merger } from './merge.ts';
 import { isPullRef, pullBranch, REVERT_BRANCH } from './bot.ts';
 import { redact } from '../utils/redact.ts';
 import { mentionOf } from '../notify/index.ts';
 import { immediateMessage } from '../notify/texts.ts';
-import { known, metrics } from '../metrics.ts';
+import { metrics } from '../metrics.ts';
 import type { ForgeEvent, Json, RerunRecord, RevertRecord } from '../types.ts';
 import type { CommitStatus } from '../types/forge.ts';
 import { markReverted, revertRate } from './revert-rate.ts';

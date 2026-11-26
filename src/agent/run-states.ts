@@ -1,5 +1,4 @@
 // The states of a run and the limits the dispatcher and its collaborators share, with the helpers that read a conversation's usage.
-import { known, metrics } from '../metrics.ts';
 import type { IdleCounts, TokenTotals, Json } from '../types.ts';
 
 // `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
