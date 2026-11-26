@@ -16,7 +16,9 @@ const repository = { full_name: REPO, clone_url: 'https://forge.example/' + REPO
 export function createWorld(issueCount, clock) {
   const world = {
     issues: {}, pulls: {}, catalog: [], conversations: {}, started: [], writes: [], unknown: new Set(),
-    statuses: {}, commitTimes: {}, branches: { main: 'main0000' }, outbox: [], shas: 0, comments: 0
+    statuses: {}, commitTimes: {}, branches: { main: 'main0000' }, outbox: [], shas: 0, comments: 0,
+    // What happened to the pull requests, in order: pushes, labels on and off, merges. The invariants read it.
+    history: []
   };
   for (let n = 1; n <= issueCount; n += 1) world.issues[n] = { number: n, state: 'open', labels: new Set(), comments: [] };
   const labelId = (name) => {
@@ -45,7 +47,7 @@ export function createWorld(issueCount, clock) {
   world.pullOf = (issue) => Object.values(world.pulls).find((pr) => pr.issue === issue && pr.state === 'open');
 
   // The agent of issue n pushes: the open pull request of its branch gets a new head, or a new one is opened.
-  world.push = (issue) => {
+  world.push = (issue, files = ['src/issue-' + issue + '.ts']) => {
     const sha = commit('a');
     world.branches['ai/issue-' + issue] = sha;
     let pr = world.pullOf(issue);
@@ -56,7 +58,9 @@ export function createWorld(issueCount, clock) {
         labels: new Set(), comments: [], created_at: iso(clock()), base: world.branches.main };
     }
     pr.head = sha;
+    pr.files = files;
     pr.updated_at = iso(clock());
+    world.history.push({ at: clock(), pr: pr.number, what: 'push', sha });
     return pr;
   };
 
@@ -121,7 +125,7 @@ export function createWorld(issueCount, clock) {
       if (request.method === 'PATCH') { if (body?.title) pr.title = body.title; if (body?.state) pr.state = body.state; }
       return answer(pullView(pr));
     }
-    if ((m = /^\/pulls\/(\d+)\/files$/.exec(path))) return world.pulls[m[1]] ? answer(Number(u.searchParams.get('page') || 1) > 1 ? [] : [{ filename: 'src/issue-' + world.pulls[m[1]].issue + '.ts' }]) : answer({}, 404);
+    if ((m = /^\/pulls\/(\d+)\/files$/.exec(path))) return world.pulls[m[1]] ? answer(Number(u.searchParams.get('page') || 1) > 1 ? [] : world.pulls[m[1]].files.map((filename) => ({ filename, status: 'modified' }))) : answer({}, 404);
     if ((m = /^\/pulls\/(\d+)\/reviews$/.exec(path))) return answer([]);
     // A merge moves the default branch to a merge commit, and Forgejo sends the push of it.
     if ((m = /^\/pulls\/(\d+)\/merge$/.exec(path)) && request.method === 'POST') {
@@ -129,6 +133,7 @@ export function createWorld(issueCount, clock) {
       if (!pr || pr.state !== 'open') return answer({}, 405);
       const sha = commit('m');
       Object.assign(pr, { state: 'closed', merged: true, merged_at: iso(clock()), merge_sha: sha });
+      world.history.push({ at: clock(), pr: pr.number, what: 'merge', sha: pr.head, labels: [...pr.labels] });
       const before = world.branches.main;
       world.branches.main = sha;
       world.outbox.push(world.mainPush(before, sha, pr));
