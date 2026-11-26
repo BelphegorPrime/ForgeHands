@@ -52,8 +52,8 @@ After every step the test checks what must always hold:
 - at most one active job per key
 - a running job has a conversation
 - a tier never runs more than its limit
-- a merged pull request was approved and had a green head
-- a merge over a protected path went through two keys: only `two_keys` files, the security OK of the merged commit, `TWO_KEYS_HOLD_MINUTES` after both keys agreed and after `ai:hold` came off, and never while `ai:hold` was on
+- a merged pull request was approved, had a green head, and `ai:hold` was off
+- a merge over a protected path went through two keys: only `two_keys` files, the security OK of the merged commit, and `TWO_KEYS_HOLD_MINUTES` after both keys agreed and after `ai:hold` came off
 
 At the end, once every pull request and issue is closed, nothing may be left active, held (no merge hold either), stuck or stalled. A restart in the middle of a sequence must end in the same ledger as the run without it.
 

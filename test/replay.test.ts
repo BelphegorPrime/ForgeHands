@@ -215,16 +215,15 @@ function checkInvariants(state, world) {
     tiers.set(tier, [...(tiers.get(tier) ?? []), job.key]);
   }
   for (const [tier, keys] of tiers) assert.ok(keys.length <= 1, 'tier ' + tier + ' never runs more than MAX_CONCURRENT_PER_TIER: ' + keys.join(', '));
-  // A merge happens only for an approved pull request whose head is green. A protected path merges only through two keys: every protected
+  // A merge happens only for an approved pull request whose head is green, and never while HOLD_LABEL is on. A protected path merges only through two keys: every protected
   // file is a two-keys file, the security reviewer said OK on that very commit, the hold had run its time since then, and HOLD_LABEL was off.
   for (const pr of Object.values(world.pulls).filter((entry) => entry.merged)) {
     assert.ok(pr.labels.has('ai:approved'), 'a merged pull request was approved: #' + pr.number);
     assert.equal(world.statuses[pr.head], 'success', 'a merged pull request had a green head: #' + pr.number);
     const merge = world.history.find((entry) => entry.pr === pr.number && entry.what === 'merge');
+    assert.ok(!merge.labels.includes('ai:hold'), 'nothing merges while HOLD_LABEL is on: #' + pr.number);
     const protectedFiles = pr.files.filter(DENY);
     if (!protectedFiles.length) continue;
-    // HOLD_LABEL stops a two-key merge (README: "its two-key merge waits"); a plain merge does not read it.
-    assert.ok(!merge.labels.includes('ai:hold'), 'no two-key merge while HOLD_LABEL is on: #' + pr.number);
     assert.ok(protectedFiles.every(TWO_KEYS), 'a deny file outside two_keys keeps the human: #' + pr.number + ' ' + pr.files.join(', '));
     const reviews = pr.comments.filter((comment) => comment.user.login === SECURITY_LOGIN && comment.body.includes('Commit ' + pr.head.slice(0, 8)));
     const last = reviews.at(-1);

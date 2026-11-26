@@ -84,3 +84,13 @@ test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as
   // without two_keys the variable is not needed, and without it every security comment still counts for the advisory line
   assert.doesNotThrow(() => loadConfig(env(withMerge({ MERGE_POLICY: JSON.stringify({ 'owner/hello': { deny: ['compose.yaml'] } }) }))));
 });
+
+test('two keys: without TWO_KEYS_HOLD_MINUTES the hold label still stops the merge', async () => {
+  const { merger, forgejo } = await twoKeys(['seed/infra/tests/a.test.ts'], [securityComment('OK')]);
+  assert.equal(merger.config.twoKeysHoldMinutes, 0, 'no hold period: the two-key gate does not read the label');
+  // The pull request carries the approval and the hold label.
+  const read = merger.forge.getPull.bind(merger.forge);
+  merger.forge.getPull = async (...args) => ({ ...(await read(...args)), labels: [{ name: 'ai:approved' }, { name: 'ai:hold' }] });
+  assert.equal(await merger.handle(approvedEvent()), 'held_label');
+  assert.ok(!forgejo.wrote().includes('POST /pulls/34/merge'));
+});
