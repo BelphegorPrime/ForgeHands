@@ -405,7 +405,12 @@ test('a restart in the middle of a sequence ends in the same ledger as the run w
     const a = await harness(fileA, modeOf(seed));
     const b = await harness(fileB, modeOf(seed));
     for (let index = 0; index < plain.length; index += 1) {
-      if (index === at) await b.apply({ kind: 'restart' });
+      if (index === at) {
+        await b.apply({ kind: 'restart' });
+        // A start runs the closed-ticket sweep at once (TicketCleanup.sweepClosed, "once a day and at start"). The run without a restart
+        // sweeps at the same point, so that the restart is the only difference between the two, not the time of the daily sweep.
+        a.state.dispatcher.ticketCleanup.nextClosedSweep = 0;
+      }
       // Both runs wait for the pass a webhook starts in the background, so that only the restart tells them apart.
       await a.apply(plain[index]); await a.drain();
       await b.apply(plain[index]); await b.drain();
