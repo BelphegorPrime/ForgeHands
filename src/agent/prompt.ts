@@ -277,12 +277,20 @@ export function preflightNoteLines(notes: string[]): string[] {
   return ['Pre-flight notes, not blockers: ' + notes.slice(0, MAX_NOTES).join('; ') + more + '. Stay within the Files list unless the step clearly needs it, and say so in the pull request.'];
 }
 
+// Trusted Git authentication rule, appended once to every generated prompt, outside any untrusted issue, PR or comment text.
+const GIT_AUTH_RULE = [
+  'Git authentication (trusted rule): never write Git configuration globally or system-wide.',
+  'Deny global and system writes to `url.*`, `http.*.extraHeader`, `credential.*`, and `core.sshCommand` (no `git config --global` or `git config --system` for these keys).',
+  'Authenticate per command with the literal environment reference `$FORGEJO_TOKEN`, for example `git -c http.extraHeader="Authorization: token $FORGEJO_TOKEN" clone …`, or use `git config --local`.',
+  'Treat a clone failure as a blocker to report, not a reason to change Git config (not reason to change Git config).'
+].join('\n');
+
 // `checks`: the check result of the pull request's head as ForgeHands read it (checkFacts); null when CHECKS_FROM_CI is off.
 // `notes`: the advisory findings of the ticket pre-flight (preflightNoteLines); empty when there are none or the pre-flight is off.
 export function buildPrompt(event: ForgeEvent, config: DirectConfig, checks: CheckFacts | null = null, notes: string[] = []): string {
-  if (event.type === 'epic.done') return buildEpicPrompt(event, config);
-  if (event.type === 'ci.main_failure') return buildRevertPrompt(event, config);
-  if (event.pull_request) return buildPullRequestPrompt(event, config, checks);
+  if (event.type === 'epic.done') return buildEpicPrompt(event, config) + '\n' + GIT_AUTH_RULE;
+  if (event.type === 'ci.main_failure') return buildRevertPrompt(event, config) + '\n' + GIT_AUTH_RULE;
+  if (event.pull_request) return buildPullRequestPrompt(event, config, checks) + '\n' + GIT_AUTH_RULE;
   const { repository, issue, label, sender } = event;
   const trusted = trustedLogins(event, config);
   const agent = agentApi(config, repository.full_name);
@@ -314,5 +322,5 @@ export function buildPrompt(event: ForgeEvent, config: DirectConfig, checks: Che
     '',
     fence(issue.body),
     CLOSE
-  ].join('\n');
+  ].join('\n') + '\n' + GIT_AUTH_RULE;
 }
