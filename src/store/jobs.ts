@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { E2eRecord, EpicGapRecord, EpicSweepRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, MergeRecord, NewJob, OperatorRecord, RerunRecord, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
+import type { E2eRecord, EpicGapRecord, EpicSweepRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, Json, Logger, MergeRecord, NewJob, OperatorRecord, RerunRecord, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -46,57 +46,28 @@ export class JobStore {
   goneChecks = new Map<string, number>();
   writes: Promise<void> = Promise.resolve();
 
-  constructor(file: string) {
+  logger: Logger;
+
+  constructor(file: string, logger: Logger = console) {
     this.file = file;
+    this.logger = logger;
   }
   async load(): Promise<void> {
+    let text: string;
     try {
-      const content = JSON.parse(await readFile(this.file, 'utf8'));
-      const jobs = content?.jobs;
-      if (!Array.isArray(jobs)) throw Error('Invalid job store');
-      for (const job of jobs) if (job && job.id) this.jobs.set(job.id, job);
-      if (typeof content?.meta?.digest_sent === 'string') this.meta.digest_sent = content.meta.digest_sent;
-      if (content?.meta?.e2e && typeof content.meta.e2e.version === 'string') this.meta.e2e = content.meta.e2e;
-      for (const [key, value] of Object.entries((content?.dedupe || {}) as Record<string, number>)) {
-        if (typeof value === 'number') this.dedupe.set(key, value);
-      }
-      if (Array.isArray(content?.reverts)) this.reverts = content.reverts.filter((entry: RevertRecord) => entry && typeof entry.repository === 'string');
-      if (Array.isArray(content?.reruns)) this.reruns = content.reruns.filter((entry: RerunRecord) => entry && typeof entry.repository === 'string');
-      if (Array.isArray(content?.merges)) this.merges = content.merges.filter((entry: MergeRecord) => entry && typeof entry.repository === 'string');
-      if (Array.isArray(content?.findings)) this.findings = content.findings.filter((entry: FindingRecord) => entry && typeof entry.reason === 'string');
-      for (const [key, value] of Object.entries((content?.filed_findings || {}) as Record<string, FiledFinding>)) {
-        if (value && typeof value.issue === 'number') this.filedFindings.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.holds || {}) as Record<string, Hold>)) {
-        if (value && typeof value.sha === 'string') this.holds.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.stuck || {}) as Record<string, StuckRecord>)) {
-        if (value && typeof value.sha === 'string' && typeof value.issue === 'number') this.stuck.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.stalled || {}) as Record<string, StalledRecord>)) {
-        if (value && typeof value.issue === 'number' && typeof value.run === 'string') this.stalled.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.epic_gaps || {}) as Record<string, EpicGapRecord>)) {
-        if (value && typeof value.issue === 'number' && typeof value.replans === 'number') this.epicGaps.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.epic_sweeps || {}) as Record<string, EpicSweepRecord>)) {
-        if (value && typeof value.issue === 'number' && typeof value.last_closed === 'number' && Array.isArray(value.open)) this.epicSweeps.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.operator_tickets || {}) as Record<string, OperatorRecord>)) {
-        if (value && typeof value.issue === 'number' && typeof value.title === 'string') this.operatorTickets.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.labels || {}) as Record<string, SeenLabels>)) {
-        if (value && Array.isArray(value.labels)) this.labels.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.deleted_in_forge || {}) as Record<string, number>)) {
-        if (typeof value === 'number') this.deletedInForge.set(key, value);
-      }
-      for (const [key, value] of Object.entries((content?.gone_checks || {}) as Record<string, number>)) {
-        if (typeof value === 'number') this.goneChecks.set(key, value);
-      }
+      text = await readFile(this.file, 'utf8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
     }
+    const content = migrate(JSON.parse(text), this.file);
+    if (!Array.isArray(content?.jobs)) throw Error('Invalid job store');
+    const drop = (collection: string, key: string) => this.logger.error('ledger: dropped an invalid entry of ' + collection + ' (' + key + ')');
+    content.jobs.forEach((job: Json, index: number) => {
+      if (job && typeof job.id === 'string' && job.id) this.jobs.set(job.id, job as Job);
+      else drop('jobs', String(index));
+    });
+    for (const collection of COLLECTIONS) collection.load(this, content?.[collection.file], drop);
   }
   list(status?: JobStatus | true): Job[] {
     const all = [...this.jobs.values()].sort((a, b) => a.created - b.created);
@@ -192,21 +163,126 @@ export class JobStore {
       for (const [id, job] of this.jobs) {
         if (!ACTIVE.has(job.status) && (job.finished || job.created) < now - KEEP_MS) this.jobs.delete(id);
       }
-      // A deleted issue and a missing-issue count are kept while the ledger still holds a job of the issue.
+      // The tickets the ledger still holds a job of: some records are kept only while one is held.
       const held = new Set([...this.jobs.values()].map((job) => job.key.toLowerCase().split(':')[0]));
-      for (const ticket of this.deletedInForge.keys()) if (!held.has(ticket)) this.deletedInForge.delete(ticket);
-      for (const ticket of this.goneChecks.keys()) if (!held.has(ticket)) this.goneChecks.delete(ticket);
-      for (const [key, value] of this.labels) if (value.seen < now - KEEP_MS) this.labels.delete(key);
-      for (const [key, seen] of this.dedupe) if (seen < now - KEEP_MS) this.dedupe.delete(key);
-      this.merges = this.merges.filter((entry) => entry.merged_at >= now - KEEP_MS);
-      this.reverts = this.reverts.filter((entry) => entry.at >= now - KEEP_MS);
-      this.reruns = this.reruns.filter((entry) => entry.at >= now - KEEP_MS);
-      this.findings = this.findings.filter((entry) => entry.at >= now - KEEP_MS);
+      const content: Record<string, unknown> = { version: LEDGER_VERSION, jobs: [...this.jobs.values()] };
+      for (const collection of COLLECTIONS) {
+        collection.prune(this, now, held);
+        content[collection.file] = collection.save(this);
+      }
       await mkdir(dirname(this.file), { recursive: true });
       const temp = this.file + '.' + process.pid + '.tmp';
-      await writeFile(temp, JSON.stringify({ version: 2, jobs: [...this.jobs.values()], operator_tickets: Object.fromEntries(this.operatorTickets), labels: Object.fromEntries(this.labels), deleted_in_forge: Object.fromEntries(this.deletedInForge), gone_checks: Object.fromEntries(this.goneChecks), meta: this.meta, dedupe: Object.fromEntries(this.dedupe), holds: Object.fromEntries(this.holds), stuck: Object.fromEntries(this.stuck), epic_gaps: Object.fromEntries(this.epicGaps), epic_sweeps: Object.fromEntries(this.epicSweeps), stalled: Object.fromEntries(this.stalled), merges: this.merges, reverts: this.reverts, reruns: this.reruns, findings: this.findings, filed_findings: Object.fromEntries(this.filedFindings) }), { mode: 0o600 });
+      await writeFile(temp, JSON.stringify(content), { mode: 0o600 });
       await rename(temp, this.file);
     });
     return this.writes;
   }
 }
+
+// The version of the ledger file this code writes and reads.
+export const LEDGER_VERSION = 2;
+
+// The steps from one version of the ledger file to the next: MIGRATIONS[n] turns a version n file into a version n + 1 file. A change to the
+// file format bumps LEDGER_VERSION and adds its step here, with a test that loads a file of the old version (test/ledger-file.test.ts).
+const MIGRATIONS: Record<number, (content: Json) => Json> = {};
+
+// Brings a parsed ledger file to LEDGER_VERSION. Every object file since v0.2.5 says `version: 2`; one without a version is taken as 2, as it
+// was read before versions were checked. A file of a newer ForgeHands stops the start: reading it would drop what this version does not know,
+// and the next save would write that loss to disk.
+function migrate(content: Json, file: string): Json {
+  if (!isObject(content) || Array.isArray(content)) return content;
+  let version = content.version ?? LEDGER_VERSION;
+  if (!Number.isSafeInteger(version) || version < 1) throw Error('Invalid job store: version ' + JSON.stringify(content.version));
+  if (version > LEDGER_VERSION) {
+    throw Error('The ledger ' + file + ' was written by a newer ForgeHands (version ' + version + ', this one reads up to ' + LEDGER_VERSION + '). '
+      + 'Start the newer release again, or move the file away to start with an empty ledger.');
+  }
+  while (version < LEDGER_VERSION) {
+    const step = MIGRATIONS[version];
+    if (!step) throw Error('Invalid job store: no migration from version ' + version);
+    content = step(content);
+    version += 1;
+  }
+  return content;
+}
+
+// One collection of the ledger file besides the jobs: how it is read (with what counts as valid), pruned and written.
+interface Collection {
+  file: string;
+  load(store: JobStore, raw: unknown, drop: (collection: string, key: string) => void): void;
+  prune(store: JobStore, now: number, held: Set<string>): void;
+  save(store: JobStore): unknown;
+}
+// When a record goes: `age` reads its time and drops it after KEEP_MS, `held` keeps it while a job of its ticket (the key) is in the ledger.
+type Keep<T> = { age: (value: T) => number } | 'held' | 'kept';
+
+const isObject = (value: unknown): value is Json => typeof value === 'object' && value !== null;
+
+// A collection kept as a map in the store and as an object in the file.
+function mapOf<T>(file: string, get: (store: JobStore) => Map<string, T>, valid: (value: Json) => boolean, keep: Keep<T>): Collection {
+  return {
+    file,
+    load(store, raw, drop) {
+      if (!isObject(raw)) return;
+      for (const [key, value] of Object.entries(raw)) {
+        if (valid(value)) get(store).set(key, value as T);
+        else drop(file, key);
+      }
+    },
+    prune(store, now, held) {
+      if (keep === 'kept') return;
+      for (const [key, value] of get(store)) {
+        if (keep === 'held' ? !held.has(key) : keep.age(value) < now - KEEP_MS) get(store).delete(key);
+      }
+    },
+    save: (store) => Object.fromEntries(get(store))
+  };
+}
+
+// A collection kept as a list, in the store and in the file, pruned by age.
+function listOf<T>(file: string, get: (store: JobStore) => T[], set: (store: JobStore, list: T[]) => void, valid: (value: Json) => boolean, age: (value: T) => number): Collection {
+  return {
+    file,
+    load(store, raw, drop) {
+      if (!Array.isArray(raw)) return;
+      set(store, raw.filter((value, index) => valid(value) || (drop(file, String(index)), false)) as T[]);
+    },
+    prune: (store, now) => set(store, get(store).filter((value) => age(value) >= now - KEEP_MS)),
+    save: (store) => get(store)
+  };
+}
+
+const number = (value: unknown): value is number => typeof value === 'number';
+const string = (value: unknown): value is string => typeof value === 'string';
+
+// The meta facts: each one is read only when it has its expected shape, anything else in the file is left out.
+const META: Collection = {
+  file: 'meta',
+  load(store, raw) {
+    if (!isObject(raw)) return;
+    if (string(raw.digest_sent)) store.meta.digest_sent = raw.digest_sent;
+    if (isObject(raw.e2e) && string(raw.e2e.version)) store.meta.e2e = raw.e2e as E2eRecord;
+  },
+  prune() {},
+  save: (store) => store.meta
+};
+
+// Every collection of the ledger file, in the order the file lists them. A new collection is one line here (and its field on JobStore).
+const COLLECTIONS: Collection[] = [
+  mapOf<OperatorRecord>('operator_tickets', (s) => s.operatorTickets, (v) => isObject(v) && number(v.issue) && string(v.title), 'kept'),
+  mapOf<SeenLabels>('labels', (s) => s.labels, (v) => isObject(v) && Array.isArray(v.labels), { age: (v) => v.seen }),
+  mapOf<number>('deleted_in_forge', (s) => s.deletedInForge, number, 'held'),
+  mapOf<number>('gone_checks', (s) => s.goneChecks, number, 'held'),
+  META,
+  mapOf<number>('dedupe', (s) => s.dedupe, number, { age: (v) => v }),
+  mapOf<Hold>('holds', (s) => s.holds, (v) => isObject(v) && string(v.sha), 'kept'),
+  mapOf<StuckRecord>('stuck', (s) => s.stuck, (v) => isObject(v) && string(v.sha) && number(v.issue), 'kept'),
+  mapOf<EpicGapRecord>('epic_gaps', (s) => s.epicGaps, (v) => isObject(v) && number(v.issue) && number(v.replans), 'kept'),
+  mapOf<EpicSweepRecord>('epic_sweeps', (s) => s.epicSweeps, (v) => isObject(v) && number(v.issue) && number(v.last_closed) && Array.isArray(v.open), 'kept'),
+  mapOf<StalledRecord>('stalled', (s) => s.stalled, (v) => isObject(v) && number(v.issue) && string(v.run), 'kept'),
+  listOf<MergeRecord>('merges', (s) => s.merges, (s, l) => { s.merges = l; }, (v) => isObject(v) && string(v.repository), (v) => v.merged_at),
+  listOf<RevertRecord>('reverts', (s) => s.reverts, (s, l) => { s.reverts = l; }, (v) => isObject(v) && string(v.repository), (v) => v.at),
+  listOf<RerunRecord>('reruns', (s) => s.reruns, (s, l) => { s.reruns = l; }, (v) => isObject(v) && string(v.repository), (v) => v.at),
+  listOf<FindingRecord>('findings', (s) => s.findings, (s, l) => { s.findings = l; }, (v) => isObject(v) && string(v.reason), (v) => v.at),
+  mapOf<FiledFinding>('filed_findings', (s) => s.filedFindings, (v) => isObject(v) && number(v.issue), 'kept')
+];

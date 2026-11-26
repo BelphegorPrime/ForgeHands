@@ -24,6 +24,25 @@ curl -s http://127.0.0.1:8080/status.json
 
 The gate sits in the transport (`src/forge/index.ts`, `src/dry.ts`), below the forge implementations, so new code that goes through the `Forge` interface is covered without any work. Code that makes a request on its own would bypass it: do not add one.
 
+## Replay tests
+
+`test/replay.test.ts` runs seeded random sequences of forge events (labels, comments, closes), ended conversations, passing time and restarts against the real dispatcher in a tiny fake world (`test/helpers/world.ts`). After every step it checks what must always hold: at most one active job per key, a running job has a conversation, a tier never runs more than its limit. At the end, once every issue is closed, nothing may be left active or held. A restart in the middle of a sequence must end in the same ledger as the run without it.
+
+A failure prints its seed and the list of steps. Replay one seed with `FUZZ_SEED=<n>`, and run more than the default handful with `FUZZ_SEEDS=<n>` before a change to the dispatcher or the ledger:
+
+```sh
+FUZZ_SEEDS=500 node --test test/replay.test.ts
+FUZZ_SEED=760225 node --test test/replay.test.ts
+```
+
+A seed that found a bug becomes a named test at the end of the file, next to the fix. When a new invariant holds for the dispatcher, add it to `checkInvariants`. When ForgeHands learns a new kind of event, teach the generator in `steps()` and the fake world.
+
+## The ledger file
+
+`JobStore` (`src/store/jobs.ts`) reads and writes the ledger (`jobs.json`). Besides the jobs, every collection is one line in `COLLECTIONS`: its key in the file, its field on the store, what counts as a valid entry, and when an entry goes (after 30 days by a time field, while a job of its ticket is held, or kept until the code removes it). To add a collection, add its field and one line there. Invalid entries are logged and left out on load.
+
+The file carries `version` (`LEDGER_VERSION`). A change that an older release would misread bumps the version and adds a step to `MIGRATIONS` that turns the old shape into the new one, with a test in `test/ledger-file.test.ts` that loads a file of the old version. A new field or collection that older releases simply ignore needs no new version.
+
 ## The forge interface
 
 ForgeHands talks to a forge through one interface, `Forge` in `src/types/forge.ts`. The dispatcher, the merger, the reminders and the prompts use only that interface and never branch on the forge. It has two halves:
