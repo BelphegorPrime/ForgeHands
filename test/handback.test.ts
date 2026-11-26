@@ -247,18 +247,6 @@ test('an empty run with a blocker is not a delivery: without the comment, the ru
   assert.equal(t.starts().length, 2);
 });
 
-test('HANDBACK_HANDLING=0 restores the old behaviour: any comment is a delivery', async () => {
-  for (const text of [LEVELUP, NOT_PUSHED]) {
-    const t = await setup({ extra: { HANDBACK_HANDLING: '0' } });
-    await t.end(text);
-    assert.equal(t.job.status, 'done', text);
-    assert.equal(t.job.result, 'finished', text);
-    assert.equal(t.job.escalated, undefined, text);
-    assert.equal(t.job.delivery_retry, undefined, text);
-    assert.equal(t.starts().length, 1, text);
-  }
-});
-
 test('DRY_RUN: a hand-back that reaches the human decides in the ledger, but nothing is written to the forge', async () => {
   // No escalate_to here: the first blocker goes straight to the human, which writes a comment and two labels when the run is live.
   const extra = { DRY_RUN: '1', LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' } }) };
@@ -271,14 +259,6 @@ test('DRY_RUN: a hand-back that reaches the human decides in the ledger, but not
   assert.equal(t.job.result, 'handback', 'the decision is taken in memory');
   assert.equal(t.forge.writes().length, 0, 'no comment or label reached the forge');
   assert.equal(t.starts().length, 0, 'no conversation was started');
-});
-
-test('HANDBACK_HANDLING is validated: 1 by default, 0 switches it off, anything else is refused', () => {
-  const base = env();
-  assert.equal(loadConfig(base).handbackHandling, true);
-  assert.equal(loadConfig({ ...base, HANDBACK_HANDLING: '1' }).handbackHandling, true);
-  assert.equal(loadConfig({ ...base, HANDBACK_HANDLING: '0' }).handbackHandling, false);
-  assert.throws(() => loadConfig({ ...base, HANDBACK_HANDLING: 'yes' }), /HANDBACK_HANDLING must be 0 or 1/);
 });
 
 // The forge reads after a run ended take a while. `t.hold()` holds the read of the issue's comments until the test lets it go, so that a

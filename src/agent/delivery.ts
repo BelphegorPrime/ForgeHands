@@ -39,7 +39,7 @@ export class DeliveryCheck {
       const comments = await this.host.forge.listComments(repository, event.issue.number, 50);
       // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
       const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
-      const handback = this.host.config.handbackHandling && written.length ? handbackOf(written) : null;
+      const handback = written.length ? handbackOf(written) : null;
       if (written.length && !handback) return;
       if (this.superseded(job)) return;
       if (handback) {
@@ -50,7 +50,7 @@ export class DeliveryCheck {
       // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
       const parent = await this.parentComment(event, since);
       if (this.superseded(job)) return;
-      if (parent && this.host.config.handbackHandling) {
+      if (parent) {
         this.host.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
         await this.host.handback.handle(job, classifyHandback(parent.text) === 'blocker' ? 'blocker' : 'pushed_nothing', parent.text);
         return;

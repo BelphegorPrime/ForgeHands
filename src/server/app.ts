@@ -290,7 +290,7 @@ export function createApp(
           ),
         reviews: direct && config.verdictSource !== "comment",
         humanReviews:
-          direct && config.verdictSource === "comment" && config.humanReviewRounds && config.humanLogin
+          direct && config.verdictSource === "comment" && config.humanLogin
             ? { human: config.humanLogin }
             : undefined,
         bots: direct

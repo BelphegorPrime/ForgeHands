@@ -58,7 +58,7 @@ export class Dispatcher {
   ledgerSync: LedgerSync;
   /** The ticket pre-flight (TICKET_PREFLIGHT): a worker's ticket that breaks a rule starts no run. See src/agent/preflight.ts. */
   preflight: TicketPreflight;
-  /** HANDBACK_HANDLING: a worker run that hands its ticket back by a comment is run again, escalated or sent to the planner. See src/agent/handback.ts. */
+  /** Hand-backs: a worker run that hands its ticket back by a comment is run again, escalated or sent to the planner. See src/agent/handback.ts. */
   handback: HandbackRouter;
   /** The epic review found the epic open (EPIC_GAP_REPLAN): the planner again, then the human. See src/agent/epic-gaps.ts. */
   epicGaps: EpicGaps;
@@ -285,7 +285,7 @@ export class Dispatcher {
   // decides, so the event itself is only a trigger. A rejection starts the next round, once the reviews of the head commit say so too: a
   // review of somebody who may not request changes (a stranger, an outdated commit) starts nothing.
   async onReview(event: ForgeEvent, approved: boolean): Promise<string> {
-    // The review of HUMAN_LOGIN in comment mode (HUMAN_REVIEW_ROUNDS, see onHumanReview). Nobody else's review is an event in comment mode.
+    // The review of HUMAN_LOGIN in comment mode (see onHumanReview). Nobody else's review is an event in comment mode.
     if (event.review?.human) return this.onHumanReview(event);
     if (event.type === 'pull_request.review_comment') return 'ignored_review';
     if (approved) return this.merger.handle(event);
@@ -316,7 +316,7 @@ export class Dispatcher {
     return (await this.enqueueOne({ ...event, label: this.config.changesLabel })).status;
   }
 
-  // HUMAN_REVIEW_ROUNDS in comment mode: a review of HUMAN_LOGIN on an agent pull request (see normalizeReview). His request for changes on the
+  // In comment mode a review of HUMAN_LOGIN on an agent pull request (see normalizeReview). His request for changes on the
   // head commit starts the changes round, as the changes label does (humanTookOver applies: his action starts the rounds again). An approval or a
   // comment starts nothing and merges nothing: the merge stays driven by the label and the verdict. Anything unclear starts nothing.
   async onHumanReview(event: ForgeEvent): Promise<string> {

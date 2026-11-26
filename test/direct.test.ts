@@ -185,15 +185,11 @@ test('config rejects broken routes and missing key', () => {
   assert.equal(loadConfig(env()).jobsFile, join(ctx.dir, 'jobs.json'));
 });
 
-test('a set TIER_WEEKLY_BUDGETS is ignored with a warning instead of failing', () => {
+test('TIER_WEEKLY_BUDGETS, removed in 0.4.0, is no longer mentioned at start', () => {
   const errors = [];
   const config = loadConfig(env({ TIER_WEEKLY_BUDGETS: '{"strong": 5}' }), { error: (...args) => errors.push(args.join(' ')) });
   assert.equal('tierBudgets' in config, false);
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /TIER_WEEKLY_BUDGETS is ignored, it was removed in 0\.4\.0/);
-  const quiet = [];
-  loadConfig(env(), { error: (...args) => quiet.push(args) });
-  assert.equal(quiet.length, 0, 'no warning when it is not set');
+  assert.deepEqual(errors, []);
 });
 
 test('label added to an existing issue (real Forgejo event: issues/label_updated) starts one run and never a repeat', async () => {

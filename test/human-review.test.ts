@@ -167,20 +167,7 @@ test('a review of anybody else is ignored in comment mode, even from an allowed 
   } finally { await a.close(); }
 });
 
-test('HUMAN_REVIEW_ROUNDS=0 restores today\'s behaviour: the operator\'s review in comment mode is no event', async () => {
-  const a = await app({ HUMAN_REVIEW_ROUNDS: '0' }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
-  try {
-    assert.equal(a.config.humanReviewRounds, false);
-    assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 'z-1'), 'ignored');
-    assert.equal(a.jobs.list().length, 0);
-  } finally { await a.close(); }
-});
-
-test('HUMAN_REVIEW_ROUNDS is on by default with HUMAN_LOGIN, off without it (no error), and must be 0 or 1', async () => {
-  assert.equal(loadConfig(env()).humanReviewRounds, true);
-  assert.equal(loadConfig(env({ HUMAN_REVIEW_ROUNDS: '0' })).humanReviewRounds, false);
-  assert.equal(loadConfig(env({ HUMAN_LOGIN: undefined })).humanReviewRounds, false);
-  assert.throws(() => loadConfig(env({ HUMAN_REVIEW_ROUNDS: 'yes' })), /HUMAN_REVIEW_ROUNDS must be 0 or 1/);
+test('without HUMAN_LOGIN a review in comment mode is no event', async () => {
   const a = await app({ HUMAN_LOGIN: undefined }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
   try {
     assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 'n-1'), 'ignored');
@@ -269,9 +256,8 @@ test('the round on the last allowed round escalates via escalate_to, a round the
 });
 
 test('VERDICT_SOURCE=both: one human review starts one round, however often it is delivered', async () => {
-  const a = await app({ VERDICT_SOURCE: 'both', HUMAN_REVIEW_ROUNDS: '1' }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
+  const a = await app({ VERDICT_SOURCE: 'both' }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
   try {
-    assert.equal(a.config.humanReviewRounds, true);
     assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 'both-1'), 'queued');
     assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 'both-2'), 'duplicate_job');
     assert.equal(changesJobs(a.jobs).length, 1);
@@ -284,7 +270,6 @@ test('the request of the operator in review mode is handled by the review path, 
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' }, 'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
       'ci:success': { profile: WORKER, tier: 'strong', on: 'ci_success', forgejo_token_secret: 'REVIEWER_TOKEN' } }) }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
   try {
-    assert.equal(a.config.humanReviewRounds, true);
     assert.equal(await a.post(CHANGES_NAME, reviewPayload('pull_request_review_rejected'), 'rv-1'), 'queued');
     assert.equal(changesJobs(a.jobs)[0].event.review.human, undefined);
   } finally { await a.close(); }

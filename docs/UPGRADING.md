@@ -494,7 +494,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **A reopened ticket is restarted only with a new run.** A ticket that was closed and reopened by hand, without a new run, keeps the closed mark in the ledger, so the watchdog does not read it. It is looked at again once a run of it exists.
 - **Rollback.** Go back to the previous version, or set `TICKET_STALL_MINUTES=0` to stop the watchdog. The closed marks already set stay in the ledger; the previous version reads the same flags on the status page.
 
-## Upgrading to the next release: the status page is closed without a token
+## Upgrading to 0.11.0: the status page is closed without a token
 
 **What changes.** Without `STATUS_TOKEN`, ForgeHands closes these endpoints. They used to be open to everybody who could reach the port, with a warning at start:
 - `/` (the dashboard), `/api/dashboard` and `/dashboard/ws`
@@ -509,10 +509,24 @@ They now answer `401` with `{"error": "status_closed"}`. `/healthz` stays open.
 
 **Rollback.** Set `STATUS_PUBLIC=1`, or go back to the previous release.
 
-## Upgrading to the next release: deprecated settings warn at start
+## Upgrading to 0.11.0: deprecated settings warn at start
 
 Nothing stops working. These settings are deprecated and will be removed in 1.0.0. When one is set, the start logs `warning: <NAME> is deprecated and will be removed in 1.0.0: ...` with what to do instead:
 
 - **`FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET`.** Rename them to `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, in the environment and in `AGENT_SECRETS`. Nothing changes for the agents: they still receive the values as `FORGEJO_URL` and `FORGEJO_TOKEN`.
 - **`HUMAN_REVIEW_ROUNDS` and `HANDBACK_HANDLING`.** In 1.0.0 both are always on. If you set either to `0`, plan for that behaviour now.
+
+## Upgrading to 1.0.0: the deprecated settings are gone
+
+The settings that warned at start since 0.11.0 are removed. A start with one of them still set **stops** with a message that names what to set instead. Check your environment for them before you upgrade:
+
+| Removed | Instead |
+| --- | --- |
+| `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET` | `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, also in `AGENT_SECRETS` (for example `AGENT_SECRETS=FORGE_TOKEN,FORGE_URL`). The agents still receive the values as `FORGEJO_URL` and `FORGEJO_TOKEN`, so prompts and scripts in the agent are unchanged. |
+| `HUMAN_REVIEW_ROUNDS` | Remove it. A request for changes of `HUMAN_LOGIN` always starts a round. |
+| `HANDBACK_HANDLING` | Remove it. A run that hands its ticket back by a comment is always handled as a hand-back. |
+
+`TIER_WEEKLY_BUDGETS` (removed in 0.4.0) is no longer mentioned at start. Setting it does nothing.
+
+**Rollback.** Go back to the last 0.x release. It reads the same ledger.
 
