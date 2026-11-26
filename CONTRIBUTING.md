@@ -46,7 +46,7 @@ The older collaborators (`review-sweep.ts`, `epic-gaps.ts`, `preflight.ts`, `han
 
 ## Replay tests
 
-`test/replay.test.ts` runs seeded random sequences against the real app and dispatcher in a small fake world (`test/helpers/world.ts`). The world is one repository on a fake Forgejo with issues, the agent pull requests of those issues (branch, head commit, commit status, labels, comments, merges that move the default branch) and a fake OpenHands. The sequences mix labels, comments, closes, agent pushes (plain code, files two keys may merge, or files that need the human), CI outcomes, review verdicts, security reviews, approvals, change requests, `ai:hold` on and off, ended conversations, passing time and restarts. Events reach ForgeHands as signed webhooks through `createApp`, as Forgejo sends them, and the review sweep runs as fake time passes.
+`test/replay.test.ts` runs seeded random sequences against the real app and dispatcher in a small fake world (`test/helpers/world.ts`). The world is one repository on a fake Forgejo with issues (some become epics with sub-issues), the agent pull requests of those issues (branch, head commit, commit status, labels, comments, merges that move the default branch), CI on the default branch with reruns, revert pull requests, and a fake OpenHands. Label changes ForgeHands makes come back as webhooks, as Forgejo sends them. The sequences mix labels, comments, closes, agent pushes (plain code, files two keys may merge, or files that need the human), CI outcomes, review verdicts, security reviews, approvals, change requests, `ai:hold` on and off, a planner creating sub-issues, epic review verdicts, red or green CI on the default branch, ending reruns, ended conversations, passing time and restarts. Events reach ForgeHands as signed webhooks through `createApp`, as Forgejo sends them, and the review sweep runs as fake time passes.
 
 After every step the test checks what must always hold:
 - at most one active job per key
@@ -55,7 +55,9 @@ After every step the test checks what must always hold:
 - a merged pull request was approved, had a green head, and `ai:hold` was off
 - a merge over a protected path went through two keys: only `two_keys` files, the security OK of the merged commit, and `TWO_KEYS_HOLD_MINUTES` after both keys agreed and after `ai:hold` came off
 
-At the end, once every pull request and issue is closed, nothing may be left active, held (no merge hold either), stuck or stalled. A restart in the middle of a sequence must end in the same ledger as the run without it.
+At the end, once every pull request and issue is closed, nothing may be left active, held (no merge hold either), stuck, stalled, or recorded as an epic with gaps.
+
+A scheduled workflow (`.github/workflows/fuzz.yml`) runs 3,000 seeds per mode every night, with other seeds each night (`FUZZ_OFFSET`). A restart in the middle of a sequence must end in the same ledger as the run without it.
 
 A failure prints its seed and the list of steps. Replay one seed with `FUZZ_SEED=<n>`, and run more than the default handful with `FUZZ_SEEDS=<n>` before a change to the dispatcher or the ledger:
 
