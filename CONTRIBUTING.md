@@ -46,7 +46,15 @@ The older collaborators (`review-sweep.ts`, `epic-gaps.ts`, `preflight.ts`, `han
 
 ## Replay tests
 
-`test/replay.test.ts` runs seeded random sequences of forge events (labels, comments, closes), ended conversations, passing time and restarts against the real dispatcher in a tiny fake world (`test/helpers/world.ts`). After every step it checks what must always hold: at most one active job per key, a running job has a conversation, a tier never runs more than its limit. At the end, once every issue is closed, nothing may be left active or held. A restart in the middle of a sequence must end in the same ledger as the run without it.
+`test/replay.test.ts` runs seeded random sequences against the real app and dispatcher in a small fake world (`test/helpers/world.ts`). The world is one repository on a fake Forgejo with issues, the agent pull requests of those issues (branch, head commit, commit status, labels, comments, merges that move the default branch) and a fake OpenHands. The sequences mix labels, comments, closes, agent pushes, CI outcomes, review verdicts, approvals, change requests, ended conversations, passing time and restarts. Events reach ForgeHands as signed webhooks through `createApp`, as Forgejo sends them, and the review sweep runs as fake time passes.
+
+After every step the test checks what must always hold:
+- at most one active job per key
+- a running job has a conversation
+- a tier never runs more than its limit
+- a merged pull request was approved and had a green head
+
+At the end, once every pull request and issue is closed, nothing may be left active, held, stuck or stalled. A restart in the middle of a sequence must end in the same ledger as the run without it.
 
 A failure prints its seed and the list of steps. Replay one seed with `FUZZ_SEED=<n>`, and run more than the default handful with `FUZZ_SEEDS=<n>` before a change to the dispatcher or the ledger:
 

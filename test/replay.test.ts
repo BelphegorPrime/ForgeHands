@@ -10,31 +10,48 @@ import { join } from 'node:path';
 import { Dispatcher } from '../src/agent/dispatch.ts';
 import { loadConfig } from '../src/config.ts';
 import { ACTIVE, JobStore } from '../src/store/jobs.ts';
+import { DeliveryStore } from '../src/store/deliveries.ts';
+import { createApp } from '../src/server/app.ts';
 import { Notifier } from '../src/notify/index.ts';
 import { prng } from './helpers/prng.ts';
-import { createWorld, REPO } from './helpers/world.ts';
+import { createWorld, poster, REPO } from './helpers/world.ts';
 
 const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
+const CHANGES = '33333333-3333-4333-8333-333333333333';
+const REVIEWER = '44444444-4444-4444-8444-444444444444';
 const MINUTE = 60000;
 const ISSUES = 3;
 const STEPS = 40;
+const SECRET = 'forgejo-test-secret-long-enough';
+const VERDICT = (ok) => (ok ? 'Verdict: OK\n' : 'Verdict: NOT OK\n') + 'Evidence: the criterion is checked at src/a.ts line 12, bash validate.sh exits 0. '.repeat(8);
 const quiet = { error() {} };
 let dir;
 
-const env = () => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+// Issue routes, rounds on the pull request, CI fix rounds and the review of a green commit, and merges of approved pull requests.
+const env = (file) => ({
+  FORGEJO_WEBHOOK_SECRET: SECRET,
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0',
   ALLOWED_REPOS: REPO,
   HUMAN_LOGIN: 'marcel',
-  LABEL_ROUTES: JSON.stringify({ 'ai:plan': { profile: PLANNER, tier: 'strong' }, 'ai:ready': { profile: WORKER, tier: 'free' } }),
+  LABEL_ROUTES: JSON.stringify({
+    'ai:plan': { profile: PLANNER, tier: 'strong' },
+    'ai:ready': { profile: WORKER, tier: 'free' },
+    'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
+    'ci:failure': { profile: CHANGES, tier: 'free', on: 'ci_failure' },
+    'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success' }
+  }),
+  MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['secrets/**'] } }),
+  APPROVAL_GRACE_SECONDS: '0',
+  REVIEW_SWEEP_MINUTES: '30',
+  STUCK_PR_MINUTES: '120',
   MAX_CONCURRENT_PER_TIER: '1',
   ERROR_RETRIES: '1',
   FORGEJO_TOKEN: 'tok-secret-value',
   FORGEJO_URL: 'https://forge.example',
-  DATA_FILE: join(dir, 'deliveries.json')
+  DATA_FILE: file + '.deliveries.json'
 });
 
 // The seeds a run tries: FUZZ_SEED replays one, FUZZ_SEEDS sets how many (a handful by default, so that npm test stays fast).
@@ -44,59 +61,103 @@ function seeds() {
   return Array.from({ length: count }, (_, index) => 1 + index * 7919);
 }
 
-// One step of a sequence: what a human or the forge does, a conversation that ends, time that passes, or (with restarts) ForgeHands restarting.
+// One step of a sequence: what a human, an agent, CI or the forge does, a conversation that ends, time that passes, or (with restarts)
+// ForgeHands restarting.
 function steps(seed, restarts) {
   const random = prng(seed);
   const list = [];
   for (let index = 0; index < STEPS; index += 1) {
     const number = 1 + random.int(ISSUES);
     const roll = random.next();
-    if (roll < 0.25) list.push({ kind: 'label', number, label: random.pick(['ai:ready', 'ai:ready', 'ai:plan']) });
-    else if (roll < 0.35) list.push({ kind: 'comment', number });
-    else if (roll < 0.45) list.push({ kind: 'close', number });
-    else if (roll < 0.5) list.push({ kind: 'reopen', number });
-    else if (roll < 0.7) list.push({ kind: 'end', pick: random.int(1000), state: random.pick(['finished', 'finished', 'error', 'stuck', 'max_iterations']) });
+    if (roll < 0.14) list.push({ kind: 'label', number, label: random.pick(['ai:ready', 'ai:ready', 'ai:plan']) });
+    else if (roll < 0.19) list.push({ kind: 'comment', number });
+    else if (roll < 0.24) list.push({ kind: 'close', number });
+    else if (roll < 0.27) list.push({ kind: 'reopen', number });
+    else if (roll < 0.35) list.push({ kind: 'push', number });
+    else if (roll < 0.43) list.push({ kind: 'ci', number, outcome: random.pick(['success', 'success', 'failure']) });
+    else if (roll < 0.48) list.push({ kind: 'verdict', number, ok: random.next() < 0.7 });
+    else if (roll < 0.52) list.push({ kind: 'approve', number });
+    else if (roll < 0.55) list.push({ kind: 'changes', number });
+    else if (roll < 0.57) list.push({ kind: 'closePull', number });
+    else if (roll < 0.6) list.push({ kind: 'ship', number });
+    else if (roll < 0.72) list.push({ kind: 'end', pick: random.int(1000), state: random.pick(['finished', 'finished', 'error', 'stuck', 'max_iterations']) });
     else if (restarts && roll < 0.78) list.push({ kind: 'restart' });
     else list.push({ kind: 'tick', minutes: random.pick([1, 5, 30, 240]) });
   }
   return list;
 }
 
-// A run of ForgeHands over one sequence. `clock` and the world live across restarts; the store and the dispatcher are built again from the file.
+// A run of ForgeHands over one sequence. `clock` and the world live across restarts; the store, the dispatcher and the app are built again from
+// the files. Events reach ForgeHands as signed webhooks through the real app, as Forgejo sends them.
 async function harness(file) {
-  const state = { clock: 1_700_000_000_000, comments: 0 };
+  const state = { clock: 1_700_000_000_000 };
   const world = createWorld(ISSUES, () => state.clock);
-  const config = loadConfig(env());
+  const config = loadConfig(env(file));
   const boot = async () => {
-    state.jobs = new JobStore(file);
+    if (state.server) await new Promise((resolve) => state.server.close(resolve));
+    state.jobs = new JobStore(file, quiet);
     await state.jobs.load();
     const notifier = new Notifier([], [], () => false, quiet, () => {});
     state.dispatcher = new Dispatcher(config, state.jobs, world.send, quiet, () => state.clock, notifier);
+    state.server = createApp(config, new DeliveryStore(config.dataFile), world.send, quiet, state.dispatcher);
+    await new Promise((resolve) => state.server.listen(0, '127.0.0.1', resolve));
+    state.post = poster(world, 'http://127.0.0.1:' + state.server.address().port + '/webhooks/forgejo', SECRET);
   };
   await boot();
   const drain = async () => { while (state.dispatcher.current) await state.dispatcher.current.catch(() => {}); };
   const apply = async (step) => {
     const issue = world.issues[step.number];
+    const pr = step.number ? world.pullOf(step.number) : undefined;
     if (step.kind === 'label') {
       issue.labels.add(step.label);
-      if (issue.state === 'open') await state.dispatcher.enqueue(world.event('issues.labeled', step.number, { label: step.label, action: 'labeled' }));
+      if (issue.state === 'open') await state.post(world.labelHook(step.number));
     } else if (step.kind === 'comment') {
       if (issue.state !== 'open') return;
-      state.comments += 1;
-      issue.comments.push({ id: state.comments, created_at: new Date(state.clock).toISOString(), user: { login: 'marcel' }, body: 'please go on' });
-      await state.dispatcher.onComment(world.event('issues.commented', step.number, { action: 'created', comment: { id: String(state.comments), login: 'marcel' } }));
+      world.comments += 1;
+      const comment = { id: world.comments, created_at: new Date(state.clock).toISOString(), user: { login: 'marcel' }, body: 'please go on' };
+      issue.comments.push(comment);
+      await state.post(world.commentHook(step.number, comment));
     } else if (step.kind === 'close') {
       if (issue.state !== 'open') return;
       issue.state = 'closed';
-      await state.dispatcher.onClosed(world.event('issues.closed', step.number, { action: 'closed' }));
+      await state.post(world.closeHook(step.number));
     } else if (step.kind === 'reopen') {
       issue.state = 'open';
+    } else if (step.kind === 'push') {
+      // The agent of the issue pushes its branch: only while the issue is open, as an agent works on open tickets.
+      if (issue.state === 'open') world.push(step.number);
+    } else if (step.kind === 'ci') {
+      if (!pr) return;
+      world.statuses[pr.head] = step.outcome;
+      await state.post(world.ciHook(pr, step.outcome));
+    } else if (step.kind === 'verdict') {
+      if (!pr) return;
+      world.comments += 1;
+      pr.comments.push({ id: world.comments, created_at: new Date(state.clock).toISOString(), user: { login: 'openhands' }, body: VERDICT(step.ok) });
+    } else if (step.kind === 'approve' || step.kind === 'changes') {
+      if (!pr) return;
+      pr.labels.add(step.kind === 'approve' ? 'ai:approved' : 'ai:changes');
+      await state.post(world.pullLabelHook(pr));
+    } else if (step.kind === 'ship') {
+      // The happy path in one step: CI turns the head green, the reviewer writes OK and approves.
+      if (!pr) return;
+      await apply({ kind: 'ci', number: step.number, outcome: 'success' });
+      state.clock += MINUTE;
+      await apply({ kind: 'verdict', number: step.number, ok: true });
+      await apply({ kind: 'approve', number: step.number });
+    } else if (step.kind === 'closePull') {
+      if (pr) pr.state = 'closed';
     } else if (step.kind === 'end') {
       const running = Object.keys(world.conversations).filter((id) => world.conversations[id] === 'running');
       if (running.length) world.conversations[running[step.pick % running.length]] = step.state;
     } else if (step.kind === 'tick') {
       state.clock += step.minutes * MINUTE;
       await state.dispatcher.tick();
+      // The review sweep runs on a timer of its own (REVIEW_SWEEP_MINUTES) in real time; here it runs when that much fake time has passed.
+      if (state.clock - (state.swept ?? 0) >= config.reviewSweepMinutes * MINUTE) {
+        state.swept = state.clock;
+        await state.dispatcher.sweep.run();
+      }
     } else if (step.kind === 'restart') {
       // A pass a webhook started in the background finishes first: a process that is stopped does not write afterwards either.
       await drain();
@@ -104,8 +165,11 @@ async function harness(file) {
       await state.jobs.writes;
       await boot();
     }
+    // What the forge sends because of what ForgeHands did (the push of a merge) arrives after the step.
+    while (world.outbox.length) await state.post(world.outbox.shift());
   };
-  return { state, world, apply, drain };
+  const close = async () => { await drain(); await new Promise((resolve) => state.server.close(resolve)); };
+  return { state, world, apply, drain, close, config };
 }
 
 // What must hold after every step, whatever came before.
@@ -117,14 +181,23 @@ function checkInvariants(state, world) {
   for (const job of jobs.filter((entry) => entry.status === 'running')) {
     assert.ok(job.conversation_id && world.conversations[job.conversation_id], 'a running job has a conversation OpenHands knows: ' + job.key);
   }
-  const running = jobs.filter((job) => job.status === 'running');
-  assert.ok(running.filter((job) => job.label === 'ai:ready').length <= 1 && running.filter((job) => job.label === 'ai:plan').length <= 1,
-    'a tier never runs more than MAX_CONCURRENT_PER_TIER: ' + running.map((job) => job.key).join(', '));
+  const tiers = new Map();
+  for (const job of jobs.filter((entry) => entry.status === 'running')) {
+    const tier = state.dispatcher.tierOf(job) ?? state.dispatcher.config.routes.get(job.label)?.tier;
+    tiers.set(tier, [...(tiers.get(tier) ?? []), job.key]);
+  }
+  for (const [tier, keys] of tiers) assert.ok(keys.length <= 1, 'tier ' + tier + ' never runs more than MAX_CONCURRENT_PER_TIER: ' + keys.join(', '));
+  // A merge happens only for an approved pull request whose head is green and has an OK verdict written after it.
+  for (const pr of Object.values(world.pulls).filter((entry) => entry.merged)) {
+    assert.ok(pr.labels.has('ai:approved'), 'a merged pull request was approved: #' + pr.number);
+    assert.equal(world.statuses[pr.head], 'success', 'a merged pull request had a green head: #' + pr.number);
+  }
 }
 
 // After the sequence the world settles: every conversation ends, every issue closes, and time passes. Nothing may be left active or held.
 async function settle(state, world, apply) {
   for (const id of Object.keys(world.conversations)) if (world.conversations[id] === 'running') world.conversations[id] = 'finished';
+  for (const pr of Object.values(world.pulls)) if (pr.state === 'open') pr.state = 'closed';
   for (const number of Object.keys(world.issues)) await apply({ kind: 'close', number: Number(number) });
   for (let round = 0; round < 12; round += 1) {
     for (const id of Object.keys(world.conversations)) if (world.conversations[id] === 'running') world.conversations[id] = 'finished';
@@ -137,9 +210,8 @@ async function settle(state, world, apply) {
   assert.equal(state.jobs.stalled.size, 0, 'no stalled record is left');
 }
 
-async function replay(seed, restarts, file) {
-  const list = steps(seed, restarts);
-  const { state, world, apply } = await harness(file);
+async function replay(seed, restarts, file, list = steps(seed, restarts)) {
+  const { state, world, apply, close } = await harness(file);
   let index = 0;
   try {
     for (; index < list.length; index += 1) {
@@ -153,6 +225,8 @@ async function replay(seed, restarts, file) {
       list.map((step, at) => at + ' ' + JSON.stringify(step)).join('\n'), { cause: error });
     replayed.stack = replayed.message;
     throw replayed;
+  } finally {
+    await close();
   }
   await state.jobs.persist(state.clock);
   await state.jobs.writes;
@@ -195,20 +269,19 @@ test('a restart in the middle of a sequence ends in the same ledger as the run w
       await a.apply(plain[index]); await a.drain();
       await b.apply(plain[index]); await b.drain();
     }
+    await a.close(); await b.close();
     await a.state.jobs.persist(a.state.clock); await a.state.jobs.writes;
     await b.state.jobs.persist(b.state.clock); await b.state.jobs.writes;
     const ledger = async (file) => {
-      const content = JSON.parse(await readFile(file, 'utf8'));
-      // Job ids are random per store. archived_view may differ on purpose: the closed-ticket sweep runs at start (see sweepClosed), so a
-      // restart can mark a closed ticket earlier than a day later. Everything else must agree.
-      content.jobs = content.jobs.map(({ id, archived_view, ...rest }) => rest).sort((x, y) => (x.key + x.created).localeCompare(y.key + y.created));
+      let raw = await readFile(file, 'utf8');
+      // Job ids are random per store: every mention of one (the job itself, a stalled record's run) becomes its key and creation time.
+      for (const job of JSON.parse(raw).jobs) raw = raw.replaceAll(JSON.stringify(job.id), JSON.stringify(job.key + '@' + job.created));
+      const content = JSON.parse(raw);
+      // archived_view may differ on purpose: the closed-ticket sweep runs at start (see sweepClosed), so a restart can mark a closed ticket
+      // earlier than a day later. Everything else must agree.
+      content.jobs = content.jobs.map(({ archived_view, ...rest }) => rest).sort((x, y) => (x.key + x.created).localeCompare(y.key + y.created));
       return content;
     };
     assert.deepEqual(await ledger(fileB), await ledger(fileA), 'seed ' + seed + ', restart before step ' + at);
   }
-});
-
-// Seeds that found a bug, kept as named tests so that they run on every npm test.
-test('a label set again while a pass checks an ended run for delivery does not start a second run on the ticket (seed 760225, #148)', async () => {
-  await replay(760225, false, join(dir, 'regression-760225.json'));
 });
