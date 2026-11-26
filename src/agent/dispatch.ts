@@ -35,6 +35,7 @@ import { markReverted, revertRate } from './revert-rate.ts';
 import { Nudger } from './nudge.ts';
 import { TERMINAL, RETRY_BASE_MS, MAX_ATTEMPTS, ROUND_KINDS, ERROR_RETRY_DELAY_MS, UNAVAILABLE_CODES, RECENT_STARTS, FILE_PULLS_LOOKED_AT, ACTIVE_STATUSES, RESUMABLE, PAUSE_MESSAGE, RESUME_SETTLE_MS, ESCALATABLE, IDLE_LOG_EVERY_MS, STALL_REPEAT_MS, DEP_CACHE_MS, DEP_READS_PER_PASS, ROUTE_KINDS, TOKEN_TYPES, tokenUsage, conversationCost, idleLine, RERUN_NOTE, RUN_UNFINISHED } from './run-states.ts';
 import type { PreExisting } from './run-states.ts';
+import { WaitKeeper } from './wait-keeper.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -81,12 +82,6 @@ export class Dispatcher {
   /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
   idle: IdleState | null = null;
   idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
-  // Same-files waits not taken ("repo#j>repo#t") and dependency cycles logged: each once, in memory.
-  cyclePairs = new Set<string>();
-  cyclesLogged = new Set<string>();
-  // The open dependencies read from the forge for the wait graph: ticket key -> when read and what was open (a failed read is an empty answer).
-  depCache = new Map<string, { at: number; open: string[] }>();
-  depReads = 0; // reads spent in the current pass
   /** The tickets the end-to-end suite created ("repo#n", lower case): the ticket watchdog leaves them alone (see exemptE2eTicket). */
   e2eTickets = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
@@ -94,6 +89,7 @@ export class Dispatcher {
   stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
 
   nudger: Nudger = new Nudger(this);
+  waitKeeper: WaitKeeper = new WaitKeeper(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -815,7 +811,7 @@ export class Dispatcher {
     if (this.jobs.operatorTickets.delete(ticket)) await this.jobs.persist(this.now());
     await this.markClosed(ticket);
     if (!this.config.forgejo) return 'no_forgejo_access';
-    await this.releaseFileWaitsNow();
+    await this.waitKeeper.releaseFileWaitsNow();
     let blocked: Json;
     try { blocked = await this.forge.blocks(event.repository.full_name, event.issue.number); }
     catch (error) { this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message); return 'blocks_unknown'; }
@@ -847,7 +843,7 @@ export class Dispatcher {
   // event, which starts what waits. Best effort.
   async closeMergedTickets(event: PushEvent): Promise<number> {
     if (!this.config.forgejo) return 0;
-    await this.releaseFileWaitsNow();
+    await this.waitKeeper.releaseFileWaitsNow();
     const repository = event.repository.full_name;
     let closed = 0;
     try {
@@ -1712,8 +1708,8 @@ export class Dispatcher {
     for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
       if (await this.releaseDeferred(job, now)) changed = true;
     }
-    this.depReads = 0;
-    if (await this.breakWaitCycles()) changed = true;
+    this.waitKeeper.depReads = 0;
+    if (await this.waitKeeper.breakWaitCycles()) changed = true;
     // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
     const tried = new Set<string>();
     let started = 0;
@@ -1889,155 +1885,6 @@ export class Dispatcher {
     await this.merger.clearApproval(event);
     this.logger.error(this.issueKey(event) + ': pull request #' + number + ' conflicts with the default branch, conflict round queued');
     return true;
-  }
-
-  // WAIT_FOR_SAME_FILES: the older issues (lower numbers) whose files this worker job's issue also declares, because they have an open agent
-  // pull request that changes them, or a job in the ledger and the same declared files. The oldest goes first, so no ticket ever waits
-  // for a newer one and two tickets cannot wait for each other. Any failing read means "not held": a ticket is never stuck on a guess.
-  async filesBlockers(job: Job): Promise<number[]> {
-    const event = job.event;
-    const mine = parseDeclaredFiles(event.issue.body);
-    if (!this.config.waitForSameFiles || !this.config.forgejo || !mine.length) return [];
-    const repository = event.repository.full_name;
-    const number = event.issue.number;
-    const blockers = new Set<number>();
-    try {
-      const pulls = await this.forge.listPulls(repository, { state: 'open', limit: FILE_PULLS_LOOKED_AT });
-      for (const pr of (Array.isArray(pulls) ? pulls : []).slice(0, FILE_PULLS_LOOKED_AT)) {
-        const other = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))?.[1]);
-        if (!other || other >= number || blockers.has(other)) continue;
-        const files = await this.forge.pullFiles(repository, pr.number, 100);
-        const names = (Array.isArray(files) ? files : []).flatMap((file) => [file.filename, file.previous_filename].filter((name): name is string => !!name));
-        if (anyOverlap(mine, names)) blockers.add(other);
-      }
-      for (const other of this.jobs.list(true)) {
-        const issue = other.event?.issue;
-        if (!issue || other.event.bot || other.event.repository.full_name.toLowerCase() !== repository.toLowerCase()) continue;
-        if (issue.number >= number || blockers.has(issue.number) || !ACTIVE_STATUSES.has(other.status)) continue;
-        if (this.config.epicLabels.has(other.label) || !anyOverlap(mine, parseDeclaredFiles(issue.body))) continue;
-        if ((await this.forge.getIssue(repository, issue.number))?.state === 'open') blockers.add(issue.number);
-      }
-    } catch (error) {
-      this.logger.error('could not compare the files of #' + number + ' with the open work, it is not held back:', error.message);
-      return [];
-    }
-    // A blocker that already waits for this ticket (explicit dependencies and the waits in force) would make a cycle: it is not waited for.
-    const me = repository.toLowerCase() + '#' + number;
-    const kept: number[] = [];
-    for (const other of [...blockers].sort((a, b) => a - b)) {
-      const key = repository.toLowerCase() + '#' + other;
-      if (!(await this.waitReaches(key, me, true))) kept.push(other);
-      else this.noteCycle(me, key);
-    }
-    return kept;
-  }
-
-  // Whether `to` is waited for, directly or through other waits, starting from `from`: the waits in force (the ledger's waiting jobs, explicit and, with
-  // `files`, same-files) and, for a ticket that has no waiting job with explicit dependencies, its open dependencies in the forge (forgeEdges).
-  async waitReaches(from: string, to: string, files: boolean): Promise<boolean> {
-    const ledger = waitGraph(this.jobs.list(), files);
-    const explicit = waitGraph(this.jobs.list(), false);
-    const seen = new Set([from]);
-    const queue = [from];
-    for (let i = 0; i < queue.length; i += 1) {
-      const node = queue[i];
-      if (node === to) return true;
-      const edges = new Set(ledger.get(node) ?? []);
-      if (!explicit.has(node)) for (const next of await this.forgeEdges(node)) edges.add(next);
-      for (const next of edges) {
-        if (!seen.has(next)) { seen.add(next); queue.push(next); }
-      }
-    }
-    return false;
-  }
-
-  // The open dependencies of a ticket, read from the forge. Cached per ticket for DEP_CACHE_MS; a failed read counts as none (cached too, so the
-  // ticket is not read again in that time); past DEP_READS_PER_PASS reads in a pass the answer is none for now (not cached). A ticket whose jobs are
-  // all archived (closed on the status page) is not read: its open dependencies do not hold anything back.
-  async forgeEdges(node: string): Promise<string[]> {
-    const cached = this.depCache.get(node);
-    if (cached && this.now() - cached.at < DEP_CACHE_MS) return cached.open;
-    const own = this.jobs.list().filter((job) => ticketKey(job) === node);
-    if (!this.config.forgejo || (own.length && own.every((job) => job.archived_view))) return [];
-    if (this.depReads >= DEP_READS_PER_PASS) return [];
-    this.depReads += 1;
-    const at = own[0]?.event.repository.full_name ?? node.split('#')[0];
-    const number = Number(node.split('#')[1]);
-    let open: string[] = [];
-    try {
-      const dependencies = await this.forge.dependencies(at, number);
-      open = (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => node.split('#')[0] + '#' + issue.number);
-    } catch (error) {
-      this.logger.error('could not read the dependencies of #' + number + ', its waits are not known for now:', error.message);
-    }
-    this.depCache.set(node, { at: this.now(), open });
-    return open;
-  }
-
-  // A same-files wait that closes a cycle is not taken: the older ticket already waits for this one, through explicit dependencies or other waits in
-  // force. Logged and counted once per pair (`waiting` is a ticket key, `other` the older one).
-  noteCycle(waiting: string, other: string): void {
-    const pair = waiting + '>' + other;
-    if (this.cyclePairs.has(pair)) return;
-    this.cyclePairs.add(pair);
-    metrics.inc('forgehands_wait_cycles_broken_total');
-    const number = other.split('#')[1];
-    this.logger.error(waiting + ': not waiting for #' + number + ' (same files): #' + number + ' is blocked by this ticket (cycle)');
-  }
-
-  // The waits in force are read from the ledger (no forge read): a same-files wait that closes a cycle is dropped, the explicit dependencies never. A job
-  // left with no wait is queued again. True when something changed.
-  async breakWaitCycles(): Promise<boolean> {
-    if (!this.config.waitForSameFiles) return false;
-    let changed = false;
-    for (const job of this.jobs.list('waiting')) {
-      if (!job.waiting_for_files?.length || job.waiting_for?.length || job.waiting_for_run || job.event.bot || job.event.pull_request) continue;
-      const me = ticketKey(job);
-      const repository = job.event.repository.full_name.toLowerCase();
-      const kept: number[] = [];
-      for (const number of job.waiting_for_files) {
-        const other = repository + '#' + number;
-        if (await this.waitReaches(other, me, true)) this.noteCycle(me, other);
-        else kept.push(number);
-      }
-      if (kept.length === job.waiting_for_files.length) continue;
-      changed = true;
-      if (kept.length) job.waiting_for_files = kept;
-      else {
-        job.status = 'queued';
-        delete job.waiting_for_files;
-        this.logger.error(job.key + ' no longer waits for the files of older tickets (cycle)');
-      }
-    }
-    return changed;
-  }
-
-  // Look again at the jobs that wait for the same files and queue those whose older tickets are gone. Called when something may have
-  // been freed (a push to the default branch, a closed issue, a run that ended); startJob checks once more before a worker starts.
-  async releaseFileWaits(): Promise<boolean> {
-    if (!this.config.waitForSameFiles) return false;
-    let changed = false;
-    for (const job of this.jobs.list('waiting')) {
-      if (!job.waiting_for_files?.length || job.waiting_for?.length) continue;
-      const blockers = await this.filesBlockers(job);
-      if (blockers.length) { job.waiting_for_files = blockers; continue; }
-      job.status = 'queued';
-      delete job.waiting_for_files;
-      this.logger.error(job.key + ' no longer waits for the files of older tickets');
-      changed = true;
-    }
-    return changed;
-  }
-
-  // The same, from outside a pass (a webhook): save and start what was released.
-  async releaseFileWaitsNow(): Promise<void> {
-    try {
-      if (!(await this.releaseFileWaits())) return;
-      await this.jobs.persist(this.now());
-      this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
-    } catch (error) {
-      this.logger.error('could not release the tickets that wait for the same files:', error.message);
-    }
   }
 
   // A ticket was sent to the planner (an epic label): its original agent pull request is closed (the branch stays), because the slices
@@ -2283,8 +2130,8 @@ export class Dispatcher {
     const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
     // A dependency cycle is logged once, when it is found.
     for (const text of cycles) {
-      if (this.cyclesLogged.has(text)) continue;
-      this.cyclesLogged.add(text);
+      if (this.waitKeeper.cyclesLogged.has(text)) continue;
+      this.waitKeeper.cyclesLogged.add(text);
       this.logger.error(text + ', none of its tickets can start: a human has to break it');
     }
     if (started) this.idleLogged = null;
@@ -2335,7 +2182,7 @@ export class Dispatcher {
     }
     // WAIT_FOR_SAME_FILES: an older ticket or pull request that changes the same files goes first.
     if (this.config.waitForSameFiles && this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && !this.config.epicLabels.has(job.label)) {
-      const blockers = await this.filesBlockers(job);
+      const blockers = await this.waitKeeper.filesBlockers(job);
       if (blockers.length) {
         Object.assign(job, { status: 'waiting', waiting_for_files: blockers });
         this.logger.error(job.key + ' waits for ' + blockers.map((number) => '#' + number).join(', ') + ' (same files)');
@@ -2499,14 +2346,14 @@ export class Dispatcher {
         Object.assign(job, { status: 'failed', result: state, finished: now });
         this.logger.error(job.key + ': paused, ' + stopped + ': not resumed');
         this.runEnded(job, state, now);
-        await this.releaseFileWaits();
+        await this.waitKeeper.releaseFileWaits();
         return true;
       }
       if (await this.resume(job, state, now)) return true;
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       this.runEnded(job, state, now);
       await this.checkBranchAfterRun(job);
-      await this.releaseFileWaits();
+      await this.waitKeeper.releaseFileWaits();
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
@@ -2725,4 +2572,7 @@ export class Dispatcher {
 
   // Reached from other modules and from the tests; the work is done by Nudger (nudge.ts).
   get nudgeInflight(): Nudger['nudgeInflight'] { return this.nudger.nudgeInflight; }
+
+  // Reached from other modules and from the tests; the work is done by WaitKeeper (wait-keeper.ts).
+  releaseFileWaits(...args: Parameters<WaitKeeper['releaseFileWaits']>): ReturnType<WaitKeeper['releaseFileWaits']> { return this.waitKeeper.releaseFileWaits(...args); }
 }
