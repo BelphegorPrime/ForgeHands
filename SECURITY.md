@@ -22,7 +22,7 @@ The webhook endpoint accepts untrusted input and must be protected with TLS, an 
 
 ## Status page and metrics
 
-`/status`, `/status.json` and `/metrics` are read only and show the ticket titles, the pull request numbers, costs and counters. They are **open unless `STATUS_TOKEN` is set** (at least 16 characters; the start logs a warning without it). With it they need `Authorization: Bearer <token>` or HTTP basic auth with the token as password, compared in constant time. Basic auth sends the token in base64 on every request, so keep the port behind TLS. A refused request is `401` with no ledger data. `/healthz` stays open. In a dry run `/status.json` also shows up to 300 characters of each would-be write (a comment text, say).
+`/status`, `/status.json` and `/metrics` are read only and show the ticket titles, the pull request numbers, costs and counters. They are **closed unless `STATUS_TOKEN` is set** (at least 16 characters): without it they answer `401`, and so does the dashboard and its WebSocket. `STATUS_PUBLIC=1` opens them to everybody who can reach the port (the start logs a warning); it cannot be set together with a token. With a token they need `Authorization: Bearer <token>` or HTTP basic auth with the token as password, compared in constant time. Basic auth sends the token in base64 on every request, so keep the port behind TLS. A refused request is `401` with no ledger data. `/healthz` stays open. In a dry run `/status.json` also shows up to 300 characters of each would-be write (a comment text, say).
 
 ## Reviews and approvals
 

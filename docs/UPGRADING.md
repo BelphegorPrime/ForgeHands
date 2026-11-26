@@ -493,3 +493,19 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first passes, the tickets of `/status` that read `waiting for ...` after a `done` run are restarted within `TICKET_STALL_MINUTES` per pass (`forgehands_stalled_ticket_actions_total{action="restart"}` counts them). The log line `ticket watchdog: could not read` should be rare.
 - **A reopened ticket is restarted only with a new run.** A ticket that was closed and reopened by hand, without a new run, keeps the closed mark in the ledger, so the watchdog does not read it. It is looked at again once a run of it exists.
 - **Rollback.** Go back to the previous version, or set `TICKET_STALL_MINUTES=0` to stop the watchdog. The closed marks already set stay in the ledger; the previous version reads the same flags on the status page.
+
+## Upgrading to the next release: the status page is closed without a token
+
+**What changes.** Without `STATUS_TOKEN`, ForgeHands closes these endpoints. They used to be open to everybody who could reach the port, with a warning at start:
+- `/` (the dashboard), `/api/dashboard` and `/dashboard/ws`
+- `/status` and `/status.json`
+- `/metrics`
+
+They now answer `401` with `{"error": "status_closed"}`. `/healthz` stays open.
+
+**What to do.**
+- **Recommended:** set `STATUS_TOKEN` (at least 16 characters) and send it as `Authorization: Bearer <token>`. Prometheus does this with `credentials_file`, see "Status page and metrics" in the README.
+- **To keep the old open page:** set `STATUS_PUBLIC=1`. Only do this when the port is reachable from a trusted network alone. Setting both variables stops the start.
+
+**Rollback.** Set `STATUS_PUBLIC=1`, or go back to the previous release.
+

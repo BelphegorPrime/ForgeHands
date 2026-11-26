@@ -32,6 +32,8 @@ const env = (extra = {}) => ({
   FORGEJO_TOKEN: 'tok-secret-value',
   MERGE_POLICY: JSON.stringify({ [repo]: { deny: ['compose.yaml'] } }),
   DATA_FILE: join(dir, 'deliveries.json'),
+  // The status page is closed without STATUS_TOKEN; these tests read it, so it is opened unless a test sets a token.
+  ...(extra.STATUS_TOKEN ? {} : { STATUS_PUBLIC: '1' }),
   ...extra
 });
 function fakeApi() {

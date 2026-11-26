@@ -265,6 +265,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   // STATUS_TOKEN protects /status, /status.json and /metrics (direct mode); without it they are open, as before.
   const statusToken = env.STATUS_TOKEN || null;
   if (statusToken !== null && statusToken.length < 16) throw new Error('STATUS_TOKEN must be at least 16 characters');
+  const statusPublic = statusPublicOf(env.STATUS_PUBLIC);
+  if (statusPublic && statusToken !== null) throw new Error('STATUS_PUBLIC=1 opens the status page to everybody, STATUS_TOKEN protects it: set one of them, not both');
   const dataFile = env.DATA_FILE || './data/deliveries.json';
   const common = {
     forge: forge as ForgeKind,
@@ -272,6 +274,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     allowedRepos,
     allowedSenders,
     statusToken,
+    statusPublic,
     dataFile,
     port,
     host: env.HOST || '0.0.0.0',
@@ -533,6 +536,13 @@ function parseE2e(env: NodeJS.ProcessEnv, allowed: Set<string>, forgeReady: bool
     if (!forgeReady) throw new Error('E2E_REPO needs FORGE_URL and FORGE_TOKEN (or FORGEJO_URL and FORGEJO_TOKEN) to drive the test repository');
   }
   return { repository, onStart, scenarios: names.length ? names : null, timeoutMinutes, queueMinutes };
+}
+
+// STATUS_PUBLIC: a 0/1 switch that is off unless set to 1; any other value is a mistake worth a clear message.
+function statusPublicOf(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '0') return false;
+  if (value === '1') return true;
+  throw new Error('STATUS_PUBLIC must be 0 or 1');
 }
 
 // A 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.

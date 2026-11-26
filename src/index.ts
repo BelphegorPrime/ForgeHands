@@ -21,7 +21,8 @@ let e2e: E2eController | null = null;
 if (config.mode === 'direct') {
   const jobs = new JobStore(config.jobsFile);
   await jobs.load();
-  if (!config.statusToken) console.error('warning: STATUS_TOKEN is not set, /status and /status.json are open to everybody who can reach this port');
+  if (config.statusPublic) console.error('warning: STATUS_PUBLIC=1, /status, /status.json and /metrics are open to everybody who can reach this port');
+  else if (!config.statusToken) console.error('/status, /status.json and /metrics are closed: set STATUS_TOKEN to use them, or STATUS_PUBLIC=1 to open them');
   const channels = notifyChannels(config.notify);
   console.log('notifications: ' + (channels.length ? channels.join(', ') + '; immediate: ' + (config.notify.immediate.join(', ') || 'none') + '; digest: ' + (config.notify.digest ? config.notify.digest + ' ' + config.notify.timezone : 'off') : 'no channel configured'));
   console.log(config.workspaceCleanupDir
