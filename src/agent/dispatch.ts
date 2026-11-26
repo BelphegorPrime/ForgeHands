@@ -177,6 +177,8 @@ export class Dispatcher {
   // The open dependencies read from the forge for the wait graph: ticket key -> when read and what was open (a failed read is an empty answer).
   depCache = new Map<string, { at: number; open: string[] }>();
   depReads = 0; // reads spent in the current pass
+  /** The tickets the end-to-end suite created ("repo#n", lower case): the ticket watchdog leaves them alone (see exemptE2eTicket). */
+  e2eTickets = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
   stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
@@ -208,7 +210,8 @@ export class Dispatcher {
     // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
       block: (event, text, why) => this.markForHuman(event, text, why),
-      rounds: (event) => this.rounds(event)
+      rounds: (event) => this.rounds(event),
+      exempt: (repository, number) => this.e2eTickets.has(repository.toLowerCase() + '#' + number)
     }, {
       startReview: (event, epic) => this.startEpicReview(event, epic)
     });
@@ -854,6 +857,12 @@ export class Dispatcher {
     this.logger.error(repository + (pull ? '!pr' : '#') + number + ': deleted in the forge, its waiting jobs are dropped');
     await this.jobs.persist(now);
     return true;
+  }
+
+  // A ticket the end-to-end suite created is left to the suite: the ticket watchdog does not restart or block it (src/e2e, ReviewSweep.watchStalled).
+  // It is kept for the life of the process; a closed ticket is no candidate of the watchdog anyway.
+  exemptE2eTicket(repository: string, number: number): void {
+    this.e2eTickets.add(repository.toLowerCase() + '#' + number);
   }
 
   // The runs of an issue ("repo#n") that wait or are queued are dropped: the end-to-end suite closes its tickets this way, and a closed ticket's

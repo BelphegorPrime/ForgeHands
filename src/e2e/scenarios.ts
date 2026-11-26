@@ -34,7 +34,10 @@ export const SCENARIOS: Scenario[] = [
         body: '## Files\n- ' + RED_MARKER + ' (new)\n\n## Steps\n1. Create the file ' + RED_MARKER + ' with the single line "red".\n2. Change nothing else.\n\n'
           + '## Acceptance\n```sh\ntest "$(cat ' + RED_MARKER + ')" = "red"\n```\n\n'
           + '## Notes\nThe default branch is meant to turn red after this change: the test repository\'s CI fails on main while the marker file exists. '
-          + 'That red is intended; do not remove the marker file.' },
+          + 'That red is intended; do not remove the marker file.\n\n'
+          + '## After a revert\nIf a comment on this ticket says that the change was reverted, the scenario is complete and this run is only its last step. '
+          + 'Deliver nothing: open no pull request, change no file and create no ticket, and make no dependency. Add one comment that the scenario is done. '
+          + 'The red default branch and the revert are the expected outcome, not a cause to fix and not an operator task.' },
       { do: 'wait', as: 'pr', timeoutMinutes: 30, for: { findPull: 'ai/issue-$ticket' } },
       { do: 'wait', timeoutMinutes: 45, for: { pull: '$pr', state: 'merged' } },
       { do: 'wait', timeoutMinutes: 20, for: { mergeCommit: '$pr', status: 'failure' } },

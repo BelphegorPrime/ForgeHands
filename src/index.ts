@@ -31,7 +31,8 @@ if (config.mode === 'direct') {
   dispatcher.start().catch((error) => console.error('dispatcher start failed:', error.message));
   // The end-to-end suite (E2E_REPO): off unless a test repository is named. It drives the test repository through the same forge client.
   if (config.e2e.repository) e2e = new E2eController({ config, forge: createForge(config, createTransport(config, fetch)), jobs, notifier: dispatcher.notifier, version, logger: console,
-    dropQueued: (repository, number) => (dispatcher ? dispatcher.dropQueuedOf(repository, number) : Promise.resolve(0)) });
+    dropQueued: (repository, number) => (dispatcher ? dispatcher.dropQueuedOf(repository, number) : Promise.resolve(0)),
+    exempt: (repository, number) => dispatcher?.exemptE2eTicket(repository, number) });
 }
 const server = createApp(config, store, fetch, console, dispatcher, e2e);
 

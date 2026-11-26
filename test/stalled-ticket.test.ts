@@ -188,6 +188,18 @@ test('a run that ended less than TICKET_STALL_MINUTES ago, an epic, or a closed 
   assert.equal(ticketJobs(closed.jobs).length, 1);
 });
 
+test('a ticket the end-to-end suite created is left alone by the ticket watchdog, and a record it had goes', async () => {
+  const t = build();
+  seed(t.jobs);
+  t.jobs.stalled.set(repo + '#26', { repository: repo, issue: 26, run: 'old', restarts: 1, human: false, at: clock });
+  t.dispatcher.exemptE2eTicket(repo, 26);
+  assert.equal(await t.dispatcher.sweep.watchStalled(repo, [], clock), 1, 'the record goes');
+  assert.equal(ticketJobs(t.jobs).length, 1, 'no run is started');
+  assert.equal(t.jobs.stalled.size, 0);
+  assert.deepEqual(t.comments(), [], 'no human is called');
+  assert.equal(await t.dispatcher.sweep.watchStalled(repo, [], clock), 0);
+});
+
 test('when the human takes the blocked label off, the ticket is looked at afresh and started once more', async () => {
   const ticket = { labels: [] };
   const t = build({}, ticket);
