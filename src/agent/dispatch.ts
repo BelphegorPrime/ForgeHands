@@ -37,6 +37,7 @@ import { TERMINAL, RETRY_BASE_MS, MAX_ATTEMPTS, ROUND_KINDS, ERROR_RETRY_DELAY_M
 import type { PreExisting } from './run-states.ts';
 import { WaitKeeper } from './wait-keeper.ts';
 import { RevertKeeper } from './revert-keeper.ts';
+import { BranchRefresher } from './branch-refresh.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -76,8 +77,6 @@ export class Dispatcher {
   nextClosedSweep = 0;
   closedChecked = new Map<string, number>();
   closeRefused = new Map<string, number>(); // repository#issue -> until when a refused close is not tried again
-  lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
-  mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
   /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
   idle: IdleState | null = null;
@@ -91,6 +90,7 @@ export class Dispatcher {
   nudger: Nudger = new Nudger(this);
   waitKeeper: WaitKeeper = new WaitKeeper(this);
   revertKeeper: RevertKeeper = new RevertKeeper(this);
+  branchRefresher: BranchRefresher = new BranchRefresher(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -1373,7 +1373,7 @@ export class Dispatcher {
     if (started) this.lastStart = now;
     this.reportIdle(now, started);
     this.checkStall(now);
-    if (await this.refreshMoved(now)) changed = true;
+    if (await this.branchRefresher.refreshMoved(now)) changed = true;
     // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
     if (await this.merger.recheckHolds()) changed = true;
     if (await this.archiveOld(now)) changed = true;
@@ -1385,156 +1385,6 @@ export class Dispatcher {
     if (await this.revertKeeper.checkRevertRate(now)) changed = true;
     if (await this.revertKeeper.checkReruns(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
-  }
-
-  // The default branch of a repository moved. Remember the newest push and look at the pull requests once it has been quiet for a while.
-  onMainMoved(event: PushEvent): string {
-    if (!this.config.updateBranches || !this.config.forgejo) return 'branch_updates_off';
-    this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
-    return 'scheduled';
-  }
-
-  async refreshMoved(now: number): Promise<boolean> {
-    let changed = false;
-    for (const [repository, moved] of [...this.mainMoved]) {
-      if (now - moved.at < this.config.branchUpdateDelayMs) continue;
-      this.mainMoved.delete(repository);
-      try { if (await this.refreshBranches(moved.event)) changed = true; }
-      catch (error) { this.logger.error('could not look at the pull requests of ' + repository + ':', error.message); }
-    }
-    return changed;
-  }
-
-  // Open agent pull requests (branch ai/issue-<n>) that fell behind the default branch. What a rebase throws away is a review, so only a
-  // pull request with neither an approval nor an OK review for its current commit is brought up to date, and only when no agent works on
-  // its issue. A rebase that conflicts becomes a conflict round of the worker. Approved and reviewed pull requests are left alone: they
-  // merge as they are, and a conflict shows when the merge is tried.
-  async refreshBranches(event: PushEvent): Promise<boolean> {
-    const tip = event.after;
-    const pulls = await this.forge.listPulls(event.repository.full_name, { state: 'open', limit: 50 });
-    let changed = false;
-    let deferred = false;
-    for (const pr of Array.isArray(pulls) ? pulls : []) {
-      const outcome = await this.refreshPull(event, pr, tip);
-      if (outcome.changed) changed = true;
-      if (outcome.deferred) deferred = true;
-    }
-    // Look again later at what was postponed (the CI run ended, the cooldown passed).
-    if (deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
-    return changed;
-  }
-
-  // One open pull request against the default branch at `tip`: bring it up to date, or start a conflict round when the rebase conflicts.
-  async refreshPull(event: PushEvent, pr: Json, tip: string): Promise<{ changed: boolean; deferred: boolean }> {
-    const none = { changed: false, deferred: false };
-    const base = event.repository.full_name.toLowerCase() + '#';
-    const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
-    if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) return none;
-    if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) return none;
-    const issue = Number(match[1]);
-    if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) return none;
-    const labels = (pr.labels || []).map((label: Json) => label.name);
-    if (labels.includes(this.config.blockedLabel)) return none;
-    const approved = labels.includes(this.config.approvedLabel);
-    const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
-      issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
-    let reviewed = approved;
-    if (!reviewed) { try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; } }
-    // An approved or reviewed pull request is not brought up to date: that would throw the review away, and it merges as it is. But one
-    // that conflicts can be merged by nobody (a human waiting to merge a protected path would find it so). Once the WIP marker is gone,
-    // which approval removes, Forgejo's mergeable is reliable: a conflict starts a conflict round, after which CI and review run again.
-    if (reviewed) {
-      if (pr.mergeable === false && !this.forge.isWip(String(pr.title || '')) && (await this.startConflictRound(prEvent, tip))) return { changed: true, deferred: false };
-      return none;
-    }
-    // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
-    // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
-    if (!(await this.touchesSameFiles(event, pr, tip))) return none;
-    const hold = await this.updateHold(event, pr);
-    if (hold) { this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); return { changed: false, deferred: true }; }
-    this.lastUpdate.set(base + pr.number, this.now());
-    try {
-      if (await this.forge.updateBranch(event.repository.full_name, pr.number) === 'conflict') {
-        metrics.inc('forgehands_branch_conflicts_total');
-        if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
-        return none;
-      }
-      this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
-      metrics.inc('forgehands_branch_updates_total');
-    } catch (error) {
-      this.logger.error('could not update #' + pr.number + ':', error.message);
-    }
-    return none;
-  }
-
-  // The default branch may have moved while a run on this pull request was active (such a pull request is left alone, see refreshPull), and
-  // no later push brings it back into view. When the run ends, look at the pull request once: the same update, the same conflict round.
-  async checkBranchAfterRun(job: Job): Promise<void> {
-    const event = job.event;
-    // A dependency bot keeps its own branch current (Renovate rebases itself).
-    if (!this.config.updateBranches || !this.config.forgejo || !event?.pull_request || event.bot) return;
-    const kind = this.config.routes.get(job.label)?.kind;
-    if (kind === 'conflict' || kind === 'sensitive_review') return;
-    try {
-      const branch = event.repository.default_branch;
-      if (!branch) return;
-      const tip = await this.forge.branchTip(event.repository.full_name, branch);
-      if (typeof tip !== 'string' || !tip) return;
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      const push = { type: 'push.default', source: this.forge.kind, repository: event.repository, sender: event.sender, after: tip } as unknown as PushEvent;
-      const outcome = await this.refreshPull(push, pr, tip);
-      if (outcome.deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event: push });
-      if (outcome.changed) this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
-    } catch (error) {
-      this.logger.error('could not look at the branch of #' + event.pull_request.number + ' after its run:', error.message);
-    }
-  }
-
-  // Can the rebase of this pull request conflict? Only if the default branch changed a file since the merge base that the pull request
-  // changes too. Anything unclear (a failing call, a list that may be cut off) counts as yes.
-  async touchesSameFiles(event: PushEvent, pr: Json, tip: string): Promise<boolean> {
-    try {
-      const compare = await this.forge.compare(event.repository.full_name, pr.merge_base, tip);
-      const ours = await this.forge.pullFiles(event.repository.full_name, pr.number, 100);
-      if (!Array.isArray(compare?.files) || !Array.isArray(ours) || ours.length >= 100 || ((compare.total_commits ?? 0) > 0 && compare.files.length === 0)) return true;
-      const names = (list: Json[]) => list.flatMap((file) => [file.filename, file.previous_filename]).filter(Boolean);
-      const theirs = new Set(names(compare.files));
-      return names(ours).some((name) => theirs.has(name));
-    } catch (error) {
-      this.logger.error('could not compare #' + pr.number + ' with the default branch:', error.message);
-      return true;
-    }
-  }
-
-  // Why the update of this pull request has to wait, or null: CI still runs on its head commit, or its branch was updated recently.
-  async updateHold(event: PushEvent, pr: Json): Promise<string | null> {
-    const last = this.lastUpdate.get(event.repository.full_name.toLowerCase() + '#' + pr.number);
-    if (last && this.now() - last < this.config.branchUpdateMinIntervalMs) return 'cooldown';
-    try {
-      const status = await this.forge.commitStatus(event.repository.full_name, pr.head.sha);
-      if (status?.state === 'pending' && status.total_count > 0) return 'CI is still running';
-    } catch (error) {
-      this.logger.error('could not read the status of #' + pr.number + ':', error.message);
-    }
-    return null;
-  }
-
-  // The branch of a pull request conflicts with the default branch: a round of the worker resolves it (rebase and one force push are
-  // allowed in this round and only here). Counts as a round; without a conflict route, or when the rounds are used up, a human is called.
-  async startConflictRound(event: ForgeEvent, tip: string): Promise<boolean> {
-    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'conflict')?.[0];
-    const number = event.pull_request!.number;
-    if (!route) {
-      await this.markForHuman(event, 'ForgeHands: the pull request conflicts with ' + (event.repository.default_branch || 'the default branch') + ' and no conflict round is configured. A human has to resolve it.', 'conflict');
-      return false;
-    }
-    const key = this.issueKey(event) + ':' + route + ':' + tip.slice(0, 8);
-    if (this.jobs.list().some((job) => job.key === key)) return false;
-    if (this.rounds(event) >= this.roundLimit(event)) { await this.roundsUsedUp(event); return false; }
-    this.jobs.add({ key, label: route, status: 'queued', created: this.now(), event: { ...event, type: 'pull_request.conflict', label: route, base_sha: tip } });
-    await this.merger.clearApproval(event);
-    this.logger.error(this.issueKey(event) + ': pull request #' + number + ' conflicts with the default branch, conflict round queued');
-    return true;
   }
 
   // A ticket was sent to the planner (an epic label): its original agent pull request is closed (the branch stays), because the slices
@@ -2002,7 +1852,7 @@ export class Dispatcher {
       if (await this.resume(job, state, now)) return true;
       Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
       this.runEnded(job, state, now);
-      await this.checkBranchAfterRun(job);
+      await this.branchRefresher.checkBranchAfterRun(job);
       await this.waitKeeper.releaseFileWaits();
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
@@ -2229,4 +2079,10 @@ export class Dispatcher {
   // Reached from other modules and from the tests; the work is done by RevertKeeper (revert-keeper.ts).
   checkRevertRate(...args: Parameters<RevertKeeper['checkRevertRate']>): ReturnType<RevertKeeper['checkRevertRate']> { return this.revertKeeper.checkRevertRate(...args); }
   checkReruns(...args: Parameters<RevertKeeper['checkReruns']>): ReturnType<RevertKeeper['checkReruns']> { return this.revertKeeper.checkReruns(...args); }
+
+  // Reached from other modules and from the tests; the work is done by BranchRefresher (branch-refresh.ts).
+  get lastUpdate(): BranchRefresher['lastUpdate'] { return this.branchRefresher.lastUpdate; }
+  onMainMoved(...args: Parameters<BranchRefresher['onMainMoved']>): ReturnType<BranchRefresher['onMainMoved']> { return this.branchRefresher.onMainMoved(...args); }
+  refreshPull(...args: Parameters<BranchRefresher['refreshPull']>): ReturnType<BranchRefresher['refreshPull']> { return this.branchRefresher.refreshPull(...args); }
+  checkBranchAfterRun(...args: Parameters<BranchRefresher['checkBranchAfterRun']>): ReturnType<BranchRefresher['checkBranchAfterRun']> { return this.branchRefresher.checkBranchAfterRun(...args); }
 }
