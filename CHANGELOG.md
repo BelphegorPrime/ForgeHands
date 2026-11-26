@@ -2,6 +2,42 @@
 
 What changed in each release, from 0.4.0 on, taken from the commits. Behaviour that an operator has to act on is in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## 1.0.0 (unreleased)
+
+The first release under the versioning promise in the README ("Stability and versioning"): from here on, the environment variables, the ledger file, the webhook paths, the labels, branches and verdict lines on the forge, the metric names and `/status.json` change only in a major release.
+
+### Removed
+
+- `FORGEJO_URL`, `FORGEJO_TOKEN` and `FORGEJO_WEBHOOK_SECRET`: use `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, also in `AGENT_SECRETS`. The agents still receive `FORGEJO_URL` and `FORGEJO_TOKEN`.
+- `HUMAN_REVIEW_ROUNDS`: a request for changes of `HUMAN_LOGIN` always starts a round.
+- `HANDBACK_HANDLING`: a run that hands its ticket back by a comment is always handled as a hand-back.
+- A start with one of these still set stops with a message that says what to set instead (see docs/UPGRADING.md).
+- `TIER_WEEKLY_BUDGETS` (removed in 0.4.0) is no longer mentioned at start.
+
+## 0.11.0 (2026-11-26)
+
+### Added
+
+- GitLab: when `FORGE_WEBHOOK_SECRET` is a signing token (`whsec_...`, GitLab 19.0 and later), a delivery is checked by its HMAC signature and must be at most five minutes old.
+- `STATUS_PUBLIC=1` opens the status page and the metrics without a token.
+- The README states what the version number promises, and a test pins the public interface: the variables, the metric names, the webhook paths and the ledger version.
+- A changelog, and every upgrade note now names its release. The notes start with an overview of the features that have been on by default since 0.4.
+
+### Changed
+
+- **The dashboard, `/status`, `/status.json`, `/metrics` and the dashboard's WebSocket are closed without `STATUS_TOKEN`.** They answer `401` unless `STATUS_PUBLIC=1` is set (see docs/UPGRADING.md).
+- `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET`, `HUMAN_REVIEW_ROUNDS` and `HANDBACK_HANDLING` are deprecated. They still work and warn at start, and go in 1.0.0.
+- The error for a short webhook secret names the variable that is set.
+- Five variables that were missing from `.env.example` are added.
+
+### Fixed
+
+- An epic handed to the human no longer keeps its gap record in the ledger after it is closed.
+
+### Tests
+
+- The replay tests run through the real app with signed webhooks, and model pull requests, CI, two keys and merge holds, epics, a red default branch with reruns and reverts, dependency bot pull requests and native reviews. A scheduled workflow runs 3,000 seeds per mode every night.
+
 ## 0.10.0 (2026-11-26)
 
 ### Changed
