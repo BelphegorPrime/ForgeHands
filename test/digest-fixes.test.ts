@@ -26,13 +26,13 @@ function pr(number, title, mergedAgo, branch, files, merger = 'openhands', extra
 async function setup(pulls, { failFiles = [], failPulls = [], listError = false } = {}) {
   const base = await mkdtemp(join(tmpdir(), 'forgehands-fix-'));
   const config = loadConfig({
-    FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
     OPENHANDS_API_URL: 'http://openhands:8000/',
     OPENHANDS_API_KEY: 'k'.repeat(24),
     ALLOWED_REPOS: repo,
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: '22222222-2222-4222-8222-222222222222', tier: 'free' } }),
-    FORGEJO_TOKEN: 'tok',
-    FORGEJO_URL: 'https://forge.example',
+    FORGE_TOKEN: 'tok',
+    FORGE_URL: 'https://forge.example',
     DATA_FILE: join(base, 'deliveries.json')
   });
   const jobs = new JobStore(join(base, 'jobs.json'));

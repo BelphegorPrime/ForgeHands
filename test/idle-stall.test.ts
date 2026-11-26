@@ -25,16 +25,16 @@ const ROUTES = {
 let dir; let clock; let logs; let n = 0; let sent;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify(ROUTES),
   UPDATE_BRANCHES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });

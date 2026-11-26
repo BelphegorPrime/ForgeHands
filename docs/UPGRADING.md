@@ -509,3 +509,10 @@ They now answer `401` with `{"error": "status_closed"}`. `/healthz` stays open.
 
 **Rollback.** Set `STATUS_PUBLIC=1`, or go back to the previous release.
 
+## Upgrading to the next release: deprecated settings warn at start
+
+Nothing stops working. These settings are deprecated and will be removed in 1.0.0. When one is set, the start logs `warning: <NAME> is deprecated and will be removed in 1.0.0: ...` with what to do instead:
+
+- **`FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET`.** Rename them to `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, in the environment and in `AGENT_SECRETS`. Nothing changes for the agents: they still receive the values as `FORGEJO_URL` and `FORGEJO_TOKEN`.
+- **`HUMAN_REVIEW_ROUNDS` and `HANDBACK_HANDLING`.** In 1.0.0 both are always on. If you set either to `0`, plan for that behaviour now.
+

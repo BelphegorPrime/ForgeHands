@@ -27,7 +27,7 @@ const MINUTE = 60000;
 let dir; let clock;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: repo,
@@ -37,9 +37,9 @@ const env = (extra = {}) => ({
     'ci:success': { profile: REVIEWER, tier: 'strong', max_iterations: 60, on: 'ci_success' },
     'sensitive:review': { profile: SECURITY, tier: 'strong', max_iterations: 60, on: 'sensitive_review', forgejo_token_secret: 'SECURITY_TOKEN' }
   }),
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   SECURITY_TOKEN: 'security-token-value',
   SECURITY_REVIEWERS: 'security-bot',
   HUMAN_LOGIN: 'marcel',

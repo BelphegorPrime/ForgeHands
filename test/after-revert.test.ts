@@ -25,7 +25,7 @@ let dir; let clock; let world; let openhands; let counter = 0; let logs;
 const logger = { error(...args) { logs.push(args.join(' ')); } };
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
@@ -37,9 +37,9 @@ const env = (extra = {}) => ({
     'main:red': { profile: REVERTER, tier: 'free', on: 'main_red' }
   }),
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });

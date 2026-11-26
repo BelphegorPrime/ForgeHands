@@ -30,7 +30,7 @@ export const ESCALATE = '33333333-3333-4333-8333-333333333333';
 export const repo = 'owner/hello';
 export const quiet = { error() {} };
 export const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
@@ -42,9 +42,9 @@ export const env = (extra = {}) => ({
   }),
   MAX_CONCURRENT_PER_TIER: '2',
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(ctx.dir, 'deliveries.json'),
   // The status page is closed without STATUS_TOKEN; these tests read it, so it is opened unless a test sets a token.
   ...(extra.STATUS_TOKEN ? {} : { STATUS_PUBLIC: '1' }),
@@ -472,7 +472,7 @@ export const HEAD = 'cafe0000cafe';
 export const REVIEW_BODY = '## Verdict: OK\n' + 'Evidence: criterion met at src/a.mjs line 12, check bash validate.sh exit 0. '.repeat(8);
 export const reviewEnv = (extra = {}) => withMerge({
   VERDICT_SOURCE: 'review',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,REVIEWER_TOKEN,REVIEWER2_TOKEN',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,REVIEWER_TOKEN,REVIEWER2_TOKEN',
   REVIEWER_TOKEN: 'tok-reviewer-one', REVIEWER2_TOKEN: 'tok-reviewer-two',
   LABEL_ROUTES: JSON.stringify({
     'ai:ready': { profile: WORKER, tier: 'free' },
@@ -540,7 +540,7 @@ export const twoKeyRoutes = () => JSON.stringify({ ...JSON.parse(sensitiveRoutes
 export async function twoKeys(files, comments, extra = {}) {
   const all = [{ created_at: '2026-11-15T11:00:00Z', user: { login: 'openhands' }, body: VERDICT_OK }, ...comments];
   const routes = goodRoutes({ ['GET ' + API + '/pulls/34/files']: files.map((filename) => ({ filename })), ['GET ' + API + '/issues/34/comments']: all, ['GET ' + API + '/issues/34/comments?limit=100']: all });
-  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value', HUMAN_LOGIN: 'marcel', SECURITY_REVIEWERS: 'Security-Bot', ...extra });
+  const made = await mergerFor(routes, { MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value', HUMAN_LOGIN: 'marcel', SECURITY_REVIEWERS: 'Security-Bot', ...extra });
   return { ...made, all };
 }
 export const filesBody = (...files) => '## Summary\nSomething.\n\n## Exact files\n' + files.map((file) => '- `' + file + '`').join('\n') + '\n\n## Tests\n- `not/declared.ts`\n';

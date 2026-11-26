@@ -25,7 +25,7 @@ const quiet = { error() {} };
 let dir; let clock; let openhands; let states; let appCount = 0;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: repo,
@@ -38,9 +38,9 @@ const env = (extra = {}) => ({
   }),
   MAX_CONCURRENT_PER_TIER: '4',
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries-' + (appCount++) + '.json'),
   ...extra
 });
@@ -280,7 +280,7 @@ test('VERDICT_SOURCE=both: one human review starts one round, however often it i
 });
 
 test('the request of the operator in review mode is handled by the review path, which is unchanged', async () => {
-  const a = await app({ VERDICT_SOURCE: 'review', AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,REVIEWER_TOKEN', REVIEWER_TOKEN: 'tok-reviewer-one',
+  const a = await app({ VERDICT_SOURCE: 'review', AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,REVIEWER_TOKEN', REVIEWER_TOKEN: 'tok-reviewer-one',
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' }, 'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
       'ci:success': { profile: WORKER, tier: 'strong', on: 'ci_success', forgejo_token_secret: 'REVIEWER_TOKEN' } }) }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
   try {
@@ -291,7 +291,7 @@ test('the request of the operator in review mode is handled by the review path, 
 });
 
 test('a comment review is no event in review mode', async () => {
-  const review = await app({ VERDICT_SOURCE: 'review', AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,REVIEWER_TOKEN', REVIEWER_TOKEN: 'tok-reviewer-one',
+  const review = await app({ VERDICT_SOURCE: 'review', AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,REVIEWER_TOKEN', REVIEWER_TOKEN: 'tok-reviewer-one',
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' }, 'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
       'ci:success': { profile: WORKER, tier: 'strong', on: 'ci_success', forgejo_token_secret: 'REVIEWER_TOKEN' } }) }, { reviews: [rev(1, 'marcel', 'REQUEST_CHANGES')] });
   try {

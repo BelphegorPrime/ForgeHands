@@ -22,7 +22,7 @@ let dir; let clock; let logs; let openhands; let world;
 const logger = { error(...args) { logs.push(args.join(' ')); } };
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: repo,
@@ -33,9 +33,9 @@ const env = (extra = {}) => ({
   }),
   MAX_CONCURRENT_PER_TIER: '4',
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });

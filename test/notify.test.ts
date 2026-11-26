@@ -23,12 +23,12 @@ let dir; let clock;
 
 const SMTP = { SMTP_HOST: 'smtp.invalid', SMTP_FROM: 'forgehands@example.org', SMTP_TO: 'marcel@example.org' };
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' }, 'ai:other': { profile: WORKER, tier: 'strong' } }),
-  FORGEJO_TOKEN: 'tok', FORGEJO_URL: 'https://forge.example',
+  FORGE_TOKEN: 'tok', FORGE_URL: 'https://forge.example',
   HUMAN_LOGIN: 'marcel',
   MERGE_POLICY: JSON.stringify({ [repo]: { deny: ['compose.yaml', 'stacks/**'], reasons: { 'stacks/**': 'stacks are deployed to production' } } }),
   APPROVAL_GRACE_SECONDS: '0', ARCHIVE_AFTER_DAYS: '0',

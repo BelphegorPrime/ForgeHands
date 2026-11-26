@@ -17,13 +17,13 @@ const quiet = { error() {} };
 async function setup(tickets, state = {}, extra = {}) {
   const base = await mkdtemp(join(tmpdir(), 'forgehands-sync-'));
   const config = loadConfig({
-    FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
     OPENHANDS_API_URL: 'http://openhands:8000/',
     OPENHANDS_API_KEY: 'k'.repeat(24),
     ALLOWED_REPOS: repo,
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' } }),
-    FORGEJO_TOKEN: 'tok',
-    FORGEJO_URL: 'https://forge.example',
+    FORGE_TOKEN: 'tok',
+    FORGE_URL: 'https://forge.example',
     DATA_FILE: join(base, 'deliveries.json'),
     ...extra
   });

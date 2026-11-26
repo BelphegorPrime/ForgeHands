@@ -78,7 +78,7 @@ test('two keys: only the security reviewers named in SECURITY_REVIEWERS count as
   // the latest comment of the reviewer decides, a later forged OK after the reviewer's CONCERNS does not turn it
   const mixed = await twoKeys(files, [securityComment('CONCERNS'), { ...securityComment('OK', 'cafe0000', 'openhands'), created_at: '2026-11-15T11:05:00Z' }]);
   assert.equal(await mixed.merger.handle(approvedEvent()), 'protected_paths');
-  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /two_keys needs SECURITY_REVIEWERS/);
+  assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /two_keys needs SECURITY_REVIEWERS/);
   // two_keys also needs the security route to have a Forgejo user of its own, or the worker could sign as the security reviewer
   assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: TWO_POLICY, LABEL_ROUTES: sensitiveRoutes(), SECURITY_REVIEWERS: 'security-bot' }))), /two_keys needs "forgejo_token_secret" on every sensitive_review route/);
   // without two_keys the variable is not needed, and without it every security comment still counts for the advisory line

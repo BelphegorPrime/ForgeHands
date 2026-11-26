@@ -21,15 +21,15 @@ const quiet = { error() {} };
 let dir; let clock; let states; let failStarts; let forgejoStatus;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: repo + ',owner/quiet',
   LABEL_ROUTES: JSON.stringify({ 'ai:plan': { profile: PLANNER, tier: 'strong' }, 'ai:ready': { profile: WORKER, tier: 'free' } }),
   ERROR_RETRIES: '1',
-  FORGEJO_URL: 'https://forge.example',
-  FORGEJO_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
+  FORGE_TOKEN: 'tok-secret-value',
   MERGE_POLICY: JSON.stringify({ [repo]: { deny: ['compose.yaml'] } }),
   DATA_FILE: join(dir, 'deliveries.json'),
   // The status page is closed without STATUS_TOKEN; these tests read it, so it is opened unless a test sets a token.

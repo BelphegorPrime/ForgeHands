@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 test('failed upstream deliveries are retryable', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'forgehands-failure-'));
   const config = loadConfig({
-    FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
     OPENHANDS_WEBHOOK_SECRET: 'openhands-test-secret-long-enough',
     OPENHANDS_WEBHOOK_URL: 'http://127.0.0.1:9999/endpoint',
     ALLOWED_REPOS: 'owner/repo',

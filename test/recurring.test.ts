@@ -21,14 +21,14 @@ const SHA_D = 'd4e5f6a7' + '0'.repeat(32);
 const quiet = { error() {} };
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: REVIEWER, tier: 'free' }, 'ai:changes': { profile: REVIEWER, tier: 'free', on: 'pull_request' } }),
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
   RECURRING_REASON_MIN: '3',
   SPLIT_LABEL: 'ai:split',
   ...extra

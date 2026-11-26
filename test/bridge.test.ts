@@ -18,7 +18,7 @@ let store;
 const outbound = [];
 const repo = 'owner/hello-world';
 const config = loadConfig({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_WEBHOOK_SECRET: 'openhands-test-secret-long-enough',
   OPENHANDS_WEBHOOK_URL: 'http://127.0.0.1:9999/v1/events/org/forgehands',
   ALLOWED_REPOS: repo,

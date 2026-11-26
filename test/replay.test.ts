@@ -39,7 +39,7 @@ let dir;
 
 // Issue routes, rounds on the pull request, CI fix rounds and the review of a green commit, and merges of approved pull requests.
 const env = (file) => ({
-  FORGEJO_WEBHOOK_SECRET: SECRET,
+  FORGE_WEBHOOK_SECRET: SECRET,
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0',
@@ -58,7 +58,7 @@ const env = (file) => ({
   // Two keys: infra/tests/** merges with the security review's OK, after a hold; any other infra file needs the human.
   MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['infra/**'], two_keys: ['infra/tests/**'] } }),
   SECURITY_REVIEWERS: SECURITY_LOGIN,
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN',
   SECURITY_TOKEN: 'security-token-value',
   TWO_KEYS_HOLD_MINUTES: String(HOLD_MINUTES),
   APPROVAL_GRACE_SECONDS: '0',
@@ -66,8 +66,8 @@ const env = (file) => ({
   STUCK_PR_MINUTES: '120',
   MAX_CONCURRENT_PER_TIER: '1',
   ERROR_RETRIES: '1',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: file + '.deliveries.json'
 });
 

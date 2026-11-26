@@ -189,7 +189,7 @@ test('the reviewer prompt in review mode submits a review pinned to the commit, 
 });
 
 test('a reviewer route hands its own Forgejo token to its conversation as FORGEJO_TOKEN, and to no other', async () => {
-  const config = loadConfig(env(reviewEnv({ AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,REVIEWER_TOKEN', MAX_CONCURRENT: '5', MAX_CONCURRENT_PER_TIER: '5' })));
+  const config = loadConfig(env(reviewEnv({ AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,REVIEWER_TOKEN', MAX_CONCURRENT: '5', MAX_CONCURRENT_PER_TIER: '5' })));
   const jobs = new JobStore(join(ctx.dir, 'jobs.json'));
   await jobs.load();
   const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => ctx.clock);

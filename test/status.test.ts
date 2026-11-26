@@ -27,7 +27,7 @@ const NOW = Date.UTC(2026, 5, 30, 12);
 let dir;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: "forgejo-test-secret-long-enough",
+  FORGE_WEBHOOK_SECRET: "forgejo-test-secret-long-enough",
   OPENHANDS_API_URL: "http://openhands:8000/",
   OPENHANDS_API_KEY: "k".repeat(24),
   ALLOWED_REPOS: repo + ",owner/quiet",

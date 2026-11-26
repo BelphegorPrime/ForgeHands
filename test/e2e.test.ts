@@ -27,12 +27,12 @@ import { metrics } from '../src/metrics.ts';
 const quiet = { error() {}, log() {} };
 const UUID = '11111111-1111-4111-8111-111111111111';
 const base = {
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   ALLOWED_REPOS: 'owner/hello',
-  FORGEJO_URL: 'http://forgejo.test:3000',
-  FORGEJO_TOKEN: 't'.repeat(24),
+  FORGE_URL: 'http://forgejo.test:3000',
+  FORGE_TOKEN: 't'.repeat(24),
   LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: UUID, tier: 'free' } }),
 };
 const withE2e = (extra = {}) => ({ ...base, E2E_REPO: 'owner/hello', ...extra });

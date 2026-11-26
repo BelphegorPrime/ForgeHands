@@ -22,7 +22,7 @@ const NOT_PUSHED = 'Implementation complete in working tree at packages/api. I c
 let dir; let clock; let n = 0;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
@@ -35,9 +35,9 @@ const env = (extra = {}) => ({
   }),
   MAX_CONCURRENT_PER_TIER: '2',
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });
