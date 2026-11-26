@@ -111,6 +111,9 @@ export class JobStore {
       job.archived_view = true;
       changed = true;
     }
+    // An epic's gap record goes when the epic is closed, whoever closed it: once it was handed to the human, no review or sweep looks at it
+    // again, and the record would stay for good.
+    if (this.epicGaps.delete(ticket.toLowerCase())) changed = true;
     return changed;
   }
   // The ledger sync asked the forge about this ticket at `now`: every job of the ticket keeps it (the oldest-checked ticket is asked first).
