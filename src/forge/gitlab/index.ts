@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { metrics } from '../../metrics.ts';
 import { DryLog, isDry, isWrite } from '../../dry.ts';
 import { normalizeGitlabEvent } from './webhook.ts';
@@ -68,6 +68,27 @@ export function gitlabAgentApi(repository: string): AgentApi {
   };
 }
 
+// A signed delivery older than this (or this far in the future) is refused: the signature alone does not stop a replay.
+const SIGNED_MAX_AGE_MS = 5 * 60000;
+
+// GitLab's signing token: whsec_ and the base64 of the key.
+export function isSigningToken(secret: string): boolean {
+  return secret.startsWith('whsec_');
+}
+
+// Standard Webhooks: HMAC-SHA256 with the decoded key over "<webhook-id>.<webhook-timestamp>.<body>", base64, sent as "v1,<signature>"
+// (several may be sent, separated by spaces; one that matches is enough). The timestamp is in seconds.
+function verifySigned(secret: string, raw: Buffer, headers: Parameters<Forge['verifyWebhook']>[2], now: number): boolean {
+  const id = headers['webhook-id'];
+  const timestamp = headers['webhook-timestamp'];
+  const signatures = headers['webhook-signature'];
+  if (typeof id !== 'string' || typeof timestamp !== 'string' || typeof signatures !== 'string' || !/^\d{1,12}$/.test(timestamp)) return false;
+  if (Math.abs(now - Number(timestamp) * 1000) > SIGNED_MAX_AGE_MS) return false;
+  const key = Buffer.from(secret.slice('whsec_'.length), 'base64');
+  const expected = createHmac('sha256', key).update(id + '.' + timestamp + '.').update(raw).digest('base64');
+  return signatures.split(' ').some((entry) => entry.startsWith('v1,') && sameSecret(entry.slice(3), expected));
+}
+
 // Constant time and independent of the length: both sides are hashed first, so timingSafeEqual always compares 32 bytes.
 function sameSecret(a: string, b: string): boolean {
   return timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
@@ -121,6 +142,8 @@ export interface GitlabOptions {
   sleep?: (ms: number) => Promise<void>;
   pollMs?: number;
   maxPolls?: number;
+  /** The clock the age of a signed delivery is measured with (a test passes a fake). */
+  now?: () => number;
 }
 
 const fileOf = (diff: Json): ChangedFile => ({ filename: diff.new_path, ...(diff.renamed_file && diff.old_path !== diff.new_path ? { previous_filename: diff.old_path } : {}) });
@@ -135,10 +158,12 @@ export class GitlabForge implements Forge {
   sleep: (ms: number) => Promise<void>;
   pollMs: number;
   maxPolls: number;
+  now: () => number;
   projectIds = new Map<string, number>();
 
-  constructor(call: Transport, { sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), pollMs = 1000, maxPolls = 30 }: GitlabOptions = {}) {
+  constructor(call: Transport, { sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), pollMs = 1000, maxPolls = 30, now = Date.now }: GitlabOptions = {}) {
     this.call = call;
+    this.now = now;
     this.sleep = sleep;
     this.pollMs = pollMs;
     this.maxPolls = maxPolls;
@@ -146,9 +171,12 @@ export class GitlabForge implements Forge {
 
   agent(repository: string): AgentApi { return gitlabAgentApi(repository); }
 
-  // `X-Gitlab-Token` is the secret itself, sent in clear: it proves the sender knows the secret, but unlike an HMAC it is not bound to
-  // the body, so anybody who sees one delivery (a proxy log, a TLS-terminating hop) can replay it with another body. Keep the hop short.
-  verifyWebhook(secret: string, _raw: Buffer, headers: Parameters<Forge['verifyWebhook']>[2]): boolean {
+  // A secret of the form whsec_<base64> is GitLab's signing token (GitLab 19.0 on, Standard Webhooks): the delivery must carry a valid
+  // HMAC of its id, timestamp and body, and be at most SIGNED_MAX_AGE_MS old. The plain token is then not accepted at all, so a delivery
+  // cannot fall back to the weaker check. Any other secret is the secret token: `X-Gitlab-Token` is the secret itself, sent in clear,
+  // not bound to the body, so anybody who sees one delivery (a proxy log, a TLS-terminating hop) can replay it with another body.
+  verifyWebhook(secret: string, raw: Buffer, headers: Parameters<Forge['verifyWebhook']>[2]): boolean {
+    if (isSigningToken(secret)) return verifySigned(secret, raw, headers, this.now());
     const token = headers['x-gitlab-token'];
     return typeof token === 'string' && token.length > 0 && sameSecret(token, secret);
   }

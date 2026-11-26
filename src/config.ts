@@ -235,7 +235,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
   const direct = Boolean(env.OPENHANDS_API_URL);
   if (!direct && (env.E2E_REPO || '').trim()) throw new Error('E2E_REPO needs direct mode (OPENHANDS_API_URL): the suite runs through the ForgeHands dispatcher');
 
-  if (forgejoSecret.length < 16) throw new Error('FORGEJO_WEBHOOK_SECRET must be at least 16 characters');
+  const secretName = env.FORGE_WEBHOOK_SECRET ? 'FORGE_WEBHOOK_SECRET' : 'FORGEJO_WEBHOOK_SECRET';
+  if (forgejoSecret.length < 16) throw new Error(secretName + ' must be at least 16 characters');
+  // A GitLab signing token (whsec_<base64>) carries a key of its own: one that does not decode to at least 24 bytes is a copy mistake.
+  if (forgejoSecret.startsWith('whsec_')) {
+    if (forge !== 'gitlab') throw new Error(secretName + ' is a GitLab signing token (whsec_...), but FORGE is ' + forge);
+    const body = forgejoSecret.slice('whsec_'.length);
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body) || Buffer.from(body, 'base64').length < 24) throw new Error(secretName + ' looks like a GitLab signing token but whsec_ is not followed by the base64 of a key of at least 24 bytes');
+  }
   if (allowedRepos.size === 0) throw new Error('ALLOWED_REPOS must contain at least one owner/repository');
   for (const repo of allowedRepos) {
     if (!REPO.test(repo)) throw new Error('Invalid ALLOWED_REPOS entry: ' + repo);

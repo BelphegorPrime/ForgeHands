@@ -1,6 +1,7 @@
 // @ts-nocheck -- fixtures and fakes are deliberately loose; typing them is a follow-up (src/ is checked strictly).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createHmac } from 'node:crypto';
 import { loadConfig } from '../src/config.ts';
 import { buildPrompt } from '../src/agent/prompt.ts';
 import { agentApi, createForge, createTransport } from '../src/forge/index.ts';
@@ -449,4 +450,38 @@ test('the agent gets GitLab paths: merge requests, notes, labels by name, PUT fo
   assert.ok(prompt.includes('PRIVATE-TOKEN'));
   assert.ok(prompt.includes('PUT ' + api.pullLabel(4, '<id>')));
   assert.ok(!prompt.includes('DELETE'));
+});
+
+// GitLab's signing token (Standard Webhooks): whsec_ and the base64 of a 32-byte key; the signature is over "<id>.<timestamp>.<body>".
+const KEY = Buffer.alloc(32, 7);
+const SIGNING = 'whsec_' + KEY.toString('base64');
+const NOW = 1_800_000_000_000;
+const signed = (body, { id = 'msg_1', at = NOW, key = KEY } = {}) => {
+  const timestamp = String(Math.floor(at / 1000));
+  const signature = createHmac('sha256', key).update(id + '.' + timestamp + '.' + body).digest('base64');
+  return { 'webhook-id': id, 'webhook-timestamp': timestamp, 'webhook-signature': 'v1,' + signature };
+};
+
+test('a GitLab signing token checks the HMAC of id, timestamp and body, and refuses a stale, altered or unsigned delivery', () => {
+  const gitlab = new GitlabForge(async () => null, { now: () => NOW });
+  const body = '{"object_kind":"issue"}';
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), signed(body)), true);
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body + ' '), signed(body)), false, 'another body');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), signed(body, { key: Buffer.alloc(32, 8) })), false, 'another key');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), { ...signed(body), 'webhook-id': 'msg_2' }), false, 'the id is signed');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), signed(body, { at: NOW - 6 * 60000 })), false, 'older than five minutes');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), signed(body, { at: NOW + 6 * 60000 })), false, 'from the future');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), signed(body, { at: NOW - 4 * 60000 })), true, 'within five minutes');
+  // With a signing token the plain token is no way in, whatever it says.
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), { 'x-gitlab-token': SIGNING }), false);
+  const { 'webhook-signature': one, ...rest } = signed(body);
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), { ...rest, 'webhook-signature': 'v1,AAAA ' + one }), true, 'one of several signatures matches');
+  assert.equal(gitlab.verifyWebhook(SIGNING, Buffer.from(body), { ...rest, 'webhook-signature': one.replace('v1,', 'v2,') }), false, 'only v1 counts');
+});
+
+test('a signing token is refused at start when it is cut short, not base64, or set for a forge other than GitLab', () => {
+  assert.equal(loadConfig(env({ FORGE_WEBHOOK_SECRET: SIGNING })).forgejoSecret, SIGNING);
+  assert.throws(() => loadConfig(env({ FORGE_WEBHOOK_SECRET: 'whsec_' + Buffer.alloc(16).toString('base64') })), /key of at least 24 bytes/);
+  assert.throws(() => loadConfig(env({ FORGE_WEBHOOK_SECRET: 'whsec_not*base64*at*all' })), /key of at least 24 bytes/);
+  assert.throws(() => loadConfig(env({ FORGE: 'forgejo', FORGE_WEBHOOK_SECRET: SIGNING })), /GitLab signing token .* but FORGE is forgejo/);
 });
