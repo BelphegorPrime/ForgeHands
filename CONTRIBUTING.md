@@ -24,6 +24,19 @@ curl -s http://127.0.0.1:8080/status.json
 
 The gate sits in the transport (`src/forge/index.ts`, `src/dry.ts`), below the forge implementations, so new code that goes through the `Forge` interface is covered without any work. Code that makes a request on its own would bypass it: do not add one.
 
+## Replay tests
+
+`test/replay.test.ts` runs seeded random sequences of forge events (labels, comments, closes), ended conversations, passing time and restarts against the real dispatcher in a tiny fake world (`test/helpers/world.ts`). After every step it checks what must always hold: at most one active job per key, a running job has a conversation, a tier never runs more than its limit. At the end, once every issue is closed, nothing may be left active or held. A restart in the middle of a sequence must end in the same ledger as the run without it.
+
+A failure prints its seed and the list of steps. Replay one seed with `FUZZ_SEED=<n>`, and run more than the default handful with `FUZZ_SEEDS=<n>` before a change to the dispatcher or the ledger:
+
+```sh
+FUZZ_SEEDS=500 node --test test/replay.test.ts
+FUZZ_SEED=760225 node --test test/replay.test.ts
+```
+
+A seed that found a bug becomes a named test at the end of the file, next to the fix. When a new invariant holds for the dispatcher, add it to `checkInvariants`. When ForgeHands learns a new kind of event, teach the generator in `steps()` and the fake world.
+
 ## The forge interface
 
 ForgeHands talks to a forge through one interface, `Forge` in `src/types/forge.ts`. The dispatcher, the merger, the reminders and the prompts use only that interface and never branch on the forge. It has two halves:
