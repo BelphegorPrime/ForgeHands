@@ -1621,6 +1621,7 @@ export class Dispatcher {
       const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
       const handback = this.config.handbackHandling && written.length ? handbackOf(written) : null;
       if (written.length && !handback) return;
+      if (this.superseded(job)) return;
       if (handback) {
         await this.handback.handle(job, handback.kind, handback.text);
         return;
@@ -1628,6 +1629,7 @@ export class Dispatcher {
       // A comment on the parent (the issue this one blocks) is no delivery while this ticket is open: the ticket has no pull request and is not
       // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
       const parent = await this.parentComment(event, since);
+      if (this.superseded(job)) return;
       if (parent && this.config.handbackHandling) {
         this.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
         await this.handback.handle(job, classifyHandback(parent.text) === 'blocker' ? 'blocker' : 'pushed_nothing', parent.text);
@@ -1645,6 +1647,15 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
     }
+  }
+
+  // A label set while the ended run was being looked at (the forge reads above take a while) has queued a fresh run of the same ticket. That run
+  // takes over: running the old one once more, escalating it or calling a human would put two agents on one branch.
+  superseded(job: Job): boolean {
+    const other = this.jobs.activeByKey(job.key);
+    if (!other || other === job) return false;
+    this.logger.error(job.key + ': a fresh run was queued while the last one was looked at, it takes over');
+    return true;
   }
 
   // The second empty run of an issue whose route has escalate_to starts once more on the profile of that route (FAILURE_ESCALATE), on the same
