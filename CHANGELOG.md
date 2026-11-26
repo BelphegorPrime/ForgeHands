@@ -2,7 +2,7 @@
 
 What changed in each release, from 0.4.0 on, taken from the commits. Behaviour that an operator has to act on is in [docs/UPGRADING.md](docs/UPGRADING.md).
 
-## 1.0.0 (unreleased)
+## 1.0.0-rc.1 (2026-11-26)
 
 The first release under the versioning promise in the README ("Stability and versioning"): from here on, the environment variables, the ledger file, the webhook paths, the labels, branches and verdict lines on the forge, the metric names and `/status.json` change only in a major release.
 
