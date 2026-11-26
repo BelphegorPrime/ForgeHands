@@ -212,6 +212,15 @@ function parseRepoWeights(raw: string | undefined): Map<string, number> {
   return weights;
 }
 
+// The variables that still work but go in 1.0.0, with what to do instead (see the README, "Deprecated").
+export const DEPRECATED: Record<string, string> = {
+  FORGEJO_URL: 'set FORGE_URL instead (in AGENT_SECRETS too: the agent still gets it as FORGEJO_URL)',
+  FORGEJO_TOKEN: 'set FORGE_TOKEN instead (in AGENT_SECRETS too: the agent still gets it as FORGEJO_TOKEN)',
+  FORGEJO_WEBHOOK_SECRET: 'set FORGE_WEBHOOK_SECRET instead',
+  HUMAN_REVIEW_ROUNDS: 'a request for changes of HUMAN_LOGIN will always start a round',
+  HANDBACK_HANDLING: 'a run that hands its ticket back by a comment will always be handled as a hand-back'
+};
+
 // The neutral FORGE_* name and its FORGEJO_* alias say the same thing. Both set and different is a mistake worth stopping for.
 export function forgeEnv(env: NodeJS.ProcessEnv, neutral: string, alias: string): string | undefined {
   const a = env[neutral] || undefined;
@@ -223,6 +232,8 @@ export function forgeEnv(env: NodeJS.ProcessEnv, neutral: string, alias: string)
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger = console): Config {
   // Removed in 0.4.0: a weekly cost cap per tier. Ignored (not an error) so that an existing setup still starts.
   if (env.TIER_WEEKLY_BUDGETS) logger.error('TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0 (max_budget of a route still caps one run)');
+  // Deprecated: still read, removed in 1.0.0 (README, "Stability and versioning"). Said once at start, so the operator can move in time.
+  for (const [name, why] of Object.entries(DEPRECATED)) if (env[name] !== undefined && env[name] !== '') logger.error('warning: ' + name + ' is deprecated and will be removed in 1.0.0: ' + why);
   const forge = (env.FORGE || 'forgejo').trim().toLowerCase();
   if (!(FORGES as readonly string[]).includes(forge)) throw new Error('FORGE must be ' + FORGES.slice(0, -1).join(', ') + ' or ' + FORGES.at(-1) + ', not ' + forge);
   // FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names; FORGEJO_* keep working.

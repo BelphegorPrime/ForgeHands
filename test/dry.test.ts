@@ -21,14 +21,14 @@ const API = '/api/v1/repos/' + dryRepo;
 let dir; let clock;
 
 const env = (extra = {}) => ({
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0', // these tests are about other features: their tickets have no Steps, Files or Acceptance (test/ticket-preflight.test.ts)
   ALLOWED_REPOS: live + ',' + dryRepo,
   LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' } }),
   MERGE_POLICY: JSON.stringify({ [dryRepo]: { deny: [] }, [live]: { deny: [] } }),
-  FORGEJO_TOKEN: 'tok', FORGEJO_URL: 'https://forge.example',
+  FORGE_TOKEN: 'tok', FORGE_URL: 'https://forge.example',
   APPROVAL_GRACE_SECONDS: '0', ERROR_RETRIES: '0',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
@@ -147,7 +147,7 @@ test('DRY_RUN_REPOS: the listed repository is dry, the other runs live', async (
 
 test('dry run in webhook mode: the forward is logged, not sent', async () => {
   const config = loadConfig({
-    FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough', OPENHANDS_WEBHOOK_SECRET: 'openhands-test-secret-long-enough',
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough', OPENHANDS_WEBHOOK_SECRET: 'openhands-test-secret-long-enough',
     OPENHANDS_WEBHOOK_URL: 'http://127.0.0.1:9999/v1/events', ALLOWED_REPOS: live, DRY_RUN: '1', DATA_FILE: join(dir, 'deliveries.json')
   });
   const store = new DeliveryStore(config.dataFile);

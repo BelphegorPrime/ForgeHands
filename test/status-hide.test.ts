@@ -17,7 +17,7 @@ const NOW = Date.parse('2026-11-18T12:00:00Z');
 async function setup(extra = {}) {
   const base = await mkdtemp(join(tmpdir(), 'forgehands-hide-'));
   const config = loadConfig({
-    FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
     OPENHANDS_API_URL: 'http://openhands:8000/',
     OPENHANDS_API_KEY: 'k'.repeat(24),
     ALLOWED_REPOS: repo,

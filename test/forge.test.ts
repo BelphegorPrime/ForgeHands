@@ -178,3 +178,18 @@ test('a fake forge drives the merger: review comment, status, files and merge go
   assert.ok(forge.calls.includes('mergePull(34, {"method":"merge","headSha":"cafe0000cafe","deleteBranch":true})'));
   assert.ok(forge.calls.includes('closeIssue(26)'));
 });
+
+test('deprecated settings still work and say once at start that they go in 1.0.0, with what to do instead', () => {
+  const lines = [];
+  const logger = { error: (...args) => lines.push(args.join(' ')) };
+  const legacy = loadConfig(env({ FORGE_URL: undefined, FORGE_TOKEN: undefined, FORGEJO_URL: 'https://old.example', FORGEJO_TOKEN: 'old', AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL', HANDBACK_HANDLING: '0', HUMAN_REVIEW_ROUNDS: '0' }), logger);
+  assert.equal(legacy.forgejo.url, 'https://old.example', 'the alias still works');
+  assert.equal(legacy.handbackHandling, false, 'and so does the switch');
+  assert.ok(lines.some((line) => /^warning: FORGEJO_URL is deprecated and will be removed in 1\.0\.0: set FORGE_URL instead/.test(line)));
+  assert.ok(lines.some((line) => /^warning: FORGEJO_TOKEN is deprecated .*\(in AGENT_SECRETS too/.test(line)));
+  assert.ok(lines.some((line) => /^warning: HANDBACK_HANDLING is deprecated/.test(line)));
+  assert.ok(lines.some((line) => /^warning: HUMAN_REVIEW_ROUNDS is deprecated/.test(line)));
+  const quiet = [];
+  loadConfig(env(), { error: (...args) => quiet.push(args.join(' ')) });
+  assert.deepEqual(quiet.filter((line) => /deprecated/.test(line)), [], 'the neutral names warn about nothing');
+});

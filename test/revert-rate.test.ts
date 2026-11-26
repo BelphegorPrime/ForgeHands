@@ -31,16 +31,16 @@ const fakeChannel = () => ({ name: 'fake', sent: [], async send(message) { this.
 const ROUTES = { 'ai:ready': { profile: WORKER, tier: 'free' }, 'main:red': { profile: REVERTER, tier: 'free', on: 'main_red' } };
 const env = (extra = {}) => ({
   RERUN_TIMEOUT_MINUTES: '0', // these tests predate the rerun (test/revert-first-parent.test.ts)
-  FORGEJO_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+  FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
   TICKET_PREFLIGHT: '0',
   ALLOWED_REPOS: repo,
   LABEL_ROUTES: JSON.stringify(ROUTES),
   ERROR_RETRIES: '0',
-  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL',
-  FORGEJO_TOKEN: 'tok-secret-value',
-  FORGEJO_URL: 'https://forge.example',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL',
+  FORGE_TOKEN: 'tok-secret-value',
+  FORGE_URL: 'https://forge.example',
   DATA_FILE: join(dir, 'deliveries.json'),
   ...extra
 });

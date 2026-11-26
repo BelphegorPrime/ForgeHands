@@ -44,10 +44,10 @@ test('a dry run only logs the closing of the original pull request', async () =>
 });
 
 test('a security review route may have a Forgejo user of its own: its token goes to that route only, as FORGEJO_TOKEN', async () => {
-  const config = loadConfig(env(withMerge({ LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' })));
+  const config = loadConfig(env(withMerge({ LABEL_ROUTES: twoKeyRoutes(), AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' })));
   assert.equal(config.routes.get('sensitive:review').forgejoTokenSecret, 'SECURITY_TOKEN');
   // a route that is neither a review nor a security review still may not have one
-  assert.throws(() => loadConfig(env(withMerge({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free', forgejo_token_secret: 'SECURITY_TOKEN' } }), AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /only applies to a review route/);
+  assert.throws(() => loadConfig(env(withMerge({ LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free', forgejo_token_secret: 'SECURITY_TOKEN' } }), AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN', SECURITY_TOKEN: 'security-token-value' }))), /only applies to a review route/);
   const jobs = new JobStore(join(ctx.dir, 'sec-token.json'));
   await jobs.load();
   const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => ctx.clock);

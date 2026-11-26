@@ -36,7 +36,7 @@ test('MERGE_POLICY and MERGE_METHOD are validated; a repository without an entry
   assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: '{"nope":{}}' }))), /not owner\/repository/);
   assert.throws(() => loadConfig(env(withMerge({ MERGE_POLICY: '{"a/b":{"deny":"x"}}' }))), /list of patterns/);
   assert.throws(() => loadConfig(env(withMerge({ MERGE_METHOD: 'octopus' }))), /MERGE_METHOD/);
-  assert.throws(() => loadConfig(env(withMerge({ FORGEJO_URL: '', FORGEJO_TOKEN: '', AGENT_SECRETS: '' }))), /needs FORGEJO_URL and FORGEJO_TOKEN/);
+  assert.throws(() => loadConfig(env(withMerge({ FORGE_URL: '', FORGE_TOKEN: '', AGENT_SECRETS: '' }))), /needs FORGEJO_URL and FORGEJO_TOKEN/);
 });
 
 test('the approval label on a pull request becomes a merge event, a round label comes first, and it needs the policy', () => {
