@@ -506,3 +506,13 @@ test('EPIC_GAP_STALL_MINUTES defaults to 180, takes 0 to 10080 and rejects anyth
   assert.equal(loadConfig(env({ EPIC_GAP_STALL_MINUTES: '10080' })).epicGapStallMinutes, 10080);
   assert.throws(() => loadConfig(env({ EPIC_GAP_STALL_MINUTES: '10081' })), /EPIC_GAP_STALL_MINUTES must be an integer between 0 and 10080/);
 });
+
+test('an epic handed to the human loses its gap record when the human closes it', async () => {
+  const t = await build();
+  await reviewRun(t);
+  world.sha = 'cccc3333dddd4444';
+  await reviewRun(t, { text: REVIEW_TEXT.replace('aaaa1111', 'cccc3333') });
+  assert.equal(t.jobs.epicGaps.get('owner/hello#10').human, true);
+  await t.dispatcher.onClosed(closedEvent(10));
+  assert.equal(t.jobs.epicGaps.has('owner/hello#10'), false, 'no review or sweep looks at a handed epic again, so the close drops it');
+});
