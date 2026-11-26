@@ -1,8 +1,42 @@
-# Upgrading from 0.3.x to 0.4.0
+# Upgrading
+
+The overview and the 0.10.0 notes come first. After them, each section covers one release, oldest first, and says what changes for an operator. [CHANGELOG.md](../CHANGELOG.md) lists everything else.
+
+## From 0.4.x to 0.10.0 at a glance
+
+Many features added since 0.4.0 are **on by default**, so a setup that only changes the image gets them. Check each row before you upgrade, and set its switch if you want the old behaviour:
+
+| Since | Feature, on by default | Switch to turn it off |
+| --- | --- | --- |
+| 0.4.10 | Review and merge in a repository without any CI workflow | `REVIEW_WITHOUT_CI=0` |
+| 0.4.11 | A comment of `HUMAN_LOGIN` restarts a failed run | `COMMENT_RESTARTS=0` |
+| 0.6.0 | A stuck or timed out run is continued once; a round escalates to `escalate_to` | `RESUME_ATTEMPTS=0`, `FAILURE_ESCALATE=0` |
+| 0.6.0 | A request for changes of the operator starts a round | `HUMAN_REVIEW_ROUNDS=0` |
+| 0.8.0 | A paused run is resumed (up to 3 times) | `PAUSE_RESUMES=0` |
+| 0.8.0 | Nudge at 65 % of the iteration limit, stall alert after 90 minutes, ledger sync every 6 hours, closed tickets hidden after 7 days | `NUDGE_AT_PERCENT=0`, `STALL_ALERT_MINUTES=0`, `LEDGER_SYNC_HOURS=0`, `STATUS_HIDE_DAYS=0` |
+| 0.8.2 | **A red default branch after a ForgeHands merge is reverted** | `REVERT_ON_RED=0` |
+| 0.9.0 | A comment answers a planner and restarts it | `PLAN_ANSWER_RESTARTS=0` |
+| 0.9.3 | The review sweep every 10 minutes starts missing reviews and merges approved pull requests whose event was lost | `REVIEW_SWEEP_MINUTES=0` |
+| 0.9.7 | The stuck-PR watchdog blocks pull requests that nothing moves on | `STUCK_PR_MINUTES=0` |
+| 0.9.8 | The ticket pre-flight checks a worker's ticket before it starts; the reviewer gets the forge's check results | `TICKET_PREFLIGHT=0`, `CHECKS_FROM_CI=0` |
+| 0.9.10 | A worker that hands its ticket back is run again or escalated; an epic left open goes back to the planner | `HANDBACK_HANDLING=0`, `EPIC_GAP_REPLAN=0` |
+| 0.9.18 | The ticket watchdog restarts stalled tickets | `TICKET_STALL_MINUTES=0` |
+
+Configuration that must change:
+
+- **`two_keys` in `MERGE_POLICY`** (0.8.2) needs `SECURITY_REVIEWERS` and a `forgejo_token_secret` on every `sensitive_review` route, or ForgeHands does not start. Setups without `two_keys` are not affected.
+
+## Upgrading to 0.10.0: `ai:hold` stops every merge, and the ledger checks its version
+
+- **`HOLD_LABEL` (`ai:hold`) stops every merge ForgeHands would make**, not only a two-key merge. This includes plain approved pull requests and revert pull requests (`REVERT_ON_RED`). The refusal is counted as `forgehands_merge_refusals_total{reason="held_label"}`. Taking the label off an approved pull request looks at the merge again. If you used `ai:hold` for another purpose on agent pull requests, choose another label or set `HOLD_LABEL`.
+- **The ledger (`jobs.json`) is read according to its `version`.** A ledger written by a newer ForgeHands stops the start with a message instead of being read with parts lost. A rollback below 0.10.0 still reads the file, because the format is unchanged. An entry that is not valid is left out and logged as `ledger: dropped an invalid entry of <collection> (<key>)`. Seeing these lines once after the upgrade is expected for entries older releases left behind. Seeing them again points to a problem.
+- **A label set again while ForgeHands checks the delivery of a run that just ended** no longer starts a second run on the same ticket.
+
+## Upgrading from 0.3.x to 0.4.0
 
 This page is for an operator who runs ForgeHands `v0.3.x` in direct mode (webhook mode has no breaking change). A 0.3.x setup starts on 0.4.0 and behaves as before once you have checked the three items under "Before you upgrade". Everything new is off or unchanged until you switch it on.
 
-## Before you upgrade
+### Before you upgrade
 
 1. **`TIER_WEEKLY_BUDGETS` is gone.** The weekly cost cap per tier no longer exists. If the variable is still set, ForgeHands logs `TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0` at start and carries on; runs of a tier are then no longer held back by accumulated cost. Remove the variable and, if you relied on the cap, use `max_budget` on the routes (it caps one run) and `MAX_RUNS_PER_HOUR` (the global guard).
 2. **The ledger of v0.2.0 to v0.2.4 is no longer read.** A `jobs.json` written since v0.2.5 is `{"version": 2, ...}` and loads as before. A file that is a bare JSON array (the v0.2.0 to v0.2.4 format) now stops the start with `Invalid job store`. A 0.3.x ledger is already in the new format. If you still have an old file, start any v0.2.5 to v0.3.x release once, which rewrites it, then upgrade; or delete it and accept that the history, the seen labels and the rounds used are lost.
@@ -16,7 +50,7 @@ Nothing else is required. In particular the default `VERDICT_SOURCE` is `comment
 VERDICT_SOURCE=comment
 ```
 
-## What changed without a switch
+### What changed without a switch
 
 These apply from the first start on 0.4.0:
 
@@ -28,7 +62,7 @@ These apply from the first start on 0.4.0:
 - **The code moved**: `src/forgejo/` is now `src/forge/`. This matters only if you patch or script against the source.
 - **The revert rate is measured** (`forgehands_merges_reverted_ratio`, the revert fields of the status summary). It needs no switch; the alert is off until you set `REVERT_RATE_ALERT`. The figure is built from the merge ledger from now on: a revert merged before the upgrade is found only when it is among the last 20 closed pull requests of a push to the default branch after the upgrade, so the figure for the first 30 days may read low.
 
-## New features and their switches
+### New features and their switches
 
 | Feature | Switch | Default | Where to read |
 | --- | --- | --- | --- |
@@ -43,7 +77,7 @@ These apply from the first start on 0.4.0:
 | Token for the status page, summary, Prometheus metrics | `STATUS_TOKEN`, `GET /metrics` | open | README, Status page and metrics |
 | Revert rate of the merges and an alert above a threshold (per repository, once a day) | `REVERT_RATE_ALERT` (percent), `REVERT_RATE_MIN_MERGES` | off (`0`), 10 | README, The revert rate |
 
-## Setting up reviewer accounts (optional)
+### Setting up reviewer accounts (optional)
 
 If you want branch protection to see the reviews, move to native reviews. It needs a forge user per reviewer, so that the author of a pull request is not its approver. The short path, in full in README "Reviewer accounts":
 
@@ -52,7 +86,7 @@ If you want branch protection to see the reviews, move to native reviews. It nee
 3. Set `VERDICT_SOURCE=both`, subscribe the webhook events for approved and rejected reviews, set the branch protection (required approvals, approvals whitelist, dismiss stale approvals) and add the reviewer logins to `ALLOWED_SENDERS` if you use it.
 4. When every review route has its token, set `VERDICT_SOURCE=review`.
 
-## Checking the upgrade
+### Checking the upgrade
 
 1. Set `DRY_RUN=1` for the first start. ForgeHands judges and logs every write but sends none (README "Dry run").
 2. Open `/status` (with `STATUS_TOKEN` if you set one) and look at the summary and the queue.
@@ -63,7 +97,7 @@ A rollback to 0.3.x works: v0.3.10 loads a `jobs.json` written by 0.4.0 (includi
 - **Take the reviewer tokens out of `AGENT_SECRETS`.** 0.3.x hands every entry of `AGENT_SECRETS` to every conversation; keeping a reviewer's token private to its route is a 0.4 feature. Left in, the worker would hold the reviewer's token too.
 - Features you switched on, such as reviews by users of their own, bot pull requests, escalation or reminders, are not understood by 0.3.x and simply do nothing; with `VERDICT_SOURCE=review` the reviewer posts a native review, but 0.3.x looks for a verdict comment and a label, finds none and hands the pull request to a human after two reviews, so switch to `comment` (and the old reviewer prompt) before you roll back.
 
-# Upgrading to 0.4.10: repositories without CI
+## Upgrading to 0.4.10: repositories without CI
 
 A repository that has no workflow file never produces a CI run, so until now the pull request of an agent (or of a bot) there was never reviewed, never approved and never merged. From 0.4.10 the review starts without waiting for a green run in such a repository. Nothing else changes: **a repository that has any workflow file behaves exactly as before** (red, pending, and "no status yet" all keep waiting for the real run).
 
@@ -74,7 +108,7 @@ A repository that has no workflow file never produces a CI run, so until now the
 - **Not covered.** GitLab (the switch has no effect there).
 - **Rollback.** Set `REVIEW_WITHOUT_CI=0` (or go back to 0.4.9: it ignores the variable and never starts such a review).
 
-# Upgrading to 0.4.11: a comment restarts a failed run
+## Upgrading to 0.4.11: a comment restarts a failed run
 
 A comment of the operator (`HUMAN_LOGIN`) on an issue whose last run failed, or was handed to him, starts that run again, with the same label, and the run reads the comment. Until now such a run stayed failed until its label was taken off and put on again. README "Comments and earlier work" describes the rules.
 
@@ -83,14 +117,14 @@ A comment of the operator (`HUMAN_LOGIN`) on an issue whose last run failed, or 
 - **What changes without a switch.** Nothing else. A comment on a pull request, an edited or deleted comment, and a comment of anybody else are ignored as before. The ledger gains a `dedupe` section (the ids of comments that restarted a run, and the notices sent); 0.4.10 ignores it.
 - **Rollback.** Go back to 0.4.10: it ignores `issue_comment` events and the new ledger section, so comments no longer restart runs.
 
-# Upgrading to 0.5.2: a comment on the parent delivers a run
+## Upgrading to 0.5.2: a comment on the parent delivers a run
 
 A worker run on a ticket that blocks another ticket (its parent) now counts as delivered when the agent user comments on that parent, as it already did for a comment on the ticket itself. Before, such a run was run once more and then failed as `no_delivery`, and the parent waited for ever. README "A run that finishes without delivering is not done" has the rule.
 
 - **No switch.** Nothing to set. The forge is read with two more calls: `GET /user` (once) and `GET /issues/<n>/blocks`. A failed read counts as no delivery, as before.
 - **What you see.** The log says `<repo>#<n>: delivered as a comment on #<parent>` and the status page shows the run as done with that comment. ForgeHands does not close the ticket.
 
-# Upgrading to 0.6.0: a stuck or timed out run is continued before a human is asked
+## Upgrading to 0.6.0: a stuck or timed out run is continued before a human is asked
 
 **Behaviour change.** A run that ends `stuck` (OpenHands' stuck detection) or hits `MAX_RUN_MINUTES` used to hand its ticket or pull request to a human at once. From 0.6.0 ForgeHands first continues it, then escalates a round, and only then calls a human. README "Humans and failures" describes the three stages.
 
@@ -114,7 +148,7 @@ FAILURE_ESCALATE=0
 ```
 
 **Rollback.** Go back to 0.5.1. A job whose conversation was continued when it went back is polled as before: its conversation state decides, and a stuck conversation goes to the human as 0.5.1 did. The unanswered run call of such a job (`resume_pending`) is not repeated by 0.5.1.
-## Also in 0.6.0: a request for changes of the operator starts a round
+### Also in 0.6.0: a request for changes of the operator starts a round
 
 In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for changes of `HUMAN_LOGIN` on a pull request did nothing; the label `ai:changes` had to be set by hand. From 0.6.0 that request starts the changes round itself, as the label does.
 
@@ -124,7 +158,7 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **What changes without a switch.** Nothing else. Reviews of anybody else are still ignored in comment mode, and with `VERDICT_SOURCE=review` or `both` the review path is the one of 0.5.1.
 - **Rollback.** Set `HUMAN_REVIEW_ROUNDS=0`, or go back to 0.5.1, which ignores the review comment events and the new fields of the review event.
 
-# Upgrading to the next version: a merged revert reopens and restarts its ticket
+## Upgrading to 0.9.5: a merged revert reopens and restarts its ticket
 
 **New, on by default (`REVERT_RETRIES`, default `1`).** Until now a revert of a merge that turned the default branch red was started, but after it was merged nothing followed: the ticket stayed closed. Now, when the revert pull request is merged, ForgeHands reopens the ticket, comments once with the cause, and starts the worker again, once (see README, "After the revert").
 
@@ -134,7 +168,7 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **Caveat.** A revert that was merged before this version is not picked up: its record does not exist. Reopen such a ticket by hand, or leave it.
 - **Rollback.** Set `REVERT_RETRIES=0`. The ledger gains `reverts`; the previous version ignores it.
 
-# Upgrading to the next version: the review sweep starts the missing reviews
+## Upgrading to 0.9.3: the review sweep starts the missing reviews
 
 **New, on by default.** A pull request whose head never got a review (a lost or deferred event, or a round that ended without a new commit) used to wait for ever. Now every `REVIEW_SWEEP_MINUTES` (default `10`) ForgeHands starts the review of such a head, when its CI is green or absent.
 
@@ -142,7 +176,7 @@ In comment mode (the default `VERDICT_SOURCE=comment`) a formal request for chan
 - **What to check.** The first pass logs one line per start (`<repo>#<n>: head <sha7> has no review, starting it`). A pull request you parked without a label, and that has no review on purpose, will now get one: set `BLOCKED_LABEL` or `ai:hold` on it, or set `REVIEW_SWEEP_MINUTES=0`.
 - **Rollback.** Set `REVIEW_SWEEP_MINUTES=0`. Nothing else is written.
 
-# Upgrading to the next version: the ledger is closed up, the status page hides old tickets
+## Upgrading to 0.8.0: the ledger is closed up, the status page hides old tickets
 
 This is a feature release on top of 0.7.0 and nothing needs a change. Three things are new; each one is on by default and can be switched off.
 
@@ -150,7 +184,7 @@ This is a feature release on top of 0.7.0 and nothing needs a change. Three thin
 - **`STATUS_HIDE_DAYS`** (default `7`, `0` = hide nothing). Closed tickets older than that are left off `/status` and `/status.json`; `/status.json` gets `hidden` (their count) and `?all=1` shows them. The counters are not affected.
 - **The follow-up figure in the digest** (`NOTIFY_DIGEST`): one line on the follow-up fixes after the automatic merges of 7 days. It is read from the forge, at most 120 calls a digest, and Forgejo and Gitea only. It is a quality figure, not a task for you.
 
-## Also in 0.7.0: the workspace is cleaned up
+### Also in 0.7.0: the workspace is cleaned up
 
 Every OpenHands run clones the repository into its own directory below the workspace, and nothing removed them. On one host 35 GB sat in about 60 of them (mostly `node_modules`), the disk filled up, and the next deploy and the runs failed. From 0.7.0 ForgeHands can remove them itself and keep new runs from starting while the disk is nearly full.
 
@@ -162,7 +196,7 @@ Every OpenHands run clones the repository into its own directory below the works
 - **What changes without a switch.** Nothing. The `disk_full` notification is sent whenever a channel is configured, without `NOTIFY_IMMEDIATE`, but only once the feature is on.
 - **Rollback.** Unset `WORKSPACE_CLEANUP_DIR`. Directories already removed stay removed; nothing else is written.
 
-# Upgrading to 0.7.1: a paused run is resumed, not split
+## Upgrading to 0.7.1: a paused run is resumed, not split
 
 **Behaviour change.** A run that ends `paused` used to count as a ticket that is too big: with `SPLIT_LABEL` the planner was asked to split it, and without it the human was called. An OpenHands restart pauses the runs that were going, so healthy tickets were split for nothing (openapi-generator #32 was split into two sub-tickets, a small ticket). From 0.7.1 a pause is an interruption: the run continues on its own conversation, and it is never split.
 
@@ -172,7 +206,7 @@ Every OpenHands run clones the repository into its own directory below the works
 - **What you see.** The status page shows a run that is continued as "resumed". The metric `forgehands_resumes_total` counts the pause resumes under `state="paused"`. The job ledger gains `pause_resumes`.
 - **Rollback.** Go back to 0.7.0. Its ledger loads with the new field ignored. A job that was resumed after a pause is then polled as 0.7.0 does: a paused conversation goes to the split or the human again.
 
-# Upgrading to the next version: a run is nudged, a stall is reported, tokens are counted
+## Upgrading to 0.8.0: a run is nudged, a stall is reported, tokens are counted
 
 This is a feature release on top of 0.7.1. Two of the three changes are on by default and change what a run does, so read the first item before you upgrade.
 
@@ -182,7 +216,7 @@ This is a feature release on top of 0.7.1. Two of the three changes are on by de
 - **The ledger** gains `nudged`, `nudge_settled`, `tokens` and `tokens_seen` on a job. A 0.7.1 release ignores them, so rolling back is safe.
 - **Rollback.** Set `NUDGE_AT_PERCENT=0` and `STALL_ALERT_MINUTES=0` first, or go back to 0.7.1 directly.
 
-# Upgrading to the version after 0.8.1: safety nets for merges without a human
+## Upgrading to 0.8.2: safety nets for merges without a human
 
 This is a feature release on top of 0.8.1. It changes no default: the hold and the daily limit are off until you set them, and the revert needs a route of kind `main_red` before it starts a run. Without that route, `REVERT_ON_RED` (on by default) only comments on the merged pull request and tells you.
 
@@ -193,7 +227,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **The ledger** gains `holds` (the holds of two-key merges, per pull request) and `merges` (what ForgeHands merged: repository, pull request, branch, merge commit, time, two keys; kept 30 days). Version 0.8.1 ignores both fields, but it has no hold: a two-key pull request that was waiting for one merges at its next event there. Before you roll back, put `HOLD_LABEL` on the pull requests you want to keep.
 - **Rollback.** Set `TWO_KEYS_HOLD_MINUTES=0`, `TWO_KEYS_DAILY_LIMIT=0` and `REVERT_ON_RED=0` first (and see the note on holds above), or go back to 0.8.1.
 
-# Upgrading to the version after 0.8.0: the nudge waits for its answer in the background
+## Upgrading to 0.8.1: the nudge waits for its answer in the background
 
 **Fix.** On a real run the nudge's message timed out after the normal 10 seconds (a message to a running conversation answers after the agent's current step) and was lost. From this version the nudge has its own timeout, `NUDGE_TIMEOUT_SECONDS` (default `180`, 10 to 600), it is sent in the background, and a timeout is checked in the events before the message is sent again.
 
@@ -202,7 +236,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - The log gains `nudge pending (timeout), checking the events` and `nudge confirmed in the events`. A nudge that never shows in the events is sent once more, then the run gets no further nudges (`the nudge was not delivered after 2 tries`).
 - Rollback: go back to 0.8.0. A pending nudge in the ledger (`nudge_pending`) is ignored there.
 
-# Upgrading to the next version: old conversations are deleted in OpenHands
+## Upgrading to 0.9.1: old conversations are deleted in OpenHands
 
 **New, off by default.** Archiving tags a run, but OpenHands keeps the conversation on disk, so its data directory grows every day. `DELETE_AFTER_DAYS` (default `0`, off) lets ForgeHands delete the conversation of an archived run that ended that many days ago. Set `ARCHIVE_AFTER_DAYS` as well: only archived runs are deleted.
 
@@ -212,7 +246,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **What you should check.** Whether OpenHands removes the conversation's directory on disk when it is deleted: compare `du -sh` of its data directory and the count at `/api/conversations/count` before and after the first round. The first round logs `conversations: N deleted, M kept`.
 - **Rollback.** Set `DELETE_AFTER_DAYS=0`. Deleted conversations do not come back; the ledger and the status page keep working without them.
 
-# Upgrading to the next version: a comment answers a planner
+## Upgrading to 0.9.0: a comment answers a planner
 
 **Behaviour change.** A planner that asked its questions as comments and finished without sub-issues used to get no reaction to the operator's answers. Now a comment of `HUMAN_LOGIN` on such an issue starts the planner again (see README, "A comment answers a planner without sub-issues").
 
@@ -222,7 +256,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **The webhook answer.** With `COMMENT_RESTARTS=0` a comment now reaches the dispatcher when `PLAN_ANSWER_RESTARTS` is on, so the webhook answers `comment_restarts_off` where it used to answer `ignored`. Nothing starts in either case.
 - **Rollback.** Set `PLAN_ANSWER_RESTARTS=0`, or go back to the previous version. The ledger gains `plan_answer` on a job; the previous version ignores it.
 
-# Upgrading to the version after 0.9.10: blocks do not hold back an answer to a planner
+## Upgrading to 0.9.11: blocks do not hold back an answer to a planner
 
 **Fix.** A comment of `HUMAN_LOGIN` on a planner's issue was ignored (`has_sub_issues`, silently) when that issue blocked other issues or had dependencies from before the planner ran, so a plan that asked its questions got no answer. Now only the sub-issues created by the planner run count (README, "A comment answers a planner without sub-issues").
 
@@ -231,7 +265,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **Existing jobs.** A planner run that started before this version has no record of its dependencies. Its answers count only the dependencies created after the run started, when Forgejo gives creation times, and every dependency otherwise (as before).
 - **Rollback.** Go back to the previous version. The ledger gains `deps_before` on planner jobs; the previous version ignores it.
 
-# Upgrading to the version after 0.8.1: tickets deleted in the forge leave the queue
+## Upgrading to 0.8.2: tickets deleted in the forge leave the queue
 
 **Fix.** A ticket deleted in Forgejo kept its waiting jobs in the ledger: the dependency read answered 404 on every look, the log repeated the same line, and when its dependencies resolved a run would have started for a ticket that no longer exists. From this version a 404 of the ticket itself (not of its dependency list) drops its waiting and queued jobs.
 
@@ -240,7 +274,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - The ledger sync now also reads tickets with waiting or queued jobs (running ones are still left to their run), within its usual 60 reads a pass. A 404 of a dependency list alone changes nothing.
 - Rollback: go back to 0.8.1. Jobs marked `deleted` are not waiting there, so they stay out of the queue.
 
-# Upgrading to the version after 0.9.1: same-files waits no longer close cycles
+## Upgrading to 0.9.2: same-files waits no longer close cycles
 
 **Fix.** With `WAIT_FOR_SAME_FILES=1` a ticket that shares files with an older one waited for it, and the older one could already wait for the newer one through an explicit dependency (a split epic and its children, a ticket that depends on the epic). Nothing in such a loop could start. From this version the same-files wait is skipped when the older ticket already waits for this one, and nothing else changes.
 
@@ -249,7 +283,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - Rollback: go back to 0.9.1. The same-files waits of the loop come back, and so do the deadlocks.
 - The same-files check also reads the open dependencies of an epic whose job is done (its children are only in the forge): at most 40 such reads a pass, each ticket once per 10 minutes, so a pass costs a few reads at most. A failed read is taken as no dependencies.
 
-# Upgrading to the version after 0.9.5: an issue run that delivers nothing is escalated once
+## Upgrading to 0.9.6: an issue run that delivers nothing is escalated once
 
 **Fix.** A worker run on an issue that finished twice without a pull request or a comment went straight to the human, even when a stronger model was at hand. A route with `escalate_to` now gets one more try: after the second empty run a fresh run starts on the profile and tier of that route, on the same ticket. Only if that run is empty as well is the human called (`no_delivery`). A cheap model that claims a file cannot be read no longer costs a human a ticket.
 
@@ -258,7 +292,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - The escalated run is shown on the status page as "escalated after no_delivery" and counted in the tier statistics under the target's tier (`escalated`); `forgehands_failure_escalations_total` counts it too. The second empty run is still counted as `finished` and, when it is the last one, as `no_delivery` (as before).
 - Rollback: go back to the previous version, or set `FAILURE_ESCALATE=0`.
 
-# Upgrading to the next version: stuck pull requests reach a human
+## Upgrading to 0.9.7: stuck pull requests reach a human
 
 **A fix and a new switch.** A pull request whose last allowed round ended with a NOT OK verdict, or whose round pushed nothing, could stand still for hours: the rounds were used up, nothing else looked at it, so no label and no mail came, and the tickets that waited behind it waited for ever. Two things change.
 
@@ -268,7 +302,7 @@ This is a feature release on top of 0.8.1. It changes no default: the hold and t
 - **What to check.** The first pass after the upgrade blocks the pull requests with rounds used up at once, and the ones with a NOT OK verdict once the grace has run from that first look; each gets one comment and one notification. A pull request you want to keep moving: remove `BLOCKED_LABEL` (it is eligible again after the grace) or push a commit. Pull requests you parked on purpose have `ai:hold` or `ai:approved`, which the watchdog leaves alone. The watchdog runs with the review sweep, so `REVIEW_SWEEP_MINUTES=0` switches it off as well. The review sweep reads at most 50 open pull requests per repository; a pull request beyond that page is not looked at by the watchdog.
 - **Rollback.** Set `STUCK_PR_MINUTES=0`: no new blocks and no chain marks. The last-round check has no switch; to undo it, run the previous version. The ledger gains `stuck`, which the previous version ignores.
 
-# Upgrading to the release with CHECKS_FROM_CI: checks from the forge
+## Upgrading to 0.9.8: checks from the forge
 
 Review runs now get the forge's check result of their head as data (`ForgeHands check facts`), and a verdict of OK is not accepted while the head's check is a failure.
 
@@ -279,7 +313,7 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - **Not covered.** Check names come only from what the forge reports; step names of a failed job are not read. ForgeHands does not run the repository's check command; `.forgehands.yaml` is a planned format, see the README.
 - **Rollback.** Set `CHECKS_FROM_CI=0`, or go back to the previous version (it ignores the variable).
 
-# Upgrading to the next version: a ticket is checked before a worker starts
+## Upgrading to 0.9.8: a ticket is checked before a worker starts
 
 **A new check, on by default.** A broken ticket used to start a worker anyway, which then failed, and the reviewer kept sending the pull request back. Two of three stuck pull requests on 2026-11-18 came from a ticket whose acceptance command grepped for text that no longer existed, and another whose steps required a file that its file list forbade. Now ForgeHands checks a worker's ticket (an issue on a worker route, not a planner) before the run starts: the `Steps`, `Files` and `Acceptance` sections, and that the listed files exist. The rules and their details are in the README, [A ticket is checked before a worker starts](README.md#a-ticket-is-checked-before-a-worker-starts).
 
@@ -288,7 +322,7 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - **Not checked yet.** The acceptance command is not run on the default branch to see that it fails there (that needs a checkout and a runner ForgeHands does not have). Rule 4 is not checked on GitLab.
 - **Rollback.** Set `TICKET_PREFLIGHT=0`: tickets are not checked at all, as before. The ledger gains one `preflight:` mark per rejected revision, which the previous version ignores.
 
-# Upgrading to the version after 0.9.7: an end-to-end suite (off by default)
+## Upgrading to 0.9.8: an end-to-end suite (off by default)
 
 **A new feature, nothing changes until you switch it on.** ForgeHands can run a suite of scenarios against a dedicated test repository: a ticket goes through its run, the pull request is reviewed and merged, a change that turns the default branch red is reverted and its ticket started again once. The scenarios clean up after themselves. The suite is described in [docs/e2e.md](e2e.md).
 
@@ -299,7 +333,7 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - The cleanup restores the default branch with commits (the forge's REST API cannot move a branch pointer): the test repository's history grows by a commit per changed file in each run, and CI runs on them. This is why the repository must be a test repository.
 - Rollback: unset `E2E_REPO` (or go back to the previous version). The ledger's `meta.e2e` is ignored by the previous version.
 
-# Upgrading to the version after 0.9.8: recurring findings become check tickets (off by default)
+## Upgrading to 0.9.9: recurring findings become check tickets (off by default)
 
 **A new feature, nothing changes until you switch it on.** When the same correction of the reviewer comes back, ForgeHands can now file one ticket that asks for a deterministic check (a lint rule, a test or a type constraint) instead of another line of prompt. See README, "Recurring findings become checks".
 
@@ -309,7 +343,7 @@ Review runs now get the forge's check result of their head as data (`ForgeHands 
 - The ledger gains `findings` (30 days) and `filed_findings` (kept while needed). The previous version ignores both.
 - Rollback: unset `RECURRING_REASON_MIN` (or set `0`). Tickets already filed stay where they are.
 
-# Upgrading to the version after 0.9.9: the watchdog sees WIP pull requests, revert pull requests and conflicts
+## Upgrading to 0.9.10: the watchdog sees WIP pull requests, revert pull requests and conflicts
 
 The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull requests in three cases. A pull request titled `WIP:` (every agent pull request until it is merged) was skipped when Forgejo reports it as a draft (its `draft` field follows the `WIP:` title), so a NOT OK pull request could stand still unseen for ever. Revert pull requests (`ai/revert-<n>`) were never looked at. A pull request that Forgejo reports as not mergeable was not stuck, however long it waited. This release fixes the three. It changes no variable and no default.
 
@@ -318,7 +352,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Metrics.** `forgehands_stuck_pr_blocks_total` has a new reason `stuck_conflict`.
 - **Rollback.** Go back to 0.9.9. Revert pull requests and drafts are then unwatched again. Set `STUCK_PR_MINUTES=0` to switch the watchdog off, which also keeps the new conflict blocks from starting.
 
-# Upgrading to the version after 0.9.9: a worker that hands its ticket back is not a delivery
+## Upgrading to 0.9.10: a worker that hands its ticket back is not a delivery
 
 **A fix, on by default.** A worker run on an issue that ended with a comment counted as delivered, whatever the comment said. A worker that wrote "Blocked by conflicting scope ... npm ci exits with EUSAGE" (the ticket itself was broken) or "Implementation complete in working tree" (nothing was pushed, no pull request exists) ended in "worker done, waiting for the next event" for ever: nothing escalated, no planner, no human, and the tickets that depend on it waited with it. Now such a comment is a hand-back, and ForgeHands acts on it: see [A run that "finishes" without delivering is not done](README.md#humans-and-failures).
 
@@ -329,7 +363,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Metrics and state.** The counter `forgehands_handbacks_total{kind}` counts the steps (`retry`, `escalate`, `planner`, `blocked`). The ledger gains `handback_retry` and `handback_push` on a job; the previous version ignores both, and the result `handback` shows as a failed run there.
 - **Dry run.** Under `DRY_RUN` the steps are decided and logged, and nothing is written to the forge.
 - **Rollback.** Set `HANDBACK_HANDLING=0`, or go back to the previous version.
-# Upgrading to the version after 0.9.9: an epic that stays open goes back to the planner, then to a human
+## Upgrading to 0.9.10: an epic that stays open goes back to the planner, then to a human
 
 **A behaviour change, on by default.** Before, an epic that the epic review left open (a criterion not met) was silent: no label, no mail, no status, and the tickets that waited for it waited for ever (two epics in the homegraf repository for hours on 2026-11-18). Now ForgeHands reads the epic after the review. Open means a gap: the first one sends the epic back to its planner once (`EPIC_GAP_REPLAN=1`, the default), and the human is called only when the epic is still open after that second review.
 
@@ -340,14 +374,14 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **Metric.** `forgehands_epic_gaps_total{action}` (`replanned`, `handed`, and since the replan-run check `rereviewed`, `handed_no_plan`) is new.
 - **A replan that went nowhere.** An epic that was sent back to its planner before the upgrade and whose planner run created no sub-issues used to wait for ever. The tick now decides it once the planner run ended `EPIC_GAP_STALL_MINUTES` ago (default `180`, `0` = off): the epic review starts once more, or the human is called. Nothing else changes; the ledger gains `rereview` and `rereview_at` on the records, which the previous version ignores.
 
-# Upgrading to the next version: the notice about an empty issue run names the escalation
+## Upgrading to 0.9.11: the notice about an empty issue run names the escalation
 
 **Fix.** An issue run that stays empty after its escalation was reported as if nothing had been tried: "the run for ai:ready finished twice without a pull request and without a comment". The escalation is read from the route the ticket was started with (`job.label`), not from the route the run happened to start on, so a run that fell back to a `fallback_to` route is escalated as before. The notice to the human now says what happened: after two empty runs and the escalation, "finished twice without a pull request and without a comment, and once more after `ai:escalate`"; after a hand-back that escalated the run, "was handed back by a comment, and the run after it on `ai:escalate` finished without a pull request and without a comment". Routes without `escalate_to`, or with `FAILURE_ESCALATE=0`, get the notice as before.
 
 - Nothing to set. Behaviour is unchanged; only the text of the comment and the `no_delivery` notice differs.
 - Rollback: go back to the previous version.
 
-# Upgrading to the next version: the ticket pre-flight stops rejecting real tickets
+## Upgrading to 0.9.12: the ticket pre-flight stops rejecting real tickets
 
 **Fixes to the pre-flight of 0.9.8.** In ten hours it rejected three tickets written by the planner that were workable: openapi-generator#53 (its pull request #85 was open, with finished rounds, and the planner re-route closed it) and levelUp#75 and #76. The causes were false positives. A name in `Steps` that is code (`import.meta.url`, `process.env.X`, `Array.isArray`), a version (`users-3.1.yaml`), a URL, or a bare file name that a listed file has (`models.ts`, `index.ts`) was read as a missing path. Rule 4 read files that a ticket creates, which the planner does not always mark `new`.
 
@@ -361,7 +395,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - Check `forgehands_preflight_total{result="rejected"}` after the upgrade: a rise in rule 1 or rule 4 rejections of tickets that look right is a bug to report.
 - Rollback: `TICKET_PREFLIGHT=0` turns the check off, as in the section above.
 
-# Upgrading to the next version: the ticket pre-flight advises instead of rejecting
+## Upgrading to 0.9.13: the ticket pre-flight advises instead of rejecting
 
 **Fix.** The check of the previous version rejected most of the tickets that a worker could do. Measured on 2026-11-19 on three real repositories, with the forge's file contents: 9 of 14 workable open tickets would have been rejected, nearly all by rule 1 (a name in `Steps` that `Files` does not list). These were mentions, not work: the names of files that a generator emits (`commands.ts`, `models.ts`, `dist/index.js`), a helper script (`scripts/update-golden.sh`), a file read for context (`factory_smoke.py`, `ci.yaml`). The rejections of that measurement were rule 1 and one rule 4.
 
@@ -372,7 +406,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the upgrade, `forgehands_preflight_total{result="rejected"}` should show rules 2 and 3 only. A rejection by rule 1 or 4 under the default list is a bug to report. `result="advised"` shows how often the notes go to a worker, by rule; a note that is wrong about a ticket is worth a report too.
 - **Rollback.** Set `TICKET_PREFLIGHT=0` (no check at all), or `TICKET_PREFLIGHT_BLOCK=1,2,3,4` to get back the previous rejections. Or go back to the previous version.
 
-# Upgrading to the next version: the end-to-end suite counts a run from its start, not from its ticket
+## Upgrading to 0.9.14: the end-to-end suite counts a run from its start, not from its ticket
 
 **Nothing changes in production.** The changes are in the suite (off unless `E2E_REPO` is set, see the section above). A ticket outside the suite is dispatched, queued and cleaned up as before.
 
@@ -384,7 +418,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first run on the new version, `/status.json` (`e2e.last.results`) should show `cleanup: ok` for each scenario, and `cleanup_note` names anything left alone on the test repository.
 - **Rollback.** Go back to the previous version. The record of the last run (`meta.e2e`) keeps its format, so nothing in the ledger needs changing.
 
-# Upgrading to the next version: a WIP title is not a conflict
+## Upgrading to 0.9.14: a WIP title is not a conflict
 
 **Behaviour change, no switch.** Forgejo reports `mergeable: false` for every pull request titled `WIP:`, even when its branch merges cleanly. Two places took that for a conflict; neither does now.
 
@@ -393,7 +427,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** A WIP-titled pull request that the watchdog blocks should carry the verdict's reason in its comment, not `conflicts with`. A `conflict` mail for a pull request that merges cleanly is a bug to report.
 - **Rollback.** Go back to the previous version. Nothing in the ledger changes.
 
-# Upgrading to the next version: the end-to-end cleanup judges the commit it wrote
+## Upgrading to 0.9.15: the end-to-end cleanup judges the commit it wrote
 
 **Nothing changes in production.** The changes are in the end-to-end suite (off unless `E2E_REPO` is set). A ticket outside the suite is dispatched and delivered as before.
 
@@ -403,7 +437,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first run on the new version, `/status.json` (`e2e.last.results`) should show `cleanup: ok`. A `cleanup_reason` that still names paths means the difference is real on the test repository: look at those paths on main, not at the timing.
 - **Rollback.** Go back to the previous version. The record of the last run (`meta.e2e`) keeps its format, so nothing in the ledger needs changing.
 
-# Upgrading to the next version: every merge decision is logged
+## Upgrading to 0.9.16: every merge decision is logged
 
 **Nothing changes in the forge.** The merge rules are the same; what changes is what ForgeHands says about an approved pull request, and one label event that used to be lost.
 
@@ -414,7 +448,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first approval on the new version, the log shows `merged (<sha7>)` for the head, or a `not merged` line that names the reason. An approved pull request without either for an hour is a bug to report.
 - **Rollback.** Go back to the previous version. Nothing in the ledger changes; the decisions live in memory only.
 
-# Upgrading to the next version: stalled tickets and parent comments
+## Upgrading to 0.9.18: stalled tickets and parent comments
 
 **Behaviour change, one new switch.** Two kinds of ticket waited for ever in v0.9.17: a ticket whose run was "delivered as a comment on #<parent>" with no pull request (openapi-generator #99, homegraf #316, levelUp #86), and a ticket whose last run ended "done" after a comment with no pull request and no restart.
 
@@ -426,7 +460,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first pass, the tickets of `/status` that read `waiting for ...` after a `done` run should be restarted or listed under "Waiting for a human" within `TICKET_STALL_MINUTES`.
 - **Rollback.** Set `TICKET_STALL_MINUTES=0` to stop the watchdog. The parent-comment change has no switch: going back to the previous version restores "delivered as a comment" (the tickets that waited for it wait again).
 
-# Upgrading to the next version: a deleted issue leaves the status page
+## Upgrading to 0.9.17: a deleted issue leaves the status page
 
 **Behaviour change, no switch.** Issues deleted in the forge used to stay on the status page as open for ever (`worker done, waiting for the next event`), and every pass of the sweep of closed tickets wrote `could not read #n of <repo>: ... HTTP 404`.
 
@@ -437,7 +471,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **What to check.** After the first pass on the new version, the eight tickets that were deleted (openapi-generator and levelUp in the v0.9.16 report) should read `deleted in the forge` on the second pass, with one log line each, and the `could not read` lines should be gone. A ticket that is open in the forge but shows `deleted in the forge` is a bug to report: look at the `could not read` line of the sweep, if any, and the forge's answer to `GET /issues/<n>`.
 - **Rollback.** Go back to the previous version. It ignores the new keys, but the jobs of a deleted issue keep their `archived_view` flag (a closed ticket on the status page), so the ticket stays closed there, and its waiting jobs stay `deleted`.
 
-# Upgrading to the next version: operator prerequisites
+## Upgrading to 0.9.18: operator prerequisites
 
 **New behaviour, one label.** Work that needs something only a person can set up (a token or secret, a forge, registry or runner setting, an access right) used to make the worker end without a pull request, and the ticket went back and forth. Now such an item is a ticket labelled `OPERATOR_LABEL` (default `needs:operator`).
 
@@ -449,7 +483,7 @@ The stuck-PR watchdog (`STUCK_PR_MINUTES`, default 90) missed agent pull request
 - **The ticket watchdog (`TICKET_STALL_MINUTES`) leaves such a ticket alone**: a ticket that waits for an open operator ticket is not stalled, and no restart is started for it.
 - **Rollback.** Go back to the previous version. It ignores `operator_tickets`; a ticket that waits for an operator ticket then waits for the forge's dependency, which the older version reads as before. Remove the label from the tickets, or close them, first if you want the old behaviour.
 
-# Upgrading to the next version: the ticket watchdog reads the tickets that are open
+## Upgrading to 0.9.19: the ticket watchdog reads the tickets that are open
 
 **Behaviour change, no switch.** On v0.9.18 the ticket watchdog (`TICKET_STALL_MINUTES`) read at most 20 candidates per pass in the same ledger order. Old tickets that were closed in the forge used up those reads on every pass, so stalled open tickets of the same repository were never reached (homegraf #316, openapi-generator #99 and levelUp #86 waited for ever).
 
