@@ -41,6 +41,7 @@ import { BranchRefresher } from './branch-refresh.ts';
 import { SecurityReview } from './security-review.ts';
 import { DeliveryCheck } from './delivery.ts';
 import { TicketCleanup } from './ticket-cleanup.ts';
+import { IdleReporter } from './idle.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -76,14 +77,10 @@ export class Dispatcher {
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
-  /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
-  idle: IdleState | null = null;
-  idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
   /** The tickets the end-to-end suite created ("repo#n", lower case): the ticket watchdog leaves them alone (see exemptE2eTicket). */
   e2eTickets = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
-  stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
 
   nudger: Nudger = new Nudger(this);
   waitKeeper: WaitKeeper = new WaitKeeper(this);
@@ -92,6 +89,7 @@ export class Dispatcher {
   securityReview: SecurityReview = new SecurityReview(this);
   deliveryCheck: DeliveryCheck = new DeliveryCheck(this);
   ticketCleanup: TicketCleanup = new TicketCleanup(this);
+  idleReporter: IdleReporter = new IdleReporter(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -1115,8 +1113,8 @@ export class Dispatcher {
       if (job.started === now) started += 1;
     }
     if (started) this.lastStart = now;
-    this.reportIdle(now, started);
-    this.checkStall(now);
+    this.idleReporter.reportIdle(now, started);
+    this.idleReporter.checkStall(now);
     if (await this.branchRefresher.refreshMoved(now)) changed = true;
     // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
     if (await this.merger.recheckHolds()) changed = true;
@@ -1220,79 +1218,6 @@ export class Dispatcher {
     const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
     if (startedLastHour >= this.config.maxRunsPerHour) return { reason: 'hourly' };
     return null;
-  }
-
-  // What holds the waiting and queued jobs back right now, counted per job with the waits the dispatcher already decides: an issue that depends on
-  // open issues (and a CI result kept while its run goes on) is a dependency wait; a ticket that shares files with an older one is a files wait; a queued
-  // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
-  // and is not counted.
-  idleCounts(now: number): { reasons: IdleCounts; tiers: string[]; cycles: string[] } {
-    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 };
-    const tiers = new Set<string>();
-    // Explicit dependencies only: a cycle of them is not broken by ForgeHands (the planner or a human made it), so its jobs wait for ever.
-    const cycles = findCycles(waitGraph(this.jobs.list(), false));
-    const inCycle = new Set(cycles.flat());
-    // A ticket that waits, directly or through other tickets, behind a blocked pull request (see stuck.ts) is counted as waiting behind it.
-    const behind = behindBlocked(this.jobs.list(), blockedTickets(this.jobs.stuck));
-    for (const job of this.jobs.list(true)) {
-      if (job.status === 'waiting') {
-        if (job.waiting_for?.length && inCycle.has(ticketKey(job))) reasons.cycle += 1;
-        else if (!job.event.bot && !job.event.pull_request && behind.has(ticketKey(job))) reasons.stuck += 1;
-        else if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
-        else if (job.waiting_for_files?.length) reasons.files += 1;
-        continue;
-      }
-      if (job.status !== 'queued' || (job.next_try && job.next_try > now)) continue;
-      const hold = this.holdOf(job, now);
-      if (!hold) { reasons.could_start += 1; continue; }
-      reasons[hold.reason] += 1;
-      if (hold.tier) tiers.add(hold.tier);
-    }
-    return { reasons, tiers: [...tiers].sort(), cycles: cycles.map(cycleText) };
-  }
-
-  // The idle line of a pass in which something waits and nothing could start (`started` is the number of jobs this pass started). It is logged
-  // when its composition changes and at most every 15 minutes otherwise; the same numbers are on /status.json and in the idle gauge.
-  reportIdle(now: number, started: number): void {
-    const { reasons, tiers, cycles } = this.idleCounts(now);
-    const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
-    // A dependency cycle is logged once, when it is found.
-    for (const text of cycles) {
-      if (this.waitKeeper.cyclesLogged.has(text)) continue;
-      this.waitKeeper.cyclesLogged.add(text);
-      this.logger.error(text + ', none of its tickets can start: a human has to break it');
-    }
-    if (started) this.idleLogged = null;
-    if (started || !total) this.idle = null;
-    if (!total) { this.stallAlertAt = null; this.idleLogged = null; }
-    if (started || !total) return;
-    this.idle = { since: this.idle?.since ?? now, reasons, tiers, cycles };
-    const key = JSON.stringify([reasons, tiers]);
-    if (this.idleLogged?.key === key && now - this.idleLogged.at < IDLE_LOG_EVERY_MS) return;
-    this.idleLogged = { key, at: now };
-    this.logger.error(idleLine(reasons, tiers));
-  }
-
-  idleState(): IdleState | null {
-    return this.idle;
-  }
-
-  // STALL_ALERT_MINUTES: work waits on a hold that is not a dependency (quota, disk, a limit, or a job that could start and did not), no run is running,
-  // and nothing has started for that long: one notification (kind stalled), and not again for six hours unless nothing waits any more. The waits on
-  // dependencies and on files do not count: a chain of tickets is normal.
-  checkStall(now: number): void {
-    const minutes = this.config.stallAlertMinutes;
-    if (!minutes || !this.idle) return;
-    const { reasons, tiers, cycles } = this.idle;
-    // A dependency cycle is not a normal chain: its jobs count as a hold too (the notification names the tickets).
-    if (!(reasons.quota + reasons.disk + reasons.hourly + reasons.concurrency + reasons.could_start + reasons.cycle)) return;
-    if (this.jobs.list('running').length || now - this.lastStart < minutes * 60000) return;
-    if (this.stallAlertAt !== null && now - this.stallAlertAt < STALL_REPEAT_MS) return;
-    if (!this.notifier.wants('stalled')) return;
-    this.stallAlertAt = now;
-    const quiet = Math.round((now - this.lastStart) / 60000);
-    this.logger.error('stall alert: nothing has started for ' + quiet + ' min and no run is running. ' + idleLine(reasons, tiers));
-    this.notifier.notify(stallMessage(this.config.notify.language, { minutes: quiet, reasons, tiers, cycles }));
   }
 
   async startJob(job: Job, now: number): Promise<boolean> {
@@ -1723,4 +1648,8 @@ export class Dispatcher {
   sweepClosed(...args: Parameters<TicketCleanup['sweepClosed']>): ReturnType<TicketCleanup['sweepClosed']> { return this.ticketCleanup.sweepClosed(...args); }
   archiveOld(...args: Parameters<TicketCleanup['archiveOld']>): ReturnType<TicketCleanup['archiveOld']> { return this.ticketCleanup.archiveOld(...args); }
   deleteOld(...args: Parameters<TicketCleanup['deleteOld']>): ReturnType<TicketCleanup['deleteOld']> { return this.ticketCleanup.deleteOld(...args); }
+
+  // Reached from other modules and from the tests; the work is done by IdleReporter (idle.ts).
+  idleCounts(...args: Parameters<IdleReporter['idleCounts']>): ReturnType<IdleReporter['idleCounts']> { return this.idleReporter.idleCounts(...args); }
+  idleState(...args: Parameters<IdleReporter['idleState']>): ReturnType<IdleReporter['idleState']> { return this.idleReporter.idleState(...args); }
 }
