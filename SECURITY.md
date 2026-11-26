@@ -15,7 +15,8 @@ The webhook endpoint accepts untrusted input and must be protected with TLS, an 
 ## Webhook authentication
 
 - **Forgejo and Gitea** sign the body with an HMAC-SHA256 that ForgeHands checks in constant time. A copy of one delivery is useless for any other body.
-- **GitLab sends the secret itself** in `X-Gitlab-Token`. ForgeHands compares it in constant time (both sides hashed, then `crypto.timingSafeEqual`), but it is **weaker**: anybody who sees one delivery (a proxy log, a debugging tool) can post any body with it. Keep the hop between GitLab and ForgeHands short and on TLS, restrict who can reach the port, and rotate `FORGE_WEBHOOK_SECRET` if it may have leaked. GitLab's newer signing token (`webhook-signature`) is not implemented.
+- **GitLab with a signing token** (`FORGE_WEBHOOK_SECRET=whsec_...`, GitLab 19.0 and later) is checked like Forgejo: an HMAC-SHA256 over the delivery id, its timestamp and the body (Standard Webhooks), compared in constant time. A delivery more than five minutes old is refused, and the plain token is not accepted then.
+- **GitLab with a secret token** sends the secret itself in `X-Gitlab-Token`. ForgeHands compares it in constant time (both sides hashed, then `crypto.timingSafeEqual`), but it is **weaker**: anybody who sees one delivery (a proxy log, a debugging tool) can post any body with it. Use a signing token where GitLab offers one. Otherwise keep the hop between GitLab and ForgeHands short and on TLS, restrict who can reach the port, and rotate `FORGE_WEBHOOK_SECRET` if it may have leaked.
 - On a Gitea setup Forgejo's headers and path are rejected, and the other way round; only the path of the configured `FORGE` exists.
 - The secret has to be at least 16 characters; keep it, the forge tokens and `OPENHANDS_API_KEY` out of the repository and out of logs.
 
