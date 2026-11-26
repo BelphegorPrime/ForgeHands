@@ -91,7 +91,14 @@ export function createApp(
     req: IncomingMessage,
     res: ServerResponse,
   ): boolean => {
-    if (!config.statusToken) return true;
+    // Without STATUS_TOKEN the page and the metrics are closed, unless STATUS_PUBLIC=1 opens them on purpose: they show ticket titles, pull
+    // requests and costs, and an open default was too easy to leave exposed.
+    if (!config.statusToken) {
+      if (config.statusPublic) return true;
+      res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({ error: "status_closed", message: "Set STATUS_TOKEN to protect the status page, or STATUS_PUBLIC=1 to open it to everybody who can reach this port." }));
+      return false;
+    }
     const authorized = hasToken(req.headers.authorization, config.statusToken);
     if (
       !authorized &&
@@ -439,10 +446,12 @@ export function createApp(
     attachWebSocket(
       server,
       "/dashboard/ws",
+      // The same rule as authenticateStatus: closed without STATUS_TOKEN unless STATUS_PUBLIC=1.
       (req) =>
-        !config.statusToken ||
-        hasToken(req.headers.authorization, config.statusToken) ||
-        hasStatusSession(req.headers.cookie, config.statusToken),
+        config.statusToken
+          ? hasToken(req.headers.authorization, config.statusToken) ||
+            hasStatusSession(req.headers.cookie, config.statusToken)
+          : config.statusPublic,
       () => JSON.stringify(status()),
     );
   return server;

@@ -74,6 +74,8 @@ interface BaseConfig {
   allowedRepos: Set<string>;
   allowedSenders: Set<string> | null;
   statusToken: string | null;
+  /** STATUS_PUBLIC=1: without STATUS_TOKEN the status page and the metrics are open to everybody who can reach the port. Off by default. */
+  statusPublic: boolean;
   dataFile: string;
   port: number;
   host: string;

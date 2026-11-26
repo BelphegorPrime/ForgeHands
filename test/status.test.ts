@@ -36,6 +36,8 @@ const env = (extra = {}) => ({
     "ai:changes": { profile: WORKER, tier: "free", on: "pull_request" },
   }),
   DATA_FILE: join(dir, "deliveries.json"),
+  // The status page is closed without STATUS_TOKEN; these tests read it, so it is opened unless a test sets a token.
+  ...(extra.STATUS_TOKEN ? {} : { STATUS_PUBLIC: '1' }),
   ...extra,
 });
 const basic = (user, password) =>
@@ -287,15 +289,52 @@ function upgradeStatus(base, cookie = "", origin = base) {
   });
 }
 
-test("without STATUS_TOKEN the status stays open", async () => {
-  const { base, close } = await serve();
+// The first line of the answer to a WebSocket upgrade of /dashboard/ws, from the same origin.
+async function upgradeAnswer(base) {
+  const { request } = await import("node:http");
+  const url = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = request({ host: url.hostname, port: url.port, path: "/dashboard/ws", headers: {
+      connection: "Upgrade", upgrade: "websocket", "sec-websocket-version": "13", "sec-websocket-key": Buffer.alloc(16, 1).toString("base64"), origin: base } });
+    req.on("upgrade", (response) => { resolve("HTTP/1.1 " + response.statusCode); response.socket?.destroy(); });
+    req.on("response", (response) => { resolve("HTTP/1.1 " + response.statusCode); response.resume(); });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("without STATUS_TOKEN the status page and the metrics are closed, and STATUS_PUBLIC=1 opens them", async () => {
+  const closed = await serve({ STATUS_PUBLIC: "0" });
   try {
-    assert.equal((await fetch(base + "/status")).status, 200);
-    const body = await (await fetch(base + "/status.json")).json();
+    for (const path of ["/status", "/status.json", "/metrics"]) {
+      const response = await fetch(closed.base + path);
+      assert.equal(response.status, 401, path + " is closed");
+      const body = await response.json();
+      assert.equal(body.error, "status_closed");
+      assert.match(body.message, /Set STATUS_TOKEN .* or STATUS_PUBLIC=1/);
+      assert.equal(response.headers.get("www-authenticate"), null, "no login prompt: there is no token to log in with");
+    }
+    assert.equal((await fetch(closed.base + "/healthz")).status, 200, "the health check stays open");
+    assert.equal((await fetch(closed.base + "/")).status, 401, "the dashboard is closed too");
+    assert.match(await upgradeAnswer(closed.base), /^HTTP\/1\.1 401/, "and so is its WebSocket");
+  } finally {
+    await closed.close();
+  }
+  const open = await serve({ STATUS_PUBLIC: "1" });
+  try {
+    assert.equal((await fetch(open.base + "/status")).status, 200);
+    const body = await (await fetch(open.base + "/status.json")).json();
     assert.ok(body.summary[repo]);
   } finally {
-    await close();
+    await open.close();
   }
+});
+
+test("STATUS_PUBLIC is 0 or 1, and it cannot be set together with STATUS_TOKEN", () => {
+  assert.equal(loadConfig(env({ STATUS_PUBLIC: "0" })).statusPublic, false);
+  assert.equal(loadConfig(env({ STATUS_PUBLIC: "1" })).statusPublic, true);
+  assert.throws(() => loadConfig(env({ STATUS_PUBLIC: "yes" })), /STATUS_PUBLIC must be 0 or 1/);
+  assert.throws(() => loadConfig(env({ STATUS_PUBLIC: "1", STATUS_TOKEN: "x".repeat(20) })), /set one of them, not both/);
 });
 
 test("with STATUS_TOKEN the status needs the token, healthz does not", async () => {

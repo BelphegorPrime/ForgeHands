@@ -23,6 +23,8 @@ async function setup(extra = {}) {
     ALLOWED_REPOS: repo,
     LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: WORKER, tier: 'free' } }),
     DATA_FILE: join(base, 'deliveries.json'),
+    // The status page is closed without STATUS_TOKEN; these tests read it.
+    STATUS_PUBLIC: '1',
     ...extra
   });
   const jobs = new JobStore(join(base, 'jobs.json'));

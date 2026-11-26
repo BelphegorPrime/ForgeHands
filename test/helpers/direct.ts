@@ -46,6 +46,8 @@ export const env = (extra = {}) => ({
   FORGEJO_TOKEN: 'tok-secret-value',
   FORGEJO_URL: 'https://forge.example',
   DATA_FILE: join(ctx.dir, 'deliveries.json'),
+  // The status page is closed without STATUS_TOKEN; these tests read it, so it is opened unless a test sets a token.
+  ...(extra.STATUS_TOKEN ? {} : { STATUS_PUBLIC: '1' }),
   ...extra
 });
 export function fakeApi() {

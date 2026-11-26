@@ -17,9 +17,9 @@ Do not submit logs containing webhook secrets, tokens, or private issue contents
 Run ForgeHands against a real test repository without letting it write anything: set `DRY_RUN=1` (and `DRY_RUN_REPOS=owner/repo` to keep other repositories live). Events are judged as usual, `/status` shows what would start, wait or merge, and every write is logged as `DRY RUN, not sent: ...`; a job that would start ends as `dry` with its first message in the ledger as `dry_prompt`. Reads still use your real tokens, so use a token of a throwaway user. See "Dry run" in the README for the limits.
 
 ```sh
-cp .env.example .env     # uncomment the direct-mode block, set DRY_RUN=1
+cp .env.example .env     # uncomment the direct-mode block, set DRY_RUN=1 and a STATUS_TOKEN
 npm start
-curl -s http://127.0.0.1:8080/status.json
+curl -s -H "Authorization: Bearer $STATUS_TOKEN" http://127.0.0.1:8080/status.json
 ```
 
 The gate sits in the transport (`src/forge/index.ts`, `src/dry.ts`), below the forge implementations, so new code that goes through the `Forge` interface is covered without any work. Code that makes a request on its own would bypass it: do not add one.
