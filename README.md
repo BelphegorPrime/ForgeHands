@@ -4,7 +4,7 @@ ForgeHands connects a git forge (**Forgejo**, **Gitea** or **GitLab**) to **Open
 
 A small Node.js 26 service written in TypeScript (run by type stripping, no build step, no runtime dependencies).
 
-> Status: in daily use, released as `v0.5.x`. Coming from `v0.3.x`? Read [docs/UPGRADING.md](docs/UPGRADING.md) first. Do not expose ForgeHands to the public Internet without TLS, network controls and monitoring.
+> Status: in daily use, released as `v0.10.x`. Upgrading from an older release? Read [docs/UPGRADING.md](docs/UPGRADING.md) first; [CHANGELOG.md](CHANGELOG.md) lists every release. Do not expose ForgeHands to the public Internet without TLS, network controls and monitoring.
 
 In this document "pull request" also means a GitLab **merge request**, and "Forgejo" in a variable name (`FORGEJO_URL`, `FORGEJO_TOKEN`, `forgejo_token_secret`) is kept for compatibility and stands for the configured forge.
 

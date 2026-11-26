@@ -27,4 +27,4 @@ ForgeHands is a bridge between a git forge (Forgejo, Gitea or GitLab) and OpenHa
 - Conventional commits (`feat:`, `fix:`, `docs:`, `test:`, `chore:`), subject in plain words about the behaviour ("look at a pull request's branch when a run on it ends"). The body says what went wrong or what was missing and why the change fixes it.
 - One issue per branch (`feat/…`, `fix/…`, `docs/…`) and one pull request with `Closes #n`. The body covers behaviour and security implications.
 - A behaviour change updates its README section in the same pull request.
-- Releases are a separate `chore: release vX.Y.Z` commit that bumps `package.json` and `package-lock.json`, made by the maintainer. Feature branches leave the version alone.
+- Releases are a separate `chore: release vX.Y.Z` commit that bumps `package.json` and `package-lock.json` and adds the release's section to `CHANGELOG.md`, made by the maintainer. Feature branches leave the version alone. A change an operator has to act on also gets a section in `docs/UPGRADING.md`, written in its own pull request.
