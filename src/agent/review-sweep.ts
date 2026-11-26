@@ -44,6 +44,8 @@ export interface StuckHooks {
   block: (event: ForgeEvent, text: string, why: string) => Promise<void>;
   // The follow-up rounds the ledger counts for the event's pull request (its ticket, or its own key for a bot or revert pull request).
   rounds: (event: ForgeEvent) => number;
+  // A ticket the end-to-end suite created (src/e2e): the ticket watchdog leaves it alone, because the suite judges its outcome itself.
+  exempt?: (repository: string, number: number) => boolean;
 }
 
 // The reconciler of REVIEW_SWEEP_MINUTES. A review is started by a green commit (webhook) or by a finished round; when an event is lost or
@@ -276,6 +278,9 @@ export class ReviewSweep {
     const name = repository.toLowerCase();
     const minutes = this.config.ticketStallMinutes;
     if (!minutes) return 0;
+    // A ticket of the end-to-end suite is left alone, while the suite runs and after its cleanup: a run that ends without a delivery there is
+    // the scenario's own outcome (revert-on-red), and a human called on a test ticket is noise. Its record, if any, goes.
+    const exempt = (number: number): boolean => Boolean(this.hooks.exempt?.(repository, number));
     const agent = new Set<number>();
     for (const pr of pulls) {
       const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
@@ -298,6 +303,7 @@ export class ReviewSweep {
       const key = name + '#' + number;
       const record = this.jobs.stalled.get(key);
       const own = runs.get(number) ?? [];
+      if (exempt(number)) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }
       // A ticket that waits for an open operator ticket (OPERATOR_LABEL, see agent/operator.ts) is not stalled: a person has to do the operator's
       // part first, and the ticket starts when that is closed. Its record, if any, goes.
       if (own.some((job) => (job.waiting_for ?? []).some((waited) => this.jobs.operatorTickets.has(name + '#' + waited)))) { if (record) { this.jobs.stalled.delete(key); acted += 1; } continue; }

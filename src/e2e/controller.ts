@@ -22,6 +22,8 @@ export interface E2eDeps {
   now?: () => number;
   /** Drops the queued runs of an issue (ForgeHands' dispatcher; see Dispatcher.dropQueuedOf). Without it a closed ticket's queued run starts later. */
   dropQueued?: (repository: string, issue: number) => Promise<number>;
+  /** Told the number of each ticket a run creates (the dispatcher leaves such tickets to the suite: no ticket watchdog). */
+  exempt?: (repository: string, number: number) => void;
   /** Replaces the scenarios of E2E_SCENARIOS (tests). */
   scenarios?: Scenario[];
   /** How often a wait looks again (default 30 s). */
@@ -136,6 +138,7 @@ export class E2eController {
     try {
       results = await runSuite(scenarios, { repository, forge, ledger, timeoutMs: config.e2e.timeoutMinutes * 60000, pollMs: this.deps.pollMs ?? 30000,
         queueMs: config.e2e.queueMinutes * 60000, now: this.deps.now, sleep: this.deps.sleep,
+        onTicket: (number) => this.deps.exempt?.(repository, number),
         log: (line) => logger.log?.('e2e: ' + line) });
     } catch (caught) {
       error = String((caught as Error)?.message || caught).slice(0, 600);

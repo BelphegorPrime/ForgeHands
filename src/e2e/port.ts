@@ -5,7 +5,7 @@ import type { Forge } from '../types/forge.ts';
 import type { JobStatus } from '../types.ts';
 
 /** The forge operations the suite uses. Every one is part of the Forge interface; the fixtures are required here. */
-export type E2eForge = Pick<Forge, 'getIssue' | 'closeIssue' | 'listComments' | 'addComment' | 'getPull' | 'listPulls' | 'closePull' | 'branchTip'
+export type E2eForge = Pick<Forge, 'getIssue' | 'closeIssue' | 'dependencies' | 'listComments' | 'addComment' | 'getPull' | 'listPulls' | 'closePull' | 'branchTip'
   | 'commitStatus' | 'compare' | 'createIssue' | 'findOrCreateLabel' | 'addLabels' | 'listBranches' | 'deleteBranch' | 'readFile' | 'writeFile'
   | 'deleteFile' | 'getRepository'> & { createIssue: NonNullable<Forge['createIssue']>; listBranches: NonNullable<Forge['listBranches']>;
   deleteBranch: NonNullable<Forge['deleteBranch']>; readFile: NonNullable<Forge['readFile']>; writeFile: NonNullable<Forge['writeFile']>;

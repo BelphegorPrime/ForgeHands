@@ -49,6 +49,8 @@ class FakeForge {
     this.branches = new Map();
     this.commits = new Map();
     this.statuses = new Map();
+    // issue -> the numbers it depends on (Forgejo: the issue is blocked by them until they close).
+    this.blockers = new Map();
     this.calls = [];
     this.number = 100;
     this.commitCount = 0;
@@ -91,6 +93,9 @@ class FakeForge {
     Object.assign(pr, { state: 'closed', merged: true, merged_at: new Date().toISOString(), merge_commit_sha: tip });
   }
   nextNumber() { this.number += 1; return this.number; }
+  // Forgejo refuses to close an issue that has an open dependency (HTTP 412); the dependency is listed by `dependencies`.
+  addDependency(issue, on) { this.blockers.set(issue, [...(this.blockers.get(issue) ?? []), on]); }
+  dependencies(_, number) { this.tick('dependencies'); return (this.blockers.get(number) ?? []).map((on) => this.entry(on)); }
   entry(number) {
     const entry = this.issues.get(number) ?? this.pulls.get(number);
     if (!entry) throw new Error('GET #' + number + ' -> HTTP 404');
@@ -110,12 +115,17 @@ class FakeForge {
   createIssue(_, title, body) {
     this.tick('createIssue');
     const number = this.nextNumber();
-    const issue = { number, title, body, state: 'open', labels: [], comments: [], html_url: null };
+    const issue = { number, title, body, state: 'open', labels: [], comments: [], html_url: null, created_at: new Date().toISOString(), closed_at: null };
     this.issues.set(number, issue);
     return issue;
   }
   getIssue(_, number) { this.tick('getIssue'); return this.entry(number); }
-  closeIssue(_, number) { this.tick('closeIssue'); this.entry(number).state = 'closed'; }
+  closeIssue(_, number) {
+    this.tick('closeIssue');
+    const open = (this.blockers.get(number) ?? []).filter((on) => this.entry(on).state === 'open');
+    if (open.length) throw new Error('PATCH /issues/' + number + ' -> HTTP 412');
+    this.entry(number).state = 'closed';
+  }
   reopenIssue(_, number) { this.tick('reopenIssue'); this.entry(number).state = 'open'; }
   listComments(_, number) { this.tick('listComments'); return this.entry(number).comments.map((body) => ({ body, created_at: '' })); }
   addComment(_, number, body) { this.tick('addComment'); this.entry(number).comments.push(body); }
@@ -431,6 +441,103 @@ test('the cleanup of a delivery under another ticket closes the sub-issue and it
   assert.deepEqual([...forge.branches.keys()].filter((name) => name.startsWith('ai/')), [], 'the branch of the sub-issue is deleted');
   assert.equal(forge.readFile(null, 'e2e/delivery.txt', 'main'), null, 'main has the tree of the start again');
   assert.equal((await restoreBranch(forge, 'owner/hello', 'main', baseline)).changed, 0);
+});
+
+// A ticket of the run with an open issue that the run created and that blocks it (a worker's operator ticket): Forgejo refuses the close with
+// 412, so the cleanup closes the blocker first. The start is taken before the blocker exists.
+test('cleanup closes the open issue the run created that blocks its ticket, then the ticket', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const started = Date.now() - 1000;
+  const ticket = forge.createIssue('owner/hello', 'E2E revert on red', 'B');
+  const operator = forge.createIssue('owner/hello', 'Operator: a token', 'B');
+  forge.addDependency(ticket.number, operator.number);
+  const refusals = [];
+  const close = forge.closeIssue.bind(forge);
+  forge.closeIssue = (repository, number) => { try { return close(repository, number); } catch (error) { refusals.push(number); throw error; } };
+
+  const { problem, note } = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline, started });
+  assert.equal(problem, null, problem);
+  assert.equal(note, null);
+  assert.equal(operator.state, 'closed', 'the blocker the run created is closed');
+  assert.equal(ticket.state, 'closed', 'the ticket is closed');
+  assert.deepEqual(refusals, [], 'the blocker goes first: no close is refused');
+});
+
+test('cleanup: a 412 on the close closes the run-created blocker and retries the close once', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const started = Date.now() - 1000;
+  const ticket = forge.createIssue('owner/hello', 'E2E revert on red', 'B');
+  const operator = forge.createIssue('owner/hello', 'Operator: a token', 'B');
+  forge.addDependency(ticket.number, operator.number);
+  // The dependency is not listed at the first read (the worker made it after that read): the close is refused, then the retry follows.
+  const listed = forge.dependencies.bind(forge);
+  let reads = 0;
+  forge.dependencies = (repository, number) => { reads += 1; return reads === 1 ? [] : listed(repository, number); };
+  const refusals = [];
+  const close = forge.closeIssue.bind(forge);
+  forge.closeIssue = (repository, number) => { try { return close(repository, number); } catch (error) { refusals.push(number); throw error; } };
+
+  const { problem } = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline, started });
+  assert.equal(problem, null, problem);
+  assert.deepEqual(refusals, [ticket.number], 'the first close was refused with 412');
+  assert.equal(operator.state, 'closed', 'the blocker is closed after the 412');
+  assert.equal(ticket.state, 'closed', 'the retried close holds');
+});
+
+test('cleanup: a blocker the run did not create stays open, and the 412 that keeps the ticket open is reported', async () => {
+  const forge = new FakeForge();
+  const baseline = forge.branches.get('main');
+  const operator = forge.createIssue('owner/hello', 'Operator: a token from before the run', 'B');
+  const started = Date.parse(operator.created_at) + 1;
+  const ticket = forge.createIssue('owner/hello', 'E2E revert on red', 'B');
+  forge.addDependency(ticket.number, operator.number);
+
+  const { problem } = await cleanup('owner/hello', forge, { tickets: [ticket.number], defaultBranch: 'main', baseline, started });
+  assert.match(problem, new RegExp('close ticket #' + ticket.number + ': PATCH /issues/' + ticket.number + ' -> HTTP 412'));
+  assert.equal(operator.state, 'open', 'a blocker the run did not create is not closed');
+  assert.equal(ticket.state, 'open');
+});
+
+test('a worker that opens a blocking ticket on the scenario ticket: the scenario holds, and its cleanup closes both tickets', async () => {
+  const forge = new FakeForge();
+  let blocked = false;
+  forge.progress = () => {
+    if (blocked || !forge.issues.size) return;
+    blocked = true;
+    const ticket = [...forge.issues.values()][0];
+    const operator = forge.createIssue('owner/hello', 'Operator: a token', 'B');
+    forge.addDependency(ticket.number, operator.number);
+  };
+  const result = await runScenario(scenario([ticketStep, { do: 'settle', seconds: 1 }]), runOptions(forge));
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.cleanup, 'ok', result.cleanup_reason);
+  assert.equal([...forge.issues.values()].every((issue) => issue.state === 'closed'), true, 'the ticket and the operator ticket are closed');
+});
+
+test('the suite tells the dispatcher the number of each ticket it creates (the ticket watchdog leaves those alone)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'e2e-exempt-'));
+  try {
+    const exempt = [];
+    const forge = new FakeForge();
+    const jobs = new JobStore(join(dir, 'jobs.json'));
+    await jobs.load();
+    const controller = new E2eController({ config: loadConfig(withE2e(), quiet), forge, jobs, notifier: { wants: () => true, notify() {} }, version: '1.0.0',
+      logger: quiet, scenarios: [scenario([ticketStep, { do: 'settle', seconds: 1 }])], pollMs: 1, sleep: async () => {}, now: () => 1000,
+      exempt: (repository, number) => exempt.push(repository + '#' + number) });
+    await controller.start('manual').done;
+    assert.deepEqual(exempt, ['owner/hello#' + [...forge.issues.keys()][0]]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the revert-on-red ticket tells the restarted run to deliver nothing after a revert, and to create no ticket', () => {
+  const body = SCENARIOS.find((entry) => entry.name === 'revert-on-red').steps[0].body;
+  assert.match(body, /^## After a revert$/m);
+  assert.match(body, /Deliver nothing: open no pull request, change no file and create no ticket/);
+  assert.match(body, /Add one comment that the scenario is done/);
 });
 
 // A file the fake cannot read as a regular file (a symlink, a submodule): the real Forgejo readFile throws for those.

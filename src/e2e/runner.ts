@@ -25,6 +25,8 @@ export interface RunOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Receives the path names of the cleanup's restore retries (never contents). */
   log?: (line: string) => void;
+  /** Called with the number of each ticket the run creates, before its label is set: the ticket watchdog leaves such a ticket alone. */
+  onTicket?: (number: number) => void;
 }
 
 export interface ScenarioResult {
@@ -330,6 +332,7 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
       const issue = await forge.createIssue(repository, step.title, step.body);
       tickets.push(issue.number);
       createdAt.set(issue.number, now());
+      options.onTicket?.(issue.number);
       vars.set(step.as, issue.number);
       const label = await forge.findOrCreateLabel(repository, step.label, '#0e8a16');
       await forge.addLabels(repository, issue.number, [label], 'issue');
@@ -363,7 +366,7 @@ export async function runScenario(scenario: Scenario, options: RunOptions): Prom
     reason = where + ': ' + String(error?.message || error).slice(0, 600);
   }
 
-  const outcome = await cleanup(repository, forge, { tickets, defaultBranch, baseline },
+  const outcome = await cleanup(repository, forge, { tickets, defaultBranch, baseline, started },
     { sleep, ledger: options.ledger, pollMs: options.pollMs, leftoverMs: options.leftoverMs, log: options.log })
     .catch((error): CleanupOutcome => ({ problem: String(error?.message || error).slice(0, 600), note: null }));
   return {
@@ -392,8 +395,9 @@ export function runNotes(ledger: LedgerPort, repository: string, tickets: number
   return parts.length ? parts.join(' | ') : null;
 }
 
-// What a run created and must undo. `tickets` are the issues it opened; `baseline` the commit the default branch had at the start.
-interface Created { tickets: number[]; defaultBranch: string; baseline: string | null }
+// What a run created and must undo. `tickets` are the issues it opened; `baseline` the commit the default branch had at the start; `started`
+// the time the run started (ms): an open issue that blocks one of the tickets and was created after it is the run's own.
+interface Created { tickets: number[]; defaultBranch: string; baseline: string | null; started?: number }
 
 export interface CleanupOutcome {
   /** What failed, or null when all of it held. */
@@ -453,6 +457,29 @@ export async function cleanup(repository: string, forge: E2eForge, created: Crea
     try { await action(); }
     catch (error) { problems.push(what + ': ' + String(error?.message || error).slice(0, 200)); }
   };
+  // The open issues that block `number` and were created by this run (after its start). A worker can make a ticket depend on an operator
+  // ticket it opened; Forgejo then answers the close of the ticket with 412, so the run's own blockers are closed first. A blocker the run did
+  // not create is left alone: the close then fails and the cleanup says so. A read that fails is no blocker (the close is tried anyway).
+  const closeBlockers = async (number: number): Promise<void> => {
+    if (created.started === undefined) return;
+    let blockers: unknown;
+    try { blockers = await forge.dependencies(repository, number); }
+    catch { return; }
+    const own = (Array.isArray(blockers) ? blockers : []) as { number: number; state?: string; created_at?: string }[];
+    for (const blocker of own) {
+      if (blocker?.state !== 'open' || !(Date.parse(String(blocker.created_at ?? '')) >= (created.started as number))) continue;
+      await forge.closeIssue(repository, blocker.number);
+    }
+  };
+  // Closes a ticket of the run: its own blockers first, then the close. A 412 (a dependency that appeared after the read) closes the blockers
+  // once more and retries the close once; a second 412 is the failure the cleanup reports.
+  const closeTicket = async (number: number): Promise<void> => {
+    await closeBlockers(number);
+    try { await forge.closeIssue(repository, number); return; }
+    catch (error) { if (!/HTTP 412\b/.test(String(error?.message))) throw error; }
+    await closeBlockers(number);
+    await forge.closeIssue(repository, number);
+  };
   // The paths of the run, read before its branches are deleted. Without tickets the run changed nothing; null means "cannot say".
   let touched: Set<string> | null = new Set<string>();
   if (created.tickets.length && created.baseline) {
@@ -465,7 +492,7 @@ export async function cleanup(repository: string, forge: E2eForge, created: Crea
       const pulls = await forge.listPulls(repository, { state: 'open', limit: 50, sort: 'recentupdate' });
       for (const pr of pulls.filter((entry) => isRunBranch(branchOf(entry), first))) await attempt('close pull request #' + pr.number, () => forge.closePull(repository, pr.number));
     });
-    for (const number of created.tickets) await attempt('close ticket #' + number, () => forge.closeIssue(repository, number));
+    for (const number of created.tickets) await attempt('close ticket #' + number, () => closeTicket(number));
     // A closed ticket's run that is only queued would start later and deliver onto the branch of the next scenario: it is dropped here.
     // A run that is already going cannot be stopped; the cleanup waits for it below.
     if (pacing.ledger) {
