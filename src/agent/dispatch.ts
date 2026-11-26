@@ -1,19 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { buildPrompt } from './prompt.ts';
-import { checkFacts } from './checks.ts';
-import { parseDeclaredFiles } from './files.ts';
-import { anyOverlap } from '../utils/path-overlap.ts';
 import { createForge, createTransport } from '../forge/index.ts';
 import { Merger } from './merge.ts';
-import { isPullRef, pullBranch, REVERT_BRANCH } from './bot.ts';
-import { redact } from '../utils/redact.ts';
+import { pullBranch } from './bot.ts';
 import { DryLog, isDry, isWrite } from '../dry.ts';
 import { Reminder } from './remind.ts';
 import { Workspace } from './workspace.ts';
 import { LedgerSync } from './ledger-sync.ts';
-import { ReviewSweep, stallLine } from './review-sweep.ts';
+import { ReviewSweep } from './review-sweep.ts';
 import { TicketPreflight } from './preflight.ts';
-import { HandbackRouter, classifyHandback, handbackLine, handbackOf } from './handback.ts';
+import { HandbackRouter } from './handback.ts';
 import { EpicGaps } from './epic-gaps.ts';
 import { ledgerEpics } from './epic-sweep.ts';
 import { isOperatorTicket } from './operator.ts';
@@ -21,109 +15,27 @@ import type { OperatorEntry } from './operator.ts';
 import { RecurringFindings } from './recurring.ts';
 import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
-import { digestIsEmpty, digestMessage, immediateMessage, stallMessage } from '../notify/texts.ts';
+import { digestIsEmpty, digestMessage, immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
-import { known, metrics } from '../metrics.ts';
+import { metrics } from '../metrics.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, IdleCounts, IdleState, Route, TokenTotals, Fetch, ForgeEvent, Job, Json, Logger, NewJob, NormalizedEvent, PushEvent, RerunRecord, RevertRecord } from '../types.ts';
+import type { BranchPushEvent, DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
-import type { CommitStatus, Issue } from '../types/forge.ts';
-import { cycleText, findCycles, ticketKey, waitGraph } from './waits.ts';
-import { behindBlocked, blockedTickets } from './stuck.ts';
-import { markReverted, revertRate } from './revert-rate.ts';
+import type { Issue } from '../types/forge.ts';
+import { Nudger } from './nudge.ts';
+import { ROUND_KINDS, ACTIVE_STATUSES } from './run-states.ts';
+import { WaitKeeper } from './wait-keeper.ts';
+import { RevertKeeper } from './revert-keeper.ts';
+import { BranchRefresher } from './branch-refresh.ts';
+import { SecurityReview } from './security-review.ts';
+import { DeliveryCheck } from './delivery.ts';
+import { TicketCleanup } from './ticket-cleanup.ts';
+import { IdleReporter } from './idle.ts';
+import { RunWatcher } from './run-watcher.ts';
+import { Scheduler } from './scheduler.ts';
+export { conversationCost, tokenUsage } from './run-states.ts';
 
-// `paused` counts: the run stopped (an OpenHands restart, or POST /pause). It is an interruption, so it is resumed (see resume), not a verdict on the ticket.
-const TERMINAL = new Set(['finished', 'error', 'stuck', 'deleted', 'paused', 'max_iterations']);
-const RETRY_BASE_MS = 60000;
-const MAX_ATTEMPTS = 3;
-// Routes that count as a follow-up round of an issue (a review run does not).
-const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
-const ERROR_RETRY_DELAY_MS = 60000;
-// Errors of a gateway that has no model left to ask: treated like a quota that is used up.
-const UNAVAILABLE_CODES = new Set(['LLMServiceUnavailableError', 'BadGatewayError', 'LLMTimeoutError']);
-// The last this many started runs decide what a repository has had so far (see pickNext).
-const RECENT_STARTS = 50;
-// WAIT_FOR_SAME_FILES looks at no more open pull requests than this per check.
-const FILE_PULLS_LOOKED_AT = 20;
-const ACTIVE_STATUSES = new Set(['waiting', 'queued', 'running']);
-// Stage A (RESUME_ATTEMPTS): the states a run is continued in, on its own conversation. A run that reached its iteration limit is not among
-// them: nothing in the API raises that limit of a conversation, so the same run would end the same way (see resume).
-const RESUMABLE = new Set(['stuck', 'timeout']);
-// A paused run (PAUSE_RESUMES) is continued with its own message: nothing went wrong with the ticket, the agent was interrupted.
-const PAUSE_MESSAGE = 'The run was interrupted (the agent server was restarted or the conversation was paused). Continue from where you stopped: check the state of the branch and of your last step, then finish the task and end with the finish tool.';
-// A continued run is given this long before its state counts again: the state it stopped in may still be reported for a moment.
-const RESUME_SETTLE_MS = 60000;
-// Stage B (FAILURE_ESCALATE): the states after which a round starts once more on the profile of its escalate_to route (see escalateFailure).
-// `no_delivery` is not one of them: an issue run that ends empty twice is escalated by checkDelivery instead (once, when its route has escalate_to).
-const ESCALATABLE = new Set(['stuck', 'timeout', 'max_iterations']);
-// Nudge (NUDGE_AT_PERCENT): a run's actions are counted at most once a minute, and not before the run is three minutes old.
-const NUDGE_CHECK_EVERY_MS = 60000;
-const NUDGE_MIN_RUN_MS = 180000;
-// A nudge is sent at most this many times without a trace of it in the events (the first send and one resend after a timeout).
-const NUDGE_TRIES = 2;
-// The idle line is logged again after this long when nothing about the waiting work has changed (see reportIdle).
-const IDLE_LOG_EVERY_MS = 15 * 60000;
-// After a stall alert no other one for this long, unless nothing waits any more (see checkStall).
-const STALL_REPEAT_MS = 6 * 3600000;
-// The open dependencies of a ticket that has no waiting job in the ledger are read from the forge, at most once per ticket per this long (cached).
-const DEP_CACHE_MS = 10 * 60000;
-// And at most this many such reads per pass: beyond that a ticket's edges are unknown for now (no edges, nothing is broken).
-const DEP_READS_PER_PASS = 40;
-
-// The route kinds, as the token counter labels them (a known set, see metrics.known).
-const ROUTE_KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'];
-const TOKEN_TYPES = ['prompt', 'completion', 'cache_read', 'reasoning'] as const;
-
-// Tokens of a conversation (stats.usage_to_metrics: one entry per usage id, each with its LLM calls in token_usages), summed. Null when the
-// conversation carries no usage at all.
-export function tokenUsage(data: Json): TokenTotals | null {
-  const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
-  if (!usage || typeof usage !== 'object') return null;
-  const totals: TokenTotals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
-  for (const entry of Object.values(usage) as Json[]) {
-    for (const call of Array.isArray(entry?.token_usages) ? entry.token_usages as Json[] : []) {
-      totals.prompt += Number(call?.prompt_tokens) || 0;
-      totals.completion += Number(call?.completion_tokens) || 0;
-      totals.cache_read += Number(call?.cache_read_tokens) || 0;
-      totals.cache_write += Number(call?.cache_write_tokens) || 0;
-      totals.reasoning += Number(call?.reasoning_tokens) || 0;
-    }
-  }
-  return totals;
-}
-
-// Accumulated LLM cost (USD) of a conversation, summed over all of its LLMs.
-export function conversationCost(data: Json): number | null {
-  // OpenHands reports it under `stats`; `metrics` is null in the conversation response.
-  const usage = data?.stats?.usage_to_metrics ?? data?.metrics?.usage_to_metrics;
-  if (!usage || typeof usage !== 'object') return null;
-  return (Object.values(usage) as Json[]).reduce((sum: number, entry) => sum + (Number(entry?.accumulated_cost) || 0), 0);
-}
-
-// The idle line: how many waiting jobs wait for what (see Dispatcher.reportIdle). `could_start` is only named when it is not 0.
-function idleLine(reasons: IdleCounts, tiers: string[]): string {
-  const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
-  return 'idle: ' + total + ' waiting: ' + reasons.dependencies + ' on dependencies, ' + reasons.files + ' on files of older tickets, '
-    + reasons.quota + ' held (quota ' + (tiers.join('/') || 'none') + '), ' + reasons.disk + ' held (low disk), '
-    + reasons.hourly + ' over the hourly limit, ' + reasons.concurrency + ' over a concurrency limit'
-    + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '')
-    + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '')
-    + (reasons.stuck ? ', ' + reasons.stuck + ' behind a blocked pull request' : '');
-}
-
-// The note a revert's comment carries when the failed run could not turn green on a rerun (RERUN_TIMEOUT_MINUTES).
-const RERUN_NOTE: Record<'red' | 'timeout' | 'unavailable', string> = {
-  red: 'A rerun of the failed run did not turn it green.',
-  timeout: 'A rerun of the failed run did not finish within RERUN_TIMEOUT_MINUTES.',
-  unavailable: 'No rerun of the failed run could be started.'
-};
-// Action run states that are not finished yet: a rerun is waited for while its run is in one of them.
-const RUN_UNFINISHED = new Set(['running', 'waiting', 'queued', 'pending', 'blocked']);
-
-// The verdict of preExistingFailure (REVERT_ON_RED): regression, a check that was green before the merge and is red after it; pre_existing, a red
-// check that was not green before it; unknown, the commit before the merge could not be read; recovered, the commit is green on the second read.
-type PreExisting = { verdict: 'regression' | 'pre_existing' | 'unknown' | 'recovered'; parent?: string; checks: string[] };
 
 // Starts OpenHands conversations for queued issues and keeps the load inside the configured limits.
 export class Dispatcher {
@@ -156,33 +68,21 @@ export class Dispatcher {
   recurring: RecurringFindings;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
-  lastArchive = 0;
-  /** Earliest time of the next look for closed issues (sweepClosed) and when each ticket was last found open. */
-  nextClosedSweep = 0;
-  closedChecked = new Map<string, number>();
-  closeRefused = new Map<string, number>(); // repository#issue -> until when a refused close is not tried again
-  revertsInFlight = new Set<string>(); // repository#pull request n -> its revert is being handled now (see revertMerged); in memory only
-  lastUpdate = new Map<string, number>(); // repository#pr -> when ForgeHands last updated its branch (the cooldown)
-  mainMoved = new Map<string, { at: number; event: PushEvent }>(); // repository -> { at, event }: the default branch moved, look at the pull requests after the delay
-  cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
-  nudgeChecks = new Map<string, number>(); // job id -> when the actions of its run were last counted (NUDGE_AT_PERCENT); in memory only
-  // job id -> the nudge being delivered in the background (see startNudge): the poll path never waits for a nudge; in memory only.
-  nudgeInflight = new Map<string, Promise<void>>();
-  /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
-  idle: IdleState | null = null;
-  idleLogged: { key: string; at: number } | null = null; // the composition last logged and when
-  // Same-files waits not taken ("repo#j>repo#t") and dependency cycles logged: each once, in memory.
-  cyclePairs = new Set<string>();
-  cyclesLogged = new Set<string>();
-  // The open dependencies read from the forge for the wait graph: ticket key -> when read and what was open (a failed read is an empty answer).
-  depCache = new Map<string, { at: number; open: string[] }>();
-  depReads = 0; // reads spent in the current pass
   /** The tickets the end-to-end suite created ("repo#n", lower case): the ticket watchdog leaves them alone (see exemptE2eTicket). */
   e2eTickets = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
-  stallAlertAt: number | null = null; // when the last stall alert went out; cleared when nothing waits any more
 
+  nudger: Nudger = new Nudger(this);
+  waitKeeper: WaitKeeper = new WaitKeeper(this);
+  revertKeeper: RevertKeeper = new RevertKeeper(this);
+  branchRefresher: BranchRefresher = new BranchRefresher(this);
+  securityReview: SecurityReview = new SecurityReview(this);
+  deliveryCheck: DeliveryCheck = new DeliveryCheck(this);
+  ticketCleanup: TicketCleanup = new TicketCleanup(this);
+  idleReporter: IdleReporter = new IdleReporter(this);
+  runWatcher: RunWatcher = new RunWatcher(this);
+  scheduler: Scheduler = new Scheduler(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -204,9 +104,9 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
-    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket),
-      (repository, number) => this.ticketGone(repository, number));
-    this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.ticketCleanup.markClosed(ticket), now, (ticket) => this.ticketCleanup.dropDeletedTicket(ticket),
+      (repository, number) => this.ticketCleanup.ticketGone(repository, number));
+    this.reminder.deleted = (repository, number) => this.ticketCleanup.checkAndDropDeleted(repository, number);
     // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
       block: (event, text, why) => this.markForHuman(event, text, why),
@@ -316,7 +216,7 @@ export class Dispatcher {
   async enqueue(event: ForgeEvent): Promise<{ status: string }> {
     // An operator ticket starts no run, whatever route label it also carries (see agent/operator.ts).
     if (isOperatorTicket(event, this.config)) return this.onOperatorTicket(event);
-    if (event.type === 'ci.main_failure') return this.onMainFailure(event);
+    if (event.type === 'ci.main_failure') return this.revertKeeper.onMainFailure(event);
     if (event.type !== 'ci.success') {
       const result = await this.enqueueOne(event);
       // An approval label on a pull request that did not start the merge (the event was taken for a round, or it was a duplicate): said once, so that
@@ -660,7 +560,7 @@ export class Dispatcher {
     if (open.length) return { status: 'waiting' };
     // The earlier approval does not cover what this run will push or review.
     if (event.pull_request) await this.merger.clearApproval(event);
-    if (kind === 'ci_success') await this.startSecurityReview(event);
+    if (kind === 'ci_success') await this.securityReview.startSecurityReview(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
   }
@@ -764,20 +664,11 @@ export class Dispatcher {
   // "fallback_to" whose tier is free, the fallback route (profile and tier; the limits, branch, kind and prompt stay those of the own route).
   effectiveRoute(job: Job, now: number): { route: Route; fellBack?: string } {
     const base = this.escalationTarget(job) ?? this.route(job.label);
-    if (base.fallbackTo && (this.cooldowns.get(base.tier) || 0) > now) {
+    if (base.fallbackTo && (this.scheduler.cooldowns.get(base.tier) || 0) > now) {
       const fallback = this.config.routes.get(base.fallbackTo);
-      if (fallback && (this.cooldowns.get(fallback.tier) || 0) <= now) return { route: fallback, fellBack: base.fallbackTo };
+      if (fallback && (this.scheduler.cooldowns.get(fallback.tier) || 0) <= now) return { route: fallback, fellBack: base.fallbackTo };
     }
     return { route: base };
-  }
-
-  // When a job that hit a quota hold may start again: the earliest end of the holds of the routes it can run on (its own or escalated route
-  // and that route's fallback), or undefined when one of them is free now (a fallback takes over at once).
-  earliestStart(job: Job, now: number): number | undefined {
-    const base = this.escalationTarget(job) ?? this.route(job.label);
-    const tiers = [base.tier, ...(base.fallbackTo && this.config.routes.get(base.fallbackTo) ? [this.config.routes.get(base.fallbackTo)!.tier] : [])];
-    const earliest = Math.min(...tiers.map((tier) => this.cooldowns.get(tier) || 0));
-    return earliest > now ? earliest : undefined;
   }
 
   // The wire of the dispatcher's forge: every call it makes passes here (and below that, through the dry run gate of the transport).
@@ -806,7 +697,7 @@ export class Dispatcher {
         .map((issue) => issue.number);
     } catch (error) {
       if (/HTTP 404\b/.test(error.message) && !('pull_request' in event && event.pull_request)) {
-        await this.checkAndDropDeleted(event.repository.full_name, number);
+        await this.ticketCleanup.checkAndDropDeleted(event.repository.full_name, number);
         return [];
       }
       this.logger.error('could not read the dependencies of #' + number + ':', error.message);
@@ -814,81 +705,10 @@ export class Dispatcher {
     }
   }
 
-  // Whether the forge has no such issue: a 404 on GET /issues/{n}. Any other failure throws.
-  async ticketGone(repository: string, number: number): Promise<boolean> {
-    try {
-      await this.forge.getIssue(repository, number);
-      return false;
-    } catch (error) {
-      if (/HTTP 404\b/.test(error.message)) return true;
-      throw error;
-    }
-  }
-
-  // The ticket is checked and, when the forge says it is deleted, its waiting and queued jobs are dropped. Best effort: a failed read changes nothing.
-  async checkAndDropDeleted(repository: string, number: number): Promise<boolean> {
-    try {
-      if (!(await this.ticketGone(repository, number))) return false;
-    } catch (error) {
-      this.logger.error('could not check whether #' + number + ' of ' + repository + ' still exists:', error.message);
-      return false;
-    }
-    return this.dropDeleted(repository, number, false);
-  }
-
-  // A ticket (or, with `pull`, a pull request) is deleted in the forge: its waiting and queued jobs end as `deleted`, with no comment, no hand-over
-  // and no mail. An issue's jobs are closed on the status page too (archived_view); running jobs are left alone. One log line per ticket.
-  // Dry runs change nothing.
-  async dropDeleted(repository: string, number: number, pull: boolean): Promise<boolean> {
-    if (isDry(this.config, repository)) return false;
-    const name = repository.toLowerCase();
-    const ticket = name + '#' + number;
-    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued')
-      && job.event.repository.full_name.toLowerCase() === name
-      && (pull ? job.event.pull_request?.number === number : job.key.split(':')[0] === ticket));
-    if (!jobs.length) return false;
-    const now = this.now();
-    for (const job of jobs) {
-      Object.assign(job, { status: 'deleted', finished: now, result: 'deleted' });
-      delete job.waiting_for; delete job.waiting_for_files;
-    }
-    if (!pull) this.jobs.markClosed(ticket);
-    metrics.inc('forgehands_deleted_tickets_total');
-    this.logger.error(repository + (pull ? '!pr' : '#') + number + ': deleted in the forge, its waiting jobs are dropped');
-    await this.jobs.persist(now);
-    return true;
-  }
-
   // A ticket the end-to-end suite created is left to the suite: the ticket watchdog does not restart or block it (src/e2e, ReviewSweep.watchStalled).
   // It is kept for the life of the process; a closed ticket is no candidate of the watchdog anyway.
   exemptE2eTicket(repository: string, number: number): void {
     this.e2eTickets.add(repository.toLowerCase() + '#' + number);
-  }
-
-  // The runs of an issue ("repo#n") that wait or are queued are dropped: the end-to-end suite closes its tickets this way, and a closed ticket's
-  // queued run would otherwise start later. A running run is left alone (it cannot be stopped from here). Dry runs change nothing.
-  // Returns how many were dropped.
-  async dropQueuedOf(repository: string, number: number): Promise<number> {
-    if (isDry(this.config, repository)) return 0;
-    const ticket = repository.toLowerCase() + '#' + number;
-    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued') && job.key.toLowerCase().split(':')[0] === ticket);
-    if (!jobs.length) return 0;
-    const now = this.now();
-    for (const job of jobs) {
-      Object.assign(job, { status: 'deleted', finished: now, result: 'dropped: the ticket was closed before the run started' });
-      delete job.waiting_for; delete job.waiting_for_files;
-    }
-    this.jobs.markClosed(ticket);
-    this.logger.error(ticket + ': closed while its runs were queued, ' + jobs.length + ' queued run(s) dropped');
-    await this.jobs.persist(now);
-    return jobs.length;
-  }
-
-  // The same for a ticket of the ledger ("repo#n" or "repo!pr<n>"), as the ledger sync names it.
-  async dropDeletedTicket(ticket: string): Promise<boolean> {
-    const match = /^(.+?)([#!])(?:pr)?(\d+)$/.exec(ticket);
-    if (!match) return false;
-    return this.dropDeleted(match[1], Number(match[3]), match[2] === '!');
   }
 
   // An epic: an issue with an epic label, or one the ledger knows as an epic (it had a run of an epic label or of the epic review, see epic-sweep.ts).
@@ -902,9 +722,9 @@ export class Dispatcher {
   async onClosed(event: ForgeEvent): Promise<string> {
     const ticket = event.repository.full_name.toLowerCase() + '#' + event.issue.number;
     if (this.jobs.operatorTickets.delete(ticket)) await this.jobs.persist(this.now());
-    await this.markClosed(ticket);
+    await this.ticketCleanup.markClosed(ticket);
     if (!this.config.forgejo) return 'no_forgejo_access';
-    await this.releaseFileWaitsNow();
+    await this.waitKeeper.releaseFileWaitsNow();
     let blocked: Json;
     try { blocked = await this.forge.blocks(event.repository.full_name, event.issue.number); }
     catch (error) { this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message); return 'blocks_unknown'; }
@@ -936,7 +756,7 @@ export class Dispatcher {
   // event, which starts what waits. Best effort.
   async closeMergedTickets(event: PushEvent): Promise<number> {
     if (!this.config.forgejo) return 0;
-    await this.releaseFileWaitsNow();
+    await this.waitKeeper.releaseFileWaitsNow();
     const repository = event.repository.full_name;
     let closed = 0;
     try {
@@ -944,31 +764,31 @@ export class Dispatcher {
       for (const pr of Array.isArray(pulls) ? pulls : []) {
         const reverted = /^ai\/revert-(\d+)$/.exec(pullBranch(pr));
         if (reverted && pr.merged && (!event.repository.default_branch || !pr.base?.ref || pr.base.ref === event.repository.default_branch)) {
-          await this.markRevertedMerge(repository, Number(reverted[1]), Number(pr.number));
-          closed += (await this.revertMerged(repository, pr, Number(reverted[1]))) ? 1 : 0;
+          await this.revertKeeper.markRevertedMerge(repository, Number(reverted[1]), Number(pr.number));
+          closed += (await this.revertKeeper.revertMerged(repository, pr, Number(reverted[1]))) ? 1 : 0;
           continue;
         }
         const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
         if (!match || !pr.merged || (event.repository.default_branch && pr.base?.ref && pr.base.ref !== event.repository.default_branch)) continue;
         // A merged pull request whose change was reverted: its ticket is reopened by the revert, not closed again here.
-        if (this.revertOf(repository, Number(pr.number))) continue;
+        if (this.revertKeeper.revertOf(repository, Number(pr.number))) continue;
         const number = Number(match[1]);
         const issue = await this.forge.getIssue(repository, number);
-        if (issue && issue.state === 'closed' && !issue.pull_request) await this.markClosed(repository.toLowerCase() + '#' + number);
+        if (issue && issue.state === 'closed' && !issue.pull_request) await this.ticketCleanup.markClosed(repository.toLowerCase() + '#' + number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
         // A forge may refuse to close the ticket (Forgejo answers 412 while issues it depends on are open). That must neither stop the other
         // tickets of this pass nor repeat every push (and comment every time): the refusal is remembered for six hours.
         const ticket = repository.toLowerCase() + '#' + number;
-        if ((this.closeRefused.get(ticket) || 0) > this.now()) continue;
+        if ((this.ticketCleanup.closeRefused.get(ticket) || 0) > this.now()) continue;
         try {
           await this.forge.closeIssue(repository, number);
         } catch (error) {
-          this.closeRefused.set(ticket, this.now() + 6 * 3600000);
+          this.ticketCleanup.closeRefused.set(ticket, this.now() + 6 * 3600000);
           this.logger.error('could not close #' + number + ' of ' + repository + ' (its pull request #' + pr.number + ' is merged), trying again in six hours:', error.message);
           continue;
         }
         await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.', 'issue');
-        await this.markClosed(ticket);
+        await this.ticketCleanup.markClosed(ticket);
         this.noteTicket(ticket, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
       }
@@ -976,168 +796,6 @@ export class Dispatcher {
       this.logger.error('could not close the tickets of merged pull requests:', error.message);
     }
     return closed;
-  }
-
-  // The merged revert pull request r (ai/revert-<n>) undid the merge of pull request n: that merge counts as reverted, once (REVERT_RATE_ALERT).
-  // Saved at once; a merge that is marked already, or one ForgeHands did not merge, changes nothing.
-  async markRevertedMerge(repository: string, number: number, revert: number): Promise<void> {
-    const merge = markReverted(this.jobs.merges, repository, number, revert);
-    if (!merge) return;
-    metrics.inc('forgehands_merges_reverted_total', { repository: repository.toLowerCase() });
-    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-  }
-
-  // A red default branch after the merge of pull request n that no revert of ForgeHands undid: no revert route, a revert that went red, or a
-  // ticket blocked after its revert. Counted once per merge (forgehands_reverts_needing_human_total), saved at once.
-  async markNeededHuman(repository: string, number: number): Promise<void> {
-    const name = repository.toLowerCase();
-    const merge = this.jobs.merges.find((entry) => entry.repository === name && entry.number === number);
-    if (!merge || merge.needed_human) return;
-    merge.needed_human = true;
-    metrics.inc('forgehands_reverts_needing_human_total', { repository: name });
-    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-  }
-
-  // REVERT_RATE_ALERT: a repository whose revert rate of the last 30 days is above the threshold gets one `failed` notice per day (UTC), once
-  // REVERT_RATE_MIN_MERGES merges are in the window, so that one revert of two merges does not alarm. Off at 0. Returns whether it noted one.
-  async checkRevertRate(now: number): Promise<boolean> {
-    const threshold = this.config.revertRateAlert;
-    if (!threshold || !this.notifier.wants('failed')) return false;
-    const day = new Date(now).toISOString().slice(0, 10);
-    let told = false;
-    for (const repository of this.config.allowedRepos) {
-      const rate = revertRate(this.jobs.merges, repository, now);
-      if (rate.ratio === null || rate.merges < this.config.revertRateMinMerges || rate.ratio * 100 <= threshold) continue;
-      const key = 'revert_rate:' + repository + '@' + day;
-      if (this.jobs.noted(key)) continue;
-      this.jobs.note(key, now);
-      told = true;
-      const percent = Math.round(rate.ratio * 1000) / 10;
-      this.notifier.notify(immediateMessage(this.config.notify.language, 'failed', { repository, number: 0, why: 'revert_rate',
-        rate: { percent, reverted: rate.reverted, merges: rate.merges, threshold } }), repository);
-    }
-    return told;
-  }
-
-  // The record of the revert of pull request n (REVERT_RETRIES), if any.
-  revertOf(repository: string, number: number): RevertRecord | undefined {
-    if (!this.config.revertRetries) return undefined;
-    return this.jobs.reverts.find((entry) => entry.repository === repository.toLowerCase() && entry.number === number);
-  }
-
-  // The record of the revert of pull request n is missing (the revert ran, but its record was never kept, or the ledger predates it), while the
-  // ledger knows the merge of n: when that merge was of an agent's branch (ai/issue-<m>) the record is made now, as onMainFailure would have made it.
-  // The branch is read from the pull request when the ledger holds a pull request ref (refs/pull/<n>/head). A bot's or a ticketless merge: none.
-  async recoverRevert(repository: string, number: number): Promise<RevertRecord | undefined> {
-    if (!this.config.revertRetries) return undefined;
-    const name = repository.toLowerCase();
-    const merge = this.jobs.merges.find((entry) => entry.repository === name && entry.number === number);
-    if (!merge) return undefined;
-    let branch = String(merge.branch || '');
-    if (isPullRef(branch)) {
-      try { branch = pullBranch(await this.forge.getPull(repository, number)); } catch (error) { this.logger.error('could not read #' + number + ' to name its branch:', error.message); }
-    }
-    const ticket = /^ai\/issue-(\d+)$/.exec(branch);
-    if (!ticket) return undefined;
-    // The await above lets another event make the record meanwhile: that one is used, not a second record for the same merge.
-    const existing = this.revertOf(repository, number);
-    if (existing) return existing;
-    const record: RevertRecord = { repository: name, number, issue: Number(ticket[1]), sha: String(merge.sha || ''), state: 'started', at: this.now() };
-    this.jobs.reverts.push(record);
-    this.logger.error(name + '#' + number + ': the record of its revert was missing, made again from the ledger (ticket #' + record.issue + ')');
-    return record;
-  }
-
-  // The revert of an agent's merge is merged (by ForgeHands or by a human; seen on the push to the default branch that merged it). Once per revert:
-  // the ticket is reopened (its work was undone), one comment says what broke and quotes the revert's own account (redacted), and the worker route
-  // starts again, as a newly added label does, while REVERT_RETRIES allows it. Then the ticket gets BLOCKED_LABEL and the human is called. Each step
-  // is recorded, so a step that failed is tried again on the next push, and the steps done are not repeated. Returns whether it closed something.
-  // Pushes are handled concurrently (the server does not wait for closeMergedTickets), so two events can see the same revert before either has
-  // recorded a step: the first one in flight does the work, a second one for the same merge returns at once (false), and a step that failed is
-  // left for a later push, as before.
-  async revertMerged(repository: string, revert: Json, number: number): Promise<boolean> {
-    const key = repository.toLowerCase() + '#' + number;
-    if (this.revertsInFlight.has(key)) return false;
-    this.revertsInFlight.add(key);
-    try {
-      return await this.revertMergedNow(repository, revert, number);
-    } finally {
-      this.revertsInFlight.delete(key);
-    }
-  }
-
-  private async revertMergedNow(repository: string, revert: Json, number: number): Promise<boolean> {
-    const record = this.revertOf(repository, number) ?? await this.recoverRevert(repository, number);
-    if (!record || record.state === 'handled' || !this.config.forgejo) return false;
-    const name = repository.toLowerCase();
-    const ticket = record.issue;
-    const branch = revert.base?.ref || 'the default branch';
-    record.revert = Number(revert.number);
-    record.state = 'merged';
-    if (!record.reopened) {
-      try {
-        await this.forge.reopenIssue(repository, ticket);
-        record.reopened = true;
-      } catch (error) {
-        this.logger.error('could not reopen #' + ticket + ' of ' + repository + ' after its revert #' + revert.number + ', trying again on the next push:', error.message);
-        return false;
-      }
-    }
-    if (!record.commented) {
-      let body = '';
-      try { body = String((await this.forge.getPull(repository, Number(revert.number)))?.body || ''); } catch (error) { this.logger.error('could not read #' + revert.number + ':', error.message); }
-      const cause = redact(body.slice(0, 1200), this.secretValues()).trim();
-      const quoted = (cause || 'The revert pull request has no text: read the failed run of the default branch.').split('\n').map((line) => '> ' + line).join('\n');
-      try {
-        await this.forge.addComment(repository, ticket, 'ForgeHands: the merge of #' + record.number + ' turned the CI of ' + branch + ' red (commit ' + record.sha.slice(0, 8)
-          + '); it was reverted by #' + revert.number + '. Fix the cause, do not repeat the change that broke it. Cause as the revert run found it:\n\n' + quoted, 'issue');
-        record.commented = true;
-      } catch (error) {
-        this.logger.error('could not comment on #' + ticket + ' after its revert:', error.message);
-        return false;
-      }
-    }
-    const used = this.jobs.reverts.filter((entry) => entry !== record && entry.repository === name && entry.issue === ticket && entry.restarted).length;
-    if (!record.restarted && !record.blocked) {
-      if (used < this.config.revertRetries) {
-        const label = this.lastRunLabel(name, ticket);
-        if (!label) { this.logger.error(name + '#' + ticket + ': no run of the ticket to start again after its revert, nothing started'); await this.markNeededHuman(repository, record.number); }
-        else {
-          try {
-            const issue = await this.forge.getIssue(repository, ticket);
-            const result = await this.enqueueOne({ type: 'issues.labeled', source: this.forge.kind, action: 'revert_retry', label, revert_retry: true,
-              repository: { full_name: repository, clone_url: null, html_url: null, default_branch: revert.base?.repo?.default_branch || null },
-              issue: { number: ticket, title: String(issue?.title || '').slice(0, 1000), body: String(issue?.body || '').slice(0, 50000), html_url: issue?.html_url || null, comments: 0, labels: [label] },
-              sender: { login: null } });
-            if (result.status === 'queued' || result.status === 'waiting' || result.status === 'duplicate_job') {
-              record.restarted = true;
-              metrics.inc('forgehands_revert_retries_total');
-              this.logger.error(repository + '#' + ticket + ': reverted by #' + revert.number + ', running ' + label + ' again');
-            }
-          } catch (error) {
-            this.logger.error('could not start ' + name + '#' + ticket + ' again after its revert:', error.message);
-            return false;
-          }
-        }
-      } else {
-        try {
-          const blocked = await this.forge.findOrCreateLabel(repository, this.config.blockedLabel, '#b60205');
-          await this.forge.addLabels(repository, ticket, [blocked], 'issue');
-          await this.forge.addComment(repository, ticket, mentionOf(this.config) + 'ForgeHands: the merge of #' + record.number + ' turned the CI red again and was reverted by #'
-            + revert.number + '. The ticket was started again ' + used + ' times already (REVERT_RETRIES=' + this.config.revertRetries + '). It is blocked (' + this.config.blockedLabel + '): a human has to look at it.', 'issue');
-          this.tell('blocked', { repository: { full_name: repository, clone_url: null, html_url: null, default_branch: branch }, type: 'ci.main_failure', source: this.forge.kind,
-            sender: { login: null }, issue: { number: ticket, title: '', body: '', html_url: null, comments: 0, labels: [] } }, { why: 'revert_retries' });
-          record.blocked = true;
-          await this.markNeededHuman(repository, record.number);
-        } catch (error) {
-          this.logger.error('could not block #' + ticket + ' after its revert:', error.message);
-          return false;
-        }
-      }
-    }
-    record.state = 'handled';
-    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-    return true;
   }
 
   // The worker label of the ticket's last run: the trigger that starts it again (an issue route, not a planner's label; the newest run wins).
@@ -1169,220 +827,6 @@ export class Dispatcher {
         epic: { children }, sender: event.sender
       }
     });
-    return true;
-  }
-
-  // REVERT_ON_RED: a CI run failed on the default branch for a commit that ForgeHands merged (the ledger knows it, see Merger.recordMerge). Once per
-  // commit: the merged pull request is told, the human is told at once, and a route of kind main_red (when one exists) starts a run that reverts
-  // the merge in a pull request ai/revert-<n>. Without that route the human is called on the pull request. A red revert only tells the human: no
-  // revert of a revert. A failure outside the window or of a commit ForgeHands did not merge does nothing.
-  async onMainFailure(event: ForgeEvent): Promise<{ status: string }> {
-    if (!this.config.revertOnRed) return { status: 'revert_off' };
-    if (!this.config.forgejo) return { status: 'no_forgejo_access' };
-    const repository = event.repository.full_name;
-    const sha = event.ci!.commit_sha.toLowerCase();
-    const merge = this.jobs.merges.find((entry) => entry.repository === repository.toLowerCase() && entry.sha?.toLowerCase() === sha);
-    if (!merge) return { status: 'not_our_merge' };
-    if (this.now() - merge.merged_at > this.config.revertWindowMinutes * 60000) return { status: 'outside_window' };
-    if (await this.commitRecovered(event)) return { status: 'ci_not_red' };
-    const key = 'main_red:' + repository.toLowerCase() + '@' + sha;
-    if (this.jobs.noted(key)) return { status: 'duplicate' };
-    this.jobs.note(key, this.now());
-    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-    const number = merge.number;
-    const short = sha.slice(0, 8);
-    const branch = event.repository.default_branch || 'the default branch';
-    let title = '';
-    let pull: Json | undefined;
-    try { pull = await this.forge.getPull(repository, number); title = String(pull?.title || ''); } catch (error) { this.logger.error('could not read #' + number + ':', error.message); }
-    // The branch of the merged pull request: the ledger's name, unless it holds a pull request ref (refs/pull/<n>/head, as Forgejo reports a merged
-    // pull request whose branch is deleted); then the pull request itself names the branch.
-    const head = isPullRef(merge.branch) ? pullBranch(pull) || merge.branch : merge.branch;
-    // The pull request as the notice names it: the merged one, or the revert that went red (whose merge was a revert).
-    const told = { ...event, issue: { ...event.issue, number, title: title.slice(0, 1000), html_url: null }, pull_request: { number, head_ref: head, html_url: null } };
-    if (REVERT_BRANCH.test(head)) {
-      // The revert went red: the merge it undid stays undone by a human, not by ForgeHands.
-      await this.markNeededHuman(repository, Number(/\d+$/.exec(head)![0]));
-      this.tell('failed', told, { why: 'revert_red' });
-      return { status: 'revert_red_told' };
-    }
-    // A red check that was already red on the commit before the merge (or cannot be compared with it) is not this merge's doing: no revert.
-    const cause = await this.preExistingFailure(event, repository, sha);
-    if (cause.verdict === 'recovered') {
-      // Green on the second read: nothing to do. The key is dropped, so a red run of this commit that comes again is judged again.
-      this.jobs.dedupe.delete(key);
-      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-      return { status: 'ci_not_red' };
-    }
-    if (cause.verdict === 'pre_existing') {
-      merge.pre_existing = true;
-      try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-      this.tell('failed', told, { why: 'pre_existing' });
-      const checks = cause.checks.length ? ' (' + cause.checks.map((name) => name.slice(0, 200)).join(', ') + ')' : '';
-      try {
-        await this.forge.addComment(repository, number, 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), but it already failed on the commit before it'
-          + ' (' + String(cause.parent).slice(0, 8) + ')' + checks + '. A pre-existing failure: no revert is started.');
-      } catch (error) {
-        this.logger.error('could not comment on #' + number + ':', error.message);
-      }
-      return { status: 'pre_existing' };
-    }
-    if (cause.verdict === 'unknown') {
-      // Without the commit before the merge a revert could undo a change that was not at fault: the human decides.
-      this.tell('failed', told, { why: 'unknown_cause' });
-      try {
-        await this.forge.addComment(repository, number, mentionOf(this.config) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + '), and the commit before it'
-          + ' could not be read, so it is not known whether this merge caused it. No revert is started. A human has to look at it.');
-      } catch (error) {
-        this.logger.error('could not comment on #' + number + ':', error.message);
-      }
-      await this.markNeededHuman(repository, number);
-      return { status: 'unknown_cause' };
-    }
-    // RERUN_TIMEOUT_MINUTES: the failed run is rerun once before a revert (a failure that was green before the merge may be flaky).
-    let rerunNote = '';
-    if (cause.verdict === 'regression' && this.config.rerunTimeoutMinutes) {
-      const rerun = await this.rerunBeforeRevert(event, repository, sha, number);
-      if ('status' in rerun) return { status: 'rerun_started' };
-      if (rerun.state === 'green') return { status: 'ci_not_red' };
-      rerunNote = ' ' + RERUN_NOTE[rerun.state];
-    }
-    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'main_red')?.[0];
-    this.tell('failed', told, { why: 'main_red' });
-    try {
-      await this.forge.addComment(repository, number, (route ? '' : mentionOf(this.config)) + 'ForgeHands: CI failed on ' + branch + ' after this merge (commit ' + short + ').'
-        + (route ? ' A revert is started.' : ' A human has to look at it.') + rerunNote);
-    } catch (error) {
-      this.logger.error('could not comment on #' + number + ':', error.message);
-    }
-    if (!route) {
-      await this.markNeededHuman(repository, number);
-      return { status: 'handed_to_human' };
-    }
-    // REVERT_RETRIES: the revert of an agent's merge is recorded, so that its merged revert can reopen and restart the ticket (see revertMerged).
-    const ticket = /^ai\/issue-(\d+)$/.exec(head);
-    const record = this.config.revertRetries && ticket ? { repository: repository.toLowerCase(), number, issue: Number(ticket[1]), sha, state: 'started' as const, at: this.now() } : null;
-    if (record) this.jobs.reverts.push(record);
-    const job = this.jobs.add({ key: repository.toLowerCase() + '!pr' + number + ':' + route + ':' + short, label: route, status: 'queued', created: this.now(),
-      event: { type: 'ci.main_failure', source: this.forge.kind, action: 'main_red', label: route, repository: event.repository,
-        issue: { number, title: title.slice(0, 1000), body: '', html_url: null, comments: 0, labels: [] }, ci: event.ci, sender: event.sender } });
-    try {
-      await this.jobs.persist(this.now());
-    } catch (error) {
-      this.jobs.remove(job.id); // not durable: the retried delivery must be able to start it again
-      this.jobs.dedupe.delete(key);
-      if (record) this.jobs.reverts.splice(this.jobs.reverts.indexOf(record), 1);
-      throw error;
-    }
-    this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
-    return { status: 'queued' };
-  }
-
-  // RERUN_TIMEOUT_MINUTES: a red default branch that was green before the merge gets one rerun of its failed run, once per commit (the ledger's
-  // reruns). The run is rerun and the event waits (checkReruns resumes it when the run has finished or the time is up). When no rerun can be
-  // started, the caller reverts as it did before reruns existed, and says so in its comment.
-  async rerunBeforeRevert(event: ForgeEvent, repository: string, sha: string, number: number): Promise<{ status: 'started' } | { state: 'red' | 'timeout' | 'unavailable' | 'green' }> {
-    const name = repository.toLowerCase();
-    const known = this.jobs.reruns.find((entry) => entry.repository === name && entry.sha === sha);
-    if (known) return known.state === 'running' ? { status: 'started' } : { state: known.state as 'red' | 'timeout' | 'unavailable' | 'green' };
-    const runId = event.ci?.run_id ?? null;
-    const record: RerunRecord = { repository: name, number, sha, run_id: runId, at: this.now(), state: 'running', event };
-    if (runId === null || !this.forge.rerunRun) record.state = 'unavailable';
-    else {
-      try { await this.forge.rerunRun(repository, runId); } catch (error) {
-        this.logger.error('could not rerun run ' + runId + ' of ' + repository + ':', error.message);
-        record.state = 'unavailable';
-      }
-    }
-    this.jobs.reruns.push(record);
-    try { await this.jobs.persist(this.now()); } catch (error) { this.logger.error('persist failed:', error.message); }
-    if (record.state === 'running') return { status: 'started' };
-    return { state: record.state as 'unavailable' };
-  }
-
-  // The reruns that run (RERUN_TIMEOUT_MINUTES): a finished run resumes its red default branch event. Green ends it with no revert; red or
-  // timeout reverts, once. The commit's key is dropped first, so the event is judged again. A run the forge cannot read is looked at again.
-  async checkReruns(now: number): Promise<boolean> {
-    const limit = this.config.rerunTimeoutMinutes * 60000;
-    let changed = false;
-    for (const record of this.jobs.reruns.filter((entry) => entry.state === 'running')) {
-      const repository = record.event.repository.full_name;
-      let state: RerunRecord['state'] | null = null;
-      if (now - record.at > limit) state = 'timeout';
-      else {
-        try {
-          const status = await this.forge.runStatus?.(repository, record.run_id as number | string);
-          if (status && !RUN_UNFINISHED.has(status)) state = status === 'success' ? 'green' : 'red';
-        } catch (error) {
-          this.logger.error('could not read run ' + record.run_id + ' of ' + repository + ':', error.message);
-        }
-      }
-      if (!state) continue;
-      record.state = state;
-      changed = true;
-      this.jobs.dedupe.delete('main_red:' + record.repository + '@' + record.sha);
-      try { await this.onMainFailure(record.event); } catch (error) { this.logger.error('rerun outcome failed:', error.message); }
-    }
-    return changed;
-  }
-
-  // REVERT_ON_RED, the first-parent check: a red default branch is this merge's doing only when a check that is red on the merge commit was green
-  // on the commit before it (its first parent). A check that was red there too, or is not reported there, is pre-existing. The commit is read
-  // once more first: green then (a re-run that passed) is recovered. A parent that cannot be read gives unknown, and nothing is reverted.
-  async preExistingFailure(event: ForgeEvent, repository: string, sha: string): Promise<PreExisting> {
-    const unknown: PreExisting = { verdict: 'unknown', checks: [] };
-    let current: CommitStatus;
-    try {
-      current = await this.forge.commitStatus(repository, sha);
-    } catch (error) {
-      this.logger.error('commit status failed:', error.message);
-      return unknown;
-    }
-    if (current?.state === 'pending' || current?.state === 'success') return { verdict: 'recovered', checks: [] };
-    if (!this.forge.commitParents) return unknown;
-    let before: CommitStatus;
-    let parent: string;
-    try {
-      [parent] = await this.forge.commitParents(repository, sha);
-      if (!parent) return unknown;
-      before = await this.forge.commitStatus(repository, parent);
-    } catch (error) {
-      this.logger.error('could not read the commit before ' + sha.slice(0, 8) + ':', error.message);
-      return unknown;
-    }
-    // The state of one check on a commit; without the per-check list the combined state stands for every check.
-    const stateOf = (status: CommitStatus, context: string | undefined): string | undefined => status.statuses?.length
-      ? status.statuses.find((check) => check.context === context)?.status ?? status.statuses.find((check) => check.context === context)?.state
-      : status.state;
-    const reds = (current?.statuses ?? []).filter((check) => (check.status ?? check.state) === 'failure' || (check.status ?? check.state) === 'error');
-    if (!reds.length) return { verdict: before.state === 'success' ? 'regression' : 'pre_existing', parent, checks: [] };
-    const checks = reds.map((check) => String(check.context || 'check'));
-    const regressed = reds.some((check) => stateOf(before, check.context) === 'success');
-    return { verdict: regressed ? 'regression' : 'pre_existing', parent, checks };
-  }
-
-  // A CI outcome kept while an agent worked on the issue. Once no run of the issue is active any more it is judged as if it had just
-  // arrived: gone when its commit is no longer the head or the status is not green (a later event can come again), otherwise started.
-  async releaseDeferred(job: Job, now: number): Promise<boolean> {
-    const base = job.key.split(':')[0] + ':';
-    if (this.jobs.list(true).some((other) => other.id !== job.id && !other.waiting_for_run && other.key.startsWith(base) && !this.parallelReview(other, job.event))) {
-      if (job.created + this.config.maxRunMs < now) { this.jobs.remove(job.id); return true; }
-      return false;
-    }
-    const event = job.event;
-    const kind = this.config.routes.get(job.label)?.kind;
-    let start = !(await this.isStale(event));
-    if (start && (kind === 'ci_success' || kind === 'sensitive_review')) start = await this.commitGreen(event);
-    if (start && kind === 'ci_failure') start = !(await this.commitRecovered(event));
-    if (start && ROUND_KINDS.has(kind) && this.rounds(event) >= this.roundLimit(event)) {
-      await this.roundsUsedUp(event);
-      start = false;
-    }
-    if (!start) { this.jobs.remove(job.id); return true; }
-    delete job.waiting_for_run;
-    job.status = 'queued';
-    await this.merger.clearApproval(event);
-    if (kind === 'ci_success') await this.startSecurityReview(event);
     return true;
   }
 
@@ -1424,62 +868,6 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
       return false;
-    }
-  }
-
-  // A green commit of a pull request that changes a protected path (the deny list of the merge policy of its repository) also gets a
-  // security review, once per commit, when a route of kind sensitive_review exists. It is advisory: no label, no round, no merge.
-  async startSecurityReview(event: ForgeEvent): Promise<void> {
-    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'sensitive_review')?.[0];
-    if (!route || !event.pull_request || !event.ci || !this.config.forgejo) return;
-    const key = this.issueKey(event) + ':' + route + ':' + event.ci.commit_sha.slice(0, 8);
-    if (this.jobs.list().some((job) => job.key === key)) return;
-    const policy = this.config.mergePolicy.get(event.repository.full_name.toLowerCase());
-    if (!policy) return;
-    try {
-      const files = await this.merger.changedFiles(event.repository.full_name, event.pull_request.number);
-      const hit = [...new Set(files.filter((name) => policy.deny.some((pattern) => pattern.test(name))))];
-      if (!hit.length) return;
-      this.jobs.add({ key, label: route, event: { ...event, type: 'ci.sensitive', label: route, protected_files: hit.slice(0, 20) }, status: 'queued', created: this.now() });
-      await this.jobs.persist(this.now());
-    } catch (error) {
-      this.logger.error('could not start the security review of ' + this.issueKey(event) + ':', error.message);
-    }
-  }
-
-  // The security review is advisory: when its run ends without the comment, run it once more; after that it is only logged.
-  async checkSecurityReview(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
-      if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) { await this.handOverAfterSecurity(job); return; }
-      if (!job.verdict_retry) {
-        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error('security review ' + job.key + ' ended without a comment, running it once more');
-        return;
-      }
-      this.logger.error('security review ' + job.key + ' ended twice without a comment');
-      await this.handOverAfterSecurity(job);
-    } catch (error) {
-      this.logger.error('could not check the security review of #' + event.pull_request.number + ':', error.message);
-    }
-  }
-
-  // The hand-over of an approved protected-path pull request waits for its security review (see Merger.handle); when that run has ended
-  // (with its comment, without one, or failed) the approval is looked at again, which hands the pull request over with what was found.
-  async handOverAfterSecurity(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== event.ci.commit_sha) return;
-      const labelled = (pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel);
-      if (!labelled && !(this.config.verdictSource !== 'comment' && (await this.merger.reviewOf(event.repository.full_name, event.pull_request.number, pr.head.sha)).ok)) return;
-      await this.merger.handle(event);
-    } catch (error) {
-      this.logger.error('could not hand #' + event.pull_request.number + ' over after its security review:', error.message);
     }
   }
 
@@ -1547,7 +935,7 @@ export class Dispatcher {
     const { due, date } = digestDue(digest, timezone, now, dry ? this.digestDone : this.jobs.meta.digest_sent);
     if (!due) return false;
     try {
-      const data = collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.cooldowns, now);
+      const data = collectDigest(this.config, this.jobs, [...this.reminder.waiting.values()], this.scheduler.cooldowns, now);
       // The follow-up figure is read from the forge only when a digest goes out: it is shown in a digest and never sends one by itself.
       if (!digestIsEmpty(data)) data.fixes = await collectFixes(this.config, this.jobs, this.forge, now, this.logger);
       const message = digestMessage(language, data, this.config.allowedRepos.size > 1);
@@ -1561,184 +949,8 @@ export class Dispatcher {
     return true;
   }
 
-  // How long (ms) until the quota is back, when the run ended with a rate limit error; null for any other failure.
-  // The error a run ended with, from its last events: whether the model was out of quota (and, when the gateway says, for how long), or
-  // whether the agent reached its iteration limit. Null when there is no error event or it cannot be read.
-  async lastError(job: Job): Promise<{ code: string; rateLimited: boolean; unavailable?: boolean; waitMs: number | null } | null> {
-    try {
-      const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/search?limit=10&sort_order=TIMESTAMP_DESC');
-      if (!response.ok) return null;
-      const items = ((await response.json()) as Json)?.items || [];
-      const errors = items.filter((item: Json) => item?.kind === 'ConversationErrorEvent');
-      const limit = errors.find((item: Json) => item.code === 'LLMRateLimitError' || item.classification?.kind === 'rate_limit');
-      if (limit) {
-        const detail = String(limit.detail || '');
-        let seconds = Number(/"retry_after"\s*:\s*(\d+)/.exec(detail)?.[1]);
-        // Some gateways (OmniRoute for opencode, combo errors) say it only in words: "reset after 2h 58m 45s", "Resets in 13 days". A text
-        // under a minute ("reset after 3s" next to "no credits remaining") is not a reset time; the default wait applies then.
-        if (!(seconds > 0)) {
-          const after = /reset(?:s)? after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i.exec(detail);
-          const days = /resets? in\s+(\d+)\s*days?/i.exec(detail);
-          const words = after ? (Number(after[1] || 0) * 3600 + Number(after[2] || 0) * 60 + Number(after[3] || 0)) : days ? Number(days[1]) * 86400 : 0;
-          seconds = words >= 60 ? words : 0;
-        }
-        return { code: String(limit.code || 'LLMRateLimitError'), rateLimited: true, waitMs: seconds > 0 ? seconds * 1000 : null };
-      }
-      if (!errors.length) return null;
-      // No model could answer (OmniRoute tried every model of the combination and reports the last failure: 503, bad gateway, timeout): the
-      // same as an exhausted quota for the tier. Wait and try again, and give up only when it has gone on for QUOTA_GIVE_UP_HOURS.
-      const unavailable = errors.find((item: Json) => UNAVAILABLE_CODES.has(String(item.code || '')));
-      if (unavailable) return { code: String(unavailable.code), rateLimited: true, unavailable: true, waitMs: null };
-      return { code: String(errors[0].code || ''), rateLimited: false, waitMs: null };
-    } catch (error) {
-      this.logger.error('could not read the error of ' + job.key + ':', error.message);
-      return null;
-    }
-  }
-
-  // A worker run on a ticket that ends as `finished` is not a delivery. A model that answers in words without a tool call can "finish" in a minute
-  // with nothing done, and the ticket then waits for ever (several tickets did). A run on an issue (not a plan or an epic) must leave a pull request
-  // from the branch ai/issue-<n> that was created or changed since the run started, or a comment on the issue written since then, or close the issue.
-  // Otherwise the run is made once more; after the second empty run a human is called. Best effort: when the forge cannot be read nothing happens.
-  async checkDelivery(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event || event.pull_request || event.type === 'epic.done' || !job.started) return;
-    if (this.config.epicLabels.has(job.label) || (event.issue.labels || []).some((name) => this.config.epicLabels.has(name))) return;
-    try {
-      const since = job.started - 60000;
-      const repository = event.repository.full_name;
-      const issue = await this.forge.getIssue(repository, event.issue.number);
-      // A ticket that is closed (by the run, or by a person) is delivered: a comment on its parent is then the report, see parentComment below.
-      if (!issue || issue.state !== 'open') return;
-      const branch = 'ai/issue-' + event.issue.number;
-      const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
-      if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
-      // A need only the operator can meet, with an operator ticket this ticket depends on: the ticket waits, and that is no failed delivery.
-      const prerequisites = await this.operatorDependencies(repository, event.issue.number);
-      if (prerequisites.length) { await this.waitForOperator(job, prerequisites); return; }
-      const comments = await this.forge.listComments(repository, event.issue.number, 50);
-      // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
-      const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
-      const handback = this.config.handbackHandling && written.length ? handbackOf(written) : null;
-      if (written.length && !handback) return;
-      if (this.superseded(job)) return;
-      if (handback) {
-        await this.handback.handle(job, handback.kind, handback.text);
-        return;
-      }
-      // A comment on the parent (the issue this one blocks) is no delivery while this ticket is open: the ticket has no pull request and is not
-      // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
-      const parent = await this.parentComment(event, since);
-      if (this.superseded(job)) return;
-      if (parent && this.config.handbackHandling) {
-        this.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
-        await this.handback.handle(job, classifyHandback(parent.text) === 'blocker' ? 'blocker' : 'pushed_nothing', parent.text);
-        return;
-      }
-      if (!job.delivery_retry) {
-        Object.assign(job, { status: 'queued', delivery_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
-        return;
-      }
-      if (this.escalateDelivery(job)) return;
-      Object.assign(job, { status: 'failed', result: 'no_delivery' });
-      this.tierRunEnded(job, 'no_delivery');
-      await this.reportFailure(job, 'no_delivery');
-    } catch (error) {
-      this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
-    }
-  }
-
-  // A label set while the ended run was being looked at (the forge reads above take a while) has queued a fresh run of the same ticket. That run
-  // takes over: running the old one once more, escalating it or calling a human would put two agents on one branch.
-  superseded(job: Job): boolean {
-    const other = this.jobs.activeByKey(job.key);
-    if (!other || other === job) return false;
-    this.logger.error(job.key + ': a fresh run was queued while the last one was looked at, it takes over');
-    return true;
-  }
-
-  // The second empty run of an issue whose route has escalate_to starts once more on the profile of that route (FAILURE_ESCALATE), on the same
-  // ticket: a fresh run, `escalated` and `escalated_after` no_delivery. It is counted as the escalation and the target's tier like any escalated
-  // run. The escalated run keeps delivery_retry, so when it also ends empty the human is called at once (no third run). Returns true when queued.
-  escalateDelivery(job: Job): boolean {
-    // The route the ticket was started with (job.label): a run on the fallback route (job.fell_back) escalates like any other.
-    const route = this.config.routes.get(job.label);
-    if (!this.config.failureEscalate || !route?.escalateTo || job.escalated) return false;
-    Object.assign(job, { status: 'queued', escalated: true, failure_escalation: true, escalated_after: 'no_delivery', started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-    metrics.inc('forgehands_failure_escalations_total');
-    this.logger.error(job.key + ': no delivery twice, starting once more on ' + route.escalateTo);
-    return true;
-  }
-
-  // The newest comment of the agent since the run began on a parent (an issue this one blocks), with the parent's number, or null. A read that fails
-  // counts as no comment: an unknown answer never reads as delivered.
-  async parentComment(event: ForgeEvent, since: number): Promise<{ number: number; text: string } | null> {
-    let login: string | null;
-    let parents: Json;
-    try {
-      login = (await this.forge.agentLogin?.()) ?? null;
-      if (!login) return null;
-      parents = await this.forge.blocks(event.repository.full_name, event.issue.number);
-    } catch (error) {
-      this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message);
-      return null;
-    }
-    for (const parent of Array.isArray(parents) ? parents : []) {
-      try {
-        const comments = await this.forge.listComments(event.repository.full_name, parent.number, 50);
-        const own = comments.filter((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since);
-        if (own.length) return { number: parent.number, text: String(own.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0].body ?? '') };
-      } catch (error) {
-        this.logger.error('could not read the comments of #' + parent.number + ':', error.message);
-      }
-    }
-    return null;
-  }
-
-  // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
-  // for ever, green and unseen. Unless it moved on meanwhile, run it once more; after the second miss hand it to a human.
-  async checkVerdict(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
-      const names = (pr.labels || []).map((label: Json) => label.name);
-      // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a review that asks for changes hands it to a human, as the reviewer should have.
-      if (event.bot && !this.config.botFixRounds && names.includes(this.config.changesLabel) && ![this.config.approvedLabel, this.config.blockedLabel].some((name) => names.includes(name))) {
-        await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
-        return;
-      }
-      if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name)) && this.config.verdictSource !== 'review') return;
-      // Native reviews: any approval or request for changes on the head commit is a verdict (the webhook of the review does the rest).
-      if (this.config.verdictSource !== 'comment' && (await this.merger.nativeReviews(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)).any) return;
-      if (this.config.verdictSource === 'review' && names.includes(this.config.blockedLabel)) return;
-      // The first time, review once more: such a run mostly ends early (a blind command, a spent iteration budget), not for good.
-      if (!job.verdict_retry) {
-        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error('review ' + job.key + ' ended without a verdict, running it once more');
-        return;
-      }
-      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (' + (this.config.verdictSource === 'review' ? 'no approving or rejecting review' : 'no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel) + '). A human has to look at this pull request, or push a commit to start the review again.', 'no_verdict');
-    } catch (error) {
-      this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
-    }
-  }
-
-  // The hold on a tier lives in memory and is gone after a restart; the wait of a job that was queued again for a rate limit lives in the
-  // ledger. A restart clears both, so that it means "try again now" (the quota may be back, or the model was changed). If the model is still
-  // out of quota the first attempt fails again and sets the hold anew (a counter keeps that from going on for ever).
-  clearQuotaHolds(): number {
-    let cleared = 0;
-    for (const job of this.jobs.list('queued')) {
-      if (job.retry_at) { delete job.next_try; delete job.retry_at; cleared += 1; }
-    }
-    return cleared;
-  }
-
   async start(intervalMs = this.config.pollMs): Promise<void> {
-    if (this.clearQuotaHolds()) await this.jobs.persist(this.now());
+    if (this.scheduler.clearQuotaHolds()) await this.jobs.persist(this.now());
     this.timer = setInterval(() => this.tick().catch((error) => this.logger.error('dispatch failed:', error.message)), intervalMs);
     this.timer.unref?.();
     this.workspace.start();
@@ -1766,23 +978,6 @@ export class Dispatcher {
     return response;
   }
 
-  // A run ended for good (not queued again): count it by kind and end state and time it.
-  runEnded(job: Job, state: string, now: number): void {
-    const kind = this.config.routes.get(job.label)?.kind || 'issue';
-    metrics.inc('forgehands_runs_finished_total', { kind, state: known(state, ['finished', 'error', 'stuck', 'deleted', 'paused', 'timeout']) });
-    if (job.started) metrics.observe({ kind }, Math.max(0, now - job.started) / 1000);
-    this.tierRunEnded(job, state);
-  }
-
-  // The same end, counted per repository and the tier the run really ran on (fallback and escalation included).
-  tierRunEnded(job: Job, state: string): void {
-    const tiers = new Set([...this.config.routes.values()].map((route) => route.tier));
-    metrics.inc('forgehands_tier_runs_total', {
-      repository: known(String(job.event?.repository?.full_name).toLowerCase(), this.config.allowedRepos), tier: known(this.tierOf(job), tiers),
-      result: known(state, ['finished', 'max_iterations', 'error', 'stuck', 'timeout', 'no_delivery'])
-    });
-  }
-
   // Ticks never overlap: a caller waits for the running one and then runs a fresh pass.
   async tick(): Promise<void> {
     while (this.current) await this.current.catch(() => {});
@@ -1796,337 +991,38 @@ export class Dispatcher {
     // The disk guard is read first: a hold set here keeps the queued jobs waiting in the loop below.
     await this.workspace.poll();
     for (const job of this.jobs.list('running')) {
-      if (await this.poll(job, now)) changed = true;
+      if (await this.runWatcher.poll(job, now)) changed = true;
     }
     for (const job of this.jobs.list(true).filter((entry) => entry.status === 'waiting' && entry.waiting_for_run)) {
-      if (await this.releaseDeferred(job, now)) changed = true;
+      if (await this.scheduler.releaseDeferred(job, now)) changed = true;
     }
-    this.depReads = 0;
-    if (await this.breakWaitCycles()) changed = true;
+    this.waitKeeper.depReads = 0;
+    if (await this.waitKeeper.breakWaitCycles()) changed = true;
     // Each queued job is tried at most once per pass; what to try next is decided by pickNext.
     const tried = new Set<string>();
     let started = 0;
     for (;;) {
-      const job = this.pickNext(now, tried);
+      const job = this.scheduler.pickNext(now, tried);
       if (!job) break;
       tried.add(job.id);
-      if (await this.startJob(job, now)) changed = true;
+      if (await this.scheduler.startJob(job, now)) changed = true;
       if (job.started === now) started += 1;
     }
     if (started) this.lastStart = now;
-    this.reportIdle(now, started);
-    this.checkStall(now);
-    if (await this.refreshMoved(now)) changed = true;
+    this.idleReporter.reportIdle(now, started);
+    this.idleReporter.checkStall(now);
+    if (await this.branchRefresher.refreshMoved(now)) changed = true;
     // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
     if (await this.merger.recheckHolds()) changed = true;
-    if (await this.archiveOld(now)) changed = true;
-    if (await this.deleteOld(now)) changed = true;
-    if (await this.sweepClosed(now)) changed = true;
+    if (await this.ticketCleanup.archiveOld(now)) changed = true;
+    if (await this.ticketCleanup.deleteOld(now)) changed = true;
+    if (await this.ticketCleanup.sweepClosed(now)) changed = true;
     if (await this.epicGaps.sweep(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
-    if (await this.checkRevertRate(now)) changed = true;
-    if (await this.checkReruns(now)) changed = true;
+    if (await this.revertKeeper.checkRevertRate(now)) changed = true;
+    if (await this.revertKeeper.checkReruns(now)) changed = true;
     if (changed) await this.jobs.persist(this.now());
-  }
-
-  // The default branch of a repository moved. Remember the newest push and look at the pull requests once it has been quiet for a while.
-  onMainMoved(event: PushEvent): string {
-    if (!this.config.updateBranches || !this.config.forgejo) return 'branch_updates_off';
-    this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
-    return 'scheduled';
-  }
-
-  async refreshMoved(now: number): Promise<boolean> {
-    let changed = false;
-    for (const [repository, moved] of [...this.mainMoved]) {
-      if (now - moved.at < this.config.branchUpdateDelayMs) continue;
-      this.mainMoved.delete(repository);
-      try { if (await this.refreshBranches(moved.event)) changed = true; }
-      catch (error) { this.logger.error('could not look at the pull requests of ' + repository + ':', error.message); }
-    }
-    return changed;
-  }
-
-  // Open agent pull requests (branch ai/issue-<n>) that fell behind the default branch. What a rebase throws away is a review, so only a
-  // pull request with neither an approval nor an OK review for its current commit is brought up to date, and only when no agent works on
-  // its issue. A rebase that conflicts becomes a conflict round of the worker. Approved and reviewed pull requests are left alone: they
-  // merge as they are, and a conflict shows when the merge is tried.
-  async refreshBranches(event: PushEvent): Promise<boolean> {
-    const tip = event.after;
-    const pulls = await this.forge.listPulls(event.repository.full_name, { state: 'open', limit: 50 });
-    let changed = false;
-    let deferred = false;
-    for (const pr of Array.isArray(pulls) ? pulls : []) {
-      const outcome = await this.refreshPull(event, pr, tip);
-      if (outcome.changed) changed = true;
-      if (outcome.deferred) deferred = true;
-    }
-    // Look again later at what was postponed (the CI run ended, the cooldown passed).
-    if (deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event });
-    return changed;
-  }
-
-  // One open pull request against the default branch at `tip`: bring it up to date, or start a conflict round when the rebase conflicts.
-  async refreshPull(event: PushEvent, pr: Json, tip: string): Promise<{ changed: boolean; deferred: boolean }> {
-    const none = { changed: false, deferred: false };
-    const base = event.repository.full_name.toLowerCase() + '#';
-    const match = /^ai\/issue-(\d+)$/.exec(pullBranch(pr));
-    if (!match || pr.state !== 'open' || pr.merged || !pr.merge_base || pr.merge_base === tip) return none;
-    if (pr.head?.repo?.full_name && pr.head.repo.full_name.toLowerCase() !== event.repository.full_name.toLowerCase()) return none;
-    const issue = Number(match[1]);
-    if (this.jobs.list(true).some((job) => job.key.startsWith(base + issue + ':'))) return none;
-    const labels = (pr.labels || []).map((label: Json) => label.name);
-    if (labels.includes(this.config.blockedLabel)) return none;
-    const approved = labels.includes(this.config.approvedLabel);
-    const prEvent = { ...event, pull_request: { number: pr.number, head_ref: pullBranch(pr), html_url: pr.html_url || null },
-      issue: { number: issue, title: String(pr.title || '').slice(0, 1000), body: String(pr.body || '').slice(0, 50000), html_url: pr.html_url || null, comments: 0, labels } };
-    let reviewed = approved;
-    if (!reviewed) { try { reviewed = (await this.merger.reviewOf(event.repository.full_name, pr.number, pr.head.sha)).ok; } catch { reviewed = false; } }
-    // An approved or reviewed pull request is not brought up to date: that would throw the review away, and it merges as it is. But one
-    // that conflicts can be merged by nobody (a human waiting to merge a protected path would find it so). Once the WIP marker is gone,
-    // which approval removes, Forgejo's mergeable is reliable: a conflict starts a conflict round, after which CI and review run again.
-    if (reviewed) {
-      if (pr.mergeable === false && !this.forge.isWip(String(pr.title || '')) && (await this.startConflictRound(prEvent, tip))) return { changed: true, deferred: false };
-      return none;
-    }
-    // An update changes the head commit: it cancels the CI run in progress and throws away a review. So it only happens where it
-    // is needed (the branch and the default branch touch the same files) and not while CI runs or just after the last update.
-    if (!(await this.touchesSameFiles(event, pr, tip))) return none;
-    const hold = await this.updateHold(event, pr);
-    if (hold) { this.logger.error(event.repository.full_name + '#' + pr.number + ': update postponed (' + hold + ')'); return { changed: false, deferred: true }; }
-    this.lastUpdate.set(base + pr.number, this.now());
-    try {
-      if (await this.forge.updateBranch(event.repository.full_name, pr.number) === 'conflict') {
-        metrics.inc('forgehands_branch_conflicts_total');
-        if (await this.startConflictRound(prEvent, tip)) return { changed: true, deferred: false };
-        return none;
-      }
-      this.logger.error(event.repository.full_name + '#' + pr.number + ' brought up to date with the default branch');
-      metrics.inc('forgehands_branch_updates_total');
-    } catch (error) {
-      this.logger.error('could not update #' + pr.number + ':', error.message);
-    }
-    return none;
-  }
-
-  // The default branch may have moved while a run on this pull request was active (such a pull request is left alone, see refreshPull), and
-  // no later push brings it back into view. When the run ends, look at the pull request once: the same update, the same conflict round.
-  async checkBranchAfterRun(job: Job): Promise<void> {
-    const event = job.event;
-    // A dependency bot keeps its own branch current (Renovate rebases itself).
-    if (!this.config.updateBranches || !this.config.forgejo || !event?.pull_request || event.bot) return;
-    const kind = this.config.routes.get(job.label)?.kind;
-    if (kind === 'conflict' || kind === 'sensitive_review') return;
-    try {
-      const branch = event.repository.default_branch;
-      if (!branch) return;
-      const tip = await this.forge.branchTip(event.repository.full_name, branch);
-      if (typeof tip !== 'string' || !tip) return;
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      const push = { type: 'push.default', source: this.forge.kind, repository: event.repository, sender: event.sender, after: tip } as unknown as PushEvent;
-      const outcome = await this.refreshPull(push, pr, tip);
-      if (outcome.deferred) this.mainMoved.set(event.repository.full_name.toLowerCase(), { at: this.now(), event: push });
-      if (outcome.changed) this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
-    } catch (error) {
-      this.logger.error('could not look at the branch of #' + event.pull_request.number + ' after its run:', error.message);
-    }
-  }
-
-  // Can the rebase of this pull request conflict? Only if the default branch changed a file since the merge base that the pull request
-  // changes too. Anything unclear (a failing call, a list that may be cut off) counts as yes.
-  async touchesSameFiles(event: PushEvent, pr: Json, tip: string): Promise<boolean> {
-    try {
-      const compare = await this.forge.compare(event.repository.full_name, pr.merge_base, tip);
-      const ours = await this.forge.pullFiles(event.repository.full_name, pr.number, 100);
-      if (!Array.isArray(compare?.files) || !Array.isArray(ours) || ours.length >= 100 || ((compare.total_commits ?? 0) > 0 && compare.files.length === 0)) return true;
-      const names = (list: Json[]) => list.flatMap((file) => [file.filename, file.previous_filename]).filter(Boolean);
-      const theirs = new Set(names(compare.files));
-      return names(ours).some((name) => theirs.has(name));
-    } catch (error) {
-      this.logger.error('could not compare #' + pr.number + ' with the default branch:', error.message);
-      return true;
-    }
-  }
-
-  // Why the update of this pull request has to wait, or null: CI still runs on its head commit, or its branch was updated recently.
-  async updateHold(event: PushEvent, pr: Json): Promise<string | null> {
-    const last = this.lastUpdate.get(event.repository.full_name.toLowerCase() + '#' + pr.number);
-    if (last && this.now() - last < this.config.branchUpdateMinIntervalMs) return 'cooldown';
-    try {
-      const status = await this.forge.commitStatus(event.repository.full_name, pr.head.sha);
-      if (status?.state === 'pending' && status.total_count > 0) return 'CI is still running';
-    } catch (error) {
-      this.logger.error('could not read the status of #' + pr.number + ':', error.message);
-    }
-    return null;
-  }
-
-  // The branch of a pull request conflicts with the default branch: a round of the worker resolves it (rebase and one force push are
-  // allowed in this round and only here). Counts as a round; without a conflict route, or when the rounds are used up, a human is called.
-  async startConflictRound(event: ForgeEvent, tip: string): Promise<boolean> {
-    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'conflict')?.[0];
-    const number = event.pull_request!.number;
-    if (!route) {
-      await this.markForHuman(event, 'ForgeHands: the pull request conflicts with ' + (event.repository.default_branch || 'the default branch') + ' and no conflict round is configured. A human has to resolve it.', 'conflict');
-      return false;
-    }
-    const key = this.issueKey(event) + ':' + route + ':' + tip.slice(0, 8);
-    if (this.jobs.list().some((job) => job.key === key)) return false;
-    if (this.rounds(event) >= this.roundLimit(event)) { await this.roundsUsedUp(event); return false; }
-    this.jobs.add({ key, label: route, status: 'queued', created: this.now(), event: { ...event, type: 'pull_request.conflict', label: route, base_sha: tip } });
-    await this.merger.clearApproval(event);
-    this.logger.error(this.issueKey(event) + ': pull request #' + number + ' conflicts with the default branch, conflict round queued');
-    return true;
-  }
-
-  // WAIT_FOR_SAME_FILES: the older issues (lower numbers) whose files this worker job's issue also declares, because they have an open agent
-  // pull request that changes them, or a job in the ledger and the same declared files. The oldest goes first, so no ticket ever waits
-  // for a newer one and two tickets cannot wait for each other. Any failing read means "not held": a ticket is never stuck on a guess.
-  async filesBlockers(job: Job): Promise<number[]> {
-    const event = job.event;
-    const mine = parseDeclaredFiles(event.issue.body);
-    if (!this.config.waitForSameFiles || !this.config.forgejo || !mine.length) return [];
-    const repository = event.repository.full_name;
-    const number = event.issue.number;
-    const blockers = new Set<number>();
-    try {
-      const pulls = await this.forge.listPulls(repository, { state: 'open', limit: FILE_PULLS_LOOKED_AT });
-      for (const pr of (Array.isArray(pulls) ? pulls : []).slice(0, FILE_PULLS_LOOKED_AT)) {
-        const other = Number(/^ai\/issue-(\d+)$/.exec(pullBranch(pr))?.[1]);
-        if (!other || other >= number || blockers.has(other)) continue;
-        const files = await this.forge.pullFiles(repository, pr.number, 100);
-        const names = (Array.isArray(files) ? files : []).flatMap((file) => [file.filename, file.previous_filename].filter((name): name is string => !!name));
-        if (anyOverlap(mine, names)) blockers.add(other);
-      }
-      for (const other of this.jobs.list(true)) {
-        const issue = other.event?.issue;
-        if (!issue || other.event.bot || other.event.repository.full_name.toLowerCase() !== repository.toLowerCase()) continue;
-        if (issue.number >= number || blockers.has(issue.number) || !ACTIVE_STATUSES.has(other.status)) continue;
-        if (this.config.epicLabels.has(other.label) || !anyOverlap(mine, parseDeclaredFiles(issue.body))) continue;
-        if ((await this.forge.getIssue(repository, issue.number))?.state === 'open') blockers.add(issue.number);
-      }
-    } catch (error) {
-      this.logger.error('could not compare the files of #' + number + ' with the open work, it is not held back:', error.message);
-      return [];
-    }
-    // A blocker that already waits for this ticket (explicit dependencies and the waits in force) would make a cycle: it is not waited for.
-    const me = repository.toLowerCase() + '#' + number;
-    const kept: number[] = [];
-    for (const other of [...blockers].sort((a, b) => a - b)) {
-      const key = repository.toLowerCase() + '#' + other;
-      if (!(await this.waitReaches(key, me, true))) kept.push(other);
-      else this.noteCycle(me, key);
-    }
-    return kept;
-  }
-
-  // Whether `to` is waited for, directly or through other waits, starting from `from`: the waits in force (the ledger's waiting jobs, explicit and, with
-  // `files`, same-files) and, for a ticket that has no waiting job with explicit dependencies, its open dependencies in the forge (forgeEdges).
-  async waitReaches(from: string, to: string, files: boolean): Promise<boolean> {
-    const ledger = waitGraph(this.jobs.list(), files);
-    const explicit = waitGraph(this.jobs.list(), false);
-    const seen = new Set([from]);
-    const queue = [from];
-    for (let i = 0; i < queue.length; i += 1) {
-      const node = queue[i];
-      if (node === to) return true;
-      const edges = new Set(ledger.get(node) ?? []);
-      if (!explicit.has(node)) for (const next of await this.forgeEdges(node)) edges.add(next);
-      for (const next of edges) {
-        if (!seen.has(next)) { seen.add(next); queue.push(next); }
-      }
-    }
-    return false;
-  }
-
-  // The open dependencies of a ticket, read from the forge. Cached per ticket for DEP_CACHE_MS; a failed read counts as none (cached too, so the
-  // ticket is not read again in that time); past DEP_READS_PER_PASS reads in a pass the answer is none for now (not cached). A ticket whose jobs are
-  // all archived (closed on the status page) is not read: its open dependencies do not hold anything back.
-  async forgeEdges(node: string): Promise<string[]> {
-    const cached = this.depCache.get(node);
-    if (cached && this.now() - cached.at < DEP_CACHE_MS) return cached.open;
-    const own = this.jobs.list().filter((job) => ticketKey(job) === node);
-    if (!this.config.forgejo || (own.length && own.every((job) => job.archived_view))) return [];
-    if (this.depReads >= DEP_READS_PER_PASS) return [];
-    this.depReads += 1;
-    const at = own[0]?.event.repository.full_name ?? node.split('#')[0];
-    const number = Number(node.split('#')[1]);
-    let open: string[] = [];
-    try {
-      const dependencies = await this.forge.dependencies(at, number);
-      open = (Array.isArray(dependencies) ? dependencies : []).filter((issue) => issue.state === 'open').map((issue) => node.split('#')[0] + '#' + issue.number);
-    } catch (error) {
-      this.logger.error('could not read the dependencies of #' + number + ', its waits are not known for now:', error.message);
-    }
-    this.depCache.set(node, { at: this.now(), open });
-    return open;
-  }
-
-  // A same-files wait that closes a cycle is not taken: the older ticket already waits for this one, through explicit dependencies or other waits in
-  // force. Logged and counted once per pair (`waiting` is a ticket key, `other` the older one).
-  noteCycle(waiting: string, other: string): void {
-    const pair = waiting + '>' + other;
-    if (this.cyclePairs.has(pair)) return;
-    this.cyclePairs.add(pair);
-    metrics.inc('forgehands_wait_cycles_broken_total');
-    const number = other.split('#')[1];
-    this.logger.error(waiting + ': not waiting for #' + number + ' (same files): #' + number + ' is blocked by this ticket (cycle)');
-  }
-
-  // The waits in force are read from the ledger (no forge read): a same-files wait that closes a cycle is dropped, the explicit dependencies never. A job
-  // left with no wait is queued again. True when something changed.
-  async breakWaitCycles(): Promise<boolean> {
-    if (!this.config.waitForSameFiles) return false;
-    let changed = false;
-    for (const job of this.jobs.list('waiting')) {
-      if (!job.waiting_for_files?.length || job.waiting_for?.length || job.waiting_for_run || job.event.bot || job.event.pull_request) continue;
-      const me = ticketKey(job);
-      const repository = job.event.repository.full_name.toLowerCase();
-      const kept: number[] = [];
-      for (const number of job.waiting_for_files) {
-        const other = repository + '#' + number;
-        if (await this.waitReaches(other, me, true)) this.noteCycle(me, other);
-        else kept.push(number);
-      }
-      if (kept.length === job.waiting_for_files.length) continue;
-      changed = true;
-      if (kept.length) job.waiting_for_files = kept;
-      else {
-        job.status = 'queued';
-        delete job.waiting_for_files;
-        this.logger.error(job.key + ' no longer waits for the files of older tickets (cycle)');
-      }
-    }
-    return changed;
-  }
-
-  // Look again at the jobs that wait for the same files and queue those whose older tickets are gone. Called when something may have
-  // been freed (a push to the default branch, a closed issue, a run that ended); startJob checks once more before a worker starts.
-  async releaseFileWaits(): Promise<boolean> {
-    if (!this.config.waitForSameFiles) return false;
-    let changed = false;
-    for (const job of this.jobs.list('waiting')) {
-      if (!job.waiting_for_files?.length || job.waiting_for?.length) continue;
-      const blockers = await this.filesBlockers(job);
-      if (blockers.length) { job.waiting_for_files = blockers; continue; }
-      job.status = 'queued';
-      delete job.waiting_for_files;
-      this.logger.error(job.key + ' no longer waits for the files of older tickets');
-      changed = true;
-    }
-    return changed;
-  }
-
-  // The same, from outside a pass (a webhook): save and start what was released.
-  async releaseFileWaitsNow(): Promise<void> {
-    try {
-      if (!(await this.releaseFileWaits())) return;
-      await this.jobs.persist(this.now());
-      this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
-    } catch (error) {
-      this.logger.error('could not release the tickets that wait for the same files:', error.message);
-    }
   }
 
   // A ticket was sent to the planner (an epic label): its original agent pull request is closed (the branch stays), because the slices
@@ -2158,541 +1054,11 @@ export class Dispatcher {
     }
   }
 
-  // The issue ("repo#number") is closed in the forge: its jobs leave the waiting and failed lists of the status page (see JobStore.markClosed).
-  async markClosed(ticket: string): Promise<boolean> {
-    if (isDry(this.config, ticket.split('#')[0]) || !this.jobs.markClosed(ticket)) return false;
-    await this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
-    return true;
-  }
-
-  // The events of a closed issue can be missed (closed by hand while ForgeHands was down, or before this was kept). Once a day and at start,
-  // look at the tickets that are in a state the status page shows as a problem (failed run, rounds used up, waiting) and mark those that the
-  // forge says are closed. At most 20 reads per pass; the rest follows in the next hourly pass. A read that fails changes nothing.
-  async sweepClosed(now: number): Promise<boolean> {
-    if (!this.config.forgejo || now < this.nextClosedSweep) return false;
-    const tickets = new Map<string, Job[]>();
-    for (const job of this.jobs.list()) if (!job.key.split(':')[0].includes('!')) tickets.set(job.key.split(':')[0], [...(tickets.get(job.key.split(':')[0]) || []), job]);
-    const candidates = [...tickets].filter(([ticket, list]) => {
-      if (isDry(this.config, ticket.split('#')[0]) || list.every((job) => job.archived_view) || list.some((job) => job.status === 'running' || job.status === 'queued')) return false;
-      const checked = this.closedChecked.get(ticket);
-      if (checked !== undefined && now - checked < 86400000) return false;
-      const rounds = list.filter((job) => ROUND_KINDS.has(this.config.routes.get(job.label)?.kind) && (job.started || job.status !== 'failed')).length;
-      return list.some((job) => job.status === 'failed' || job.status === 'waiting') || rounds >= this.config.maxRounds;
-    });
-    this.nextClosedSweep = now + (candidates.length > 20 ? 3600000 : 86400000);
-    let changed = false;
-    for (const [ticket, list] of candidates.slice(0, 20)) {
-      const [repository, number] = [list[0].event.repository.full_name, Number(ticket.split('#')[1])];
-      try {
-        const issue = await this.forge.getIssue(repository, number);
-        if (!issue) continue;
-        if (issue.state === 'closed') { if (await this.markClosed(ticket)) changed = true; }
-        else this.closedChecked.set(ticket, now);
-      } catch (error) {
-        // A 404 is the ledger sync's to decide (it marks an issue deleted in the forge after two passes): the sweep does not log it again and again.
-        if (/HTTP 404\b/.test(error.message)) { this.closedChecked.set(ticket, now); continue; }
-        this.logger.error('could not read #' + number + ' of ' + repository + ':', error.message);
-      }
-    }
-    return changed;
-  }
-
-  // Archive the conversations of runs that ended a while ago: the tag archived=true is added, every other tag stays, so the runs can still
-  // be found by issue, pull request and kind. At most once an hour and 20 at a time; a conversation that is deleted or running is skipped.
-  async archiveOld(now: number): Promise<boolean> {
-    const days = this.config.archiveAfterDays;
-    if (!days || (this.lastArchive && now - this.lastArchive < 3600000)) return false;
-    this.lastArchive = now;
-    const before = now - days * 86400000;
-    let changed = false;
-    let done = 0;
-    for (const job of this.jobs.list()) {
-      if (job.archived || !job.conversation_id || !job.finished || job.finished > before || (job.status !== 'done' && job.status !== 'failed')) continue;
-      if (isDry(this.config, job.event.repository.full_name)) continue; // a dry run archives nothing, and must not mark it as done
-      if (done++ >= 20) break;
-      try {
-        const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id));
-        if (response.status === 404) { job.archived = true; changed = true; continue; }
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const data = (await response.json()) as Json;
-        if ((data.execution_status || data.status) === 'running') continue;
-        const patched = await this.api('PATCH', '/api/conversations/' + encodeURIComponent(job.conversation_id), { tags: { ...(data.tags || {}), archived: 'true' } }, job.event.repository.full_name);
-        if (!patched.ok) throw new Error('HTTP ' + patched.status);
-        job.archived = true;
-        changed = true;
-      } catch (error) {
-        this.logger.error('could not archive the run of ' + job.key + ':', error.message);
-      }
-    }
-    return changed;
-  }
-
-  // DELETE_AFTER_DAYS: the step after archiving. The OpenHands conversation of an archived run that ended long enough ago is deleted (its
-  // trajectory goes); the ledger keeps the run, its result, cost and tokens, and the status page shows no conversation link for it. Kept: a run
-  // that is not terminal, a conversation another job still uses (any job of that conversation must be terminal, archived and old enough), and a
-  // ticket that is open with a nudge or a resume pending. At most DELETE_PER_PASS deletions per pass, once an hour; a failed delete is tried again on
-  // the next pass. A dry run deletes nothing. 404 means the conversation is gone already, which counts as deleted.
-  lastDelete = 0;
-  async deleteOld(now: number): Promise<boolean> {
-    const days = this.config.deleteAfterDays;
-    if (!days || (this.lastDelete && now - this.lastDelete < 3600000)) return false;
-    this.lastDelete = now;
-    const perPass = 40;
-    const cutoff = (status: string) => now - (status === 'done' ? days : this.config.deleteFailedAfterDays) * 86400000;
-    const all = this.jobs.list();
-    // The tickets with a nudge or a resume pending, and the tickets that are closed (every job of them marked archived_view).
-    const pending = new Set(all.filter((job) => job.nudge_pending || job.resume_pending).map((job) => job.key.split(':')[0]));
-    const closed = new Set(all.filter((job) => job.archived_view).map((job) => job.key.split(':')[0]));
-    const byConversation = new Map<string, Job[]>();
-    for (const job of all) if (job.conversation_id) byConversation.set(job.conversation_id, [...(byConversation.get(job.conversation_id) || []), job]);
-    let deleted = 0;
-    let kept = 0;
-    let changed = false;
-    for (const [conversation, jobs] of byConversation) {
-      if (jobs.every((job) => job.conversation_deleted)) continue;
-      // Every job of the conversation must be finished with it (terminal, archived, old enough), else a run still needs it.
-      const aged = (job: Job) => !!job.archived && !!job.finished && (job.status === 'done' || job.status === 'failed' || job.status === 'deleted') && job.finished <= cutoff(job.status);
-      if (!jobs.every((job) => job.conversation_deleted || aged(job))) continue;
-      const ticket = jobs[0].key.split(':')[0];
-      if (pending.has(ticket) && !closed.has(ticket)) { kept += 1; continue; }
-      if (deleted >= perPass) { kept += 1; continue; }
-      if (isDry(this.config, jobs[0].event.repository.full_name)) continue; // a dry run deletes nothing, and marks nothing
-      try {
-        const response = await this.api('DELETE', '/api/conversations/' + encodeURIComponent(conversation), undefined, jobs[0].event.repository.full_name);
-        if (response.status !== 404 && !response.ok) throw new Error('HTTP ' + response.status);
-        for (const job of jobs) job.conversation_deleted = true;
-        deleted += 1;
-        changed = true;
-        metrics.inc('forgehands_conversations_deleted_total');
-        this.logger.log?.(jobs[0].key + ': conversation deleted');
-      } catch (error) {
-        kept += 1;
-        this.logger.error('could not delete the conversation of ' + jobs[0].key + ', trying again on the next pass:', error.message);
-      }
-    }
-    this.logger.error('conversations: ' + deleted + ' deleted, ' + kept + ' kept');
-    return changed;
-  }
-
-  private route(label: string): Route {
+  // The route of a label; a label without one is a mistake in the ledger or the config, and throws. Shared with RunWatcher.
+  route(label: string): Route {
     const route = this.config.routes.get(label);
     if (!route) throw new Error('no route for label ' + label);
     return route;
-  }
-
-  // Which queued job gets the next free slot. Between repositories the starts are shared by weight (REPO_WEIGHTS, default 1; a higher weight
-  // means more of the starts): the repository with the fewest recent starts per unit of weight goes first, so weights 2, 1 and 5 give 2 of 8,
-  // 1 of 8 and 5 of 8 starts when all three have work. Within a repository see `before`: begun tickets first, then the oldest ticket (lowest
-  // issue number) that can start now, not the one that was queued first. A repository without a startable job does not take a share: the others use it.
-  pickNext(now: number, tried: Set<string>): Job | null {
-    const heads = new Map<string, Job>();
-    for (const job of this.jobs.list('queued')) {
-      if (tried.has(job.id) || (job.next_try && job.next_try > now) || !this.hasRoom(job, now)) continue;
-      const repo = job.event.repository.full_name.toLowerCase();
-      const best = heads.get(repo);
-      if (!best || this.before(job, best)) heads.set(repo, job);
-    }
-    if (!heads.size) return null;
-    const recent = new Map<string, number>();
-    for (const job of this.jobs.list().filter((entry) => entry.started).sort((a, b) => (b.started || 0) - (a.started || 0)).slice(0, RECENT_STARTS)) {
-      const repo = job.event.repository.full_name.toLowerCase();
-      recent.set(repo, (recent.get(repo) || 0) + 1);
-    }
-    let pick: { repo: string; job: Job; score: number; weight: number } | null = null;
-    for (const [repo, job] of heads) {
-      const weight = this.config.repoWeights.get(repo) ?? 1;
-      const score = (recent.get(repo) || 0) / weight;
-      if (!pick || score < pick.score || (score === pick.score && (weight > pick.weight || (weight === pick.weight && repo < pick.repo)))) pick = { repo, job, score, weight };
-    }
-    return pick!.job;
-  }
-
-  // Order within a repository: work on a ticket that has begun (a round, a review, a fix, a conflict, an epic review) before a new ticket, so
-  // that what was started gets finished; then the lowest issue number; then the job that was queued first.
-  before(a: Job, b: Job): boolean {
-    const begun = (job: Job) => (job.event.pull_request || job.event.type === 'epic.done' ? 0 : 1);
-    if (begun(a) !== begun(b)) return begun(a) < begun(b);
-    if (a.event.issue.number !== b.event.issue.number) return a.event.issue.number < b.event.issue.number;
-    return a.created < b.created;
-  }
-
-  hasRoom(job: Job, now: number): boolean {
-    return this.holdOf(job, now) === null;
-  }
-
-  // The limit that keeps a queued job from starting now, checked in this order, or null when it may start: low disk space (DISK_MIN_FREE_GB, running
-  // jobs are not touched), the global concurrency, the quota hold of its tier (`tier` is that tier), the concurrency of its tier, the hourly limit.
-  holdOf(job: Job, now: number): { reason: 'disk' | 'quota' | 'concurrency' | 'hourly'; tier?: string } | null {
-    if (this.workspace.holding) return { reason: 'disk' };
-    const running = this.jobs.list('running');
-    if (running.length >= this.config.maxConcurrent) return { reason: 'concurrency' };
-    const effective = this.effectiveRoute(job, now).route;
-    const tier = effective.tier;
-    if ((this.cooldowns.get(tier) || 0) > now) return { reason: 'quota', tier };
-    const tierLimit = effective.maxConcurrent ?? this.config.maxConcurrentPerTier;
-    if (running.filter((other) => this.tierOf(other) === tier).length >= tierLimit) return { reason: 'concurrency' };
-    const startedLastHour = this.jobs.list().filter((other) => other.started && other.started > now - 3600000).length;
-    if (startedLastHour >= this.config.maxRunsPerHour) return { reason: 'hourly' };
-    return null;
-  }
-
-  // What holds the waiting and queued jobs back right now, counted per job with the waits the dispatcher already decides: an issue that depends on
-  // open issues (and a CI result kept while its run goes on) is a dependency wait; a ticket that shares files with an older one is a files wait; a queued
-  // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
-  // and is not counted.
-  idleCounts(now: number): { reasons: IdleCounts; tiers: string[]; cycles: string[] } {
-    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 };
-    const tiers = new Set<string>();
-    // Explicit dependencies only: a cycle of them is not broken by ForgeHands (the planner or a human made it), so its jobs wait for ever.
-    const cycles = findCycles(waitGraph(this.jobs.list(), false));
-    const inCycle = new Set(cycles.flat());
-    // A ticket that waits, directly or through other tickets, behind a blocked pull request (see stuck.ts) is counted as waiting behind it.
-    const behind = behindBlocked(this.jobs.list(), blockedTickets(this.jobs.stuck));
-    for (const job of this.jobs.list(true)) {
-      if (job.status === 'waiting') {
-        if (job.waiting_for?.length && inCycle.has(ticketKey(job))) reasons.cycle += 1;
-        else if (!job.event.bot && !job.event.pull_request && behind.has(ticketKey(job))) reasons.stuck += 1;
-        else if (job.waiting_for?.length || job.waiting_for_run) reasons.dependencies += 1;
-        else if (job.waiting_for_files?.length) reasons.files += 1;
-        continue;
-      }
-      if (job.status !== 'queued' || (job.next_try && job.next_try > now)) continue;
-      const hold = this.holdOf(job, now);
-      if (!hold) { reasons.could_start += 1; continue; }
-      reasons[hold.reason] += 1;
-      if (hold.tier) tiers.add(hold.tier);
-    }
-    return { reasons, tiers: [...tiers].sort(), cycles: cycles.map(cycleText) };
-  }
-
-  // The idle line of a pass in which something waits and nothing could start (`started` is the number of jobs this pass started). It is logged
-  // when its composition changes and at most every 15 minutes otherwise; the same numbers are on /status.json and in the idle gauge.
-  reportIdle(now: number, started: number): void {
-    const { reasons, tiers, cycles } = this.idleCounts(now);
-    const total = Object.values(reasons).reduce((sum, count) => sum + count, 0);
-    // A dependency cycle is logged once, when it is found.
-    for (const text of cycles) {
-      if (this.cyclesLogged.has(text)) continue;
-      this.cyclesLogged.add(text);
-      this.logger.error(text + ', none of its tickets can start: a human has to break it');
-    }
-    if (started) this.idleLogged = null;
-    if (started || !total) this.idle = null;
-    if (!total) { this.stallAlertAt = null; this.idleLogged = null; }
-    if (started || !total) return;
-    this.idle = { since: this.idle?.since ?? now, reasons, tiers, cycles };
-    const key = JSON.stringify([reasons, tiers]);
-    if (this.idleLogged?.key === key && now - this.idleLogged.at < IDLE_LOG_EVERY_MS) return;
-    this.idleLogged = { key, at: now };
-    this.logger.error(idleLine(reasons, tiers));
-  }
-
-  idleState(): IdleState | null {
-    return this.idle;
-  }
-
-  // STALL_ALERT_MINUTES: work waits on a hold that is not a dependency (quota, disk, a limit, or a job that could start and did not), no run is running,
-  // and nothing has started for that long: one notification (kind stalled), and not again for six hours unless nothing waits any more. The waits on
-  // dependencies and on files do not count: a chain of tickets is normal.
-  checkStall(now: number): void {
-    const minutes = this.config.stallAlertMinutes;
-    if (!minutes || !this.idle) return;
-    const { reasons, tiers, cycles } = this.idle;
-    // A dependency cycle is not a normal chain: its jobs count as a hold too (the notification names the tickets).
-    if (!(reasons.quota + reasons.disk + reasons.hourly + reasons.concurrency + reasons.could_start + reasons.cycle)) return;
-    if (this.jobs.list('running').length || now - this.lastStart < minutes * 60000) return;
-    if (this.stallAlertAt !== null && now - this.stallAlertAt < STALL_REPEAT_MS) return;
-    if (!this.notifier.wants('stalled')) return;
-    this.stallAlertAt = now;
-    const quiet = Math.round((now - this.lastStart) / 60000);
-    this.logger.error('stall alert: nothing has started for ' + quiet + ' min and no run is running. ' + idleLine(reasons, tiers));
-    this.notifier.notify(stallMessage(this.config.notify.language, { minutes: quiet, reasons, tiers, cycles }));
-  }
-
-  async startJob(job: Job, now: number): Promise<boolean> {
-    // Dependencies are looked at when the job is queued, but an edge may be added afterwards (a ticket labelled before its dependencies were
-    // set): look again before a worker starts, so that the order the edges give is kept.
-    if (this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && this.config.forgejo) {
-      const open = await this.openDependencies(job.event, job.event.issue.number);
-      // The ticket was found deleted (and its jobs dropped): nothing starts for it.
-      if (job.status === 'deleted') return true;
-      if (open.length) {
-        Object.assign(job, { status: 'waiting', waiting_for: open });
-        this.logger.error(job.key + ' waits for ' + open.map((number) => '#' + number).join(', ') + ' (dependencies added after it was queued)');
-        return true;
-      }
-    }
-    // WAIT_FOR_SAME_FILES: an older ticket or pull request that changes the same files goes first.
-    if (this.config.waitForSameFiles && this.config.routes.get(job.label)?.kind === 'issue' && !job.event.pull_request && !this.config.epicLabels.has(job.label)) {
-      const blockers = await this.filesBlockers(job);
-      if (blockers.length) {
-        Object.assign(job, { status: 'waiting', waiting_for_files: blockers });
-        this.logger.error(job.key + ' waits for ' + blockers.map((number) => '#' + number).join(', ') + ' (same files)');
-        return true;
-      }
-      delete job.waiting_for_files;
-    }
-    if (job.event.ci && this.config.routes.get(job.label)?.kind === 'ci_failure' && (await this.commitRecovered(job.event))) {
-      this.jobs.remove(job.id);
-      return true;
-    }
-    const route = this.route(job.label);
-    // The last round goes to the stronger profile of "escalate_to": same branch, same kind, same prompt and the limits of its own route.
-    const target = this.escalationTarget(job);
-    if (target && !job.escalated) {
-      job.escalated = true;
-      this.logger.error(job.key + ': round ' + this.rounds(job.event) + ' is escalated to ' + route.escalateTo);
-      metrics.inc('forgehands_escalated_rounds_total');
-    }
-    const { route: effective, fellBack } = this.effectiveRoute(job, now);
-    job.fell_back = fellBack;
-    if (fellBack) this.logger.error(job.key + ': the tier of its route is out of quota, starting with the fallback route ' + fellBack);
-    // PLAN_ANSWER_RESTARTS: a planner run records the dependencies it starts with; an answer later counts only the sub-issues created since (planAnswer).
-    // Without a readable forge the snapshot stays out, and planAnswer falls back to the creation dates.
-    delete job.deps_before;
-    if (this.isPlannerLabel(job.label) && !job.event.pull_request && this.config.forgejo) {
-      try {
-        const before = await this.forge.dependencies(job.event.repository.full_name, job.event.issue.number);
-        if (Array.isArray(before)) job.deps_before = before.map((issue: Json) => issue.number).filter((number: unknown) => Number.isInteger(number)).sort((a: number, b: number) => a - b);
-      } catch (error) {
-        this.logger.error('could not read the dependencies of #' + job.event.issue.number + ' before its planner run:', error.message);
-      }
-    }
-    // CHECKS_FROM_CI: a review run is given the check result of its head, read from the forge now (see agent/checks.ts).
-    const checks = this.config.checksFromCi && job.event.ci && (job.event.type === 'ci.success' || job.event.type === 'ci.sensitive')
-      ? await checkFacts(this.forge, job.event.repository.full_name, job.event.ci.commit_sha, this.logger, this.config.reviewWithoutCi) : null;
-    // The advisory findings of the ticket pre-flight are given to a worker's prompt as notes (preflight.ts); blocking ones never get here.
-    const notes = !job.event.pull_request && this.config.routes.get(job.label)?.kind === 'issue' && !this.isPlannerLabel(job.label)
-      ? await this.preflight.notesOf(job.event) : [];
-    const body: Json = {
-      workspace: { working_dir: this.config.workspaceDir },
-      agent_profile_id: effective.profile,
-      max_iterations: route.maxIterations,
-      tags: { source: 'forgehands', ...(job.event.bot ? { bot: 'dependency' } : { issue: String(job.event.issue.number) }), ...(job.event.pull_request ? { pr: String(job.event.pull_request.number) } : {}), ...(job.event.ci ? { ci: job.event.type.slice(3) } : {}), ...(job.event.epic ? { epic: 'done' } : {}), ...(job.event.type === 'pull_request.conflict' ? { conflict: 'default-branch' } : {}) },
-      initial_message: { role: 'user', run: true, content: [{ type: 'text', text: buildPrompt(job.event, this.config, checks, notes) + handbackLine(job) + stallLine(job.event) }] }
-    };
-    if (route.maxBudget) body.max_budget_per_run = route.maxBudget;
-    // Built per start from the environment; never stored in the ledger.
-    // A route's own Forgejo token (the reviewer user) goes to its conversations only, as FORGEJO_TOKEN; no other conversation gets it.
-    const claimed = new Set([...this.config.routes.values()].map((entry) => entry.forgejoTokenSecret).filter(Boolean));
-    const own = route.forgejoTokenSecret ? this.config.agentSecrets[route.forgejoTokenSecret] : undefined;
-    const secrets = [...Object.entries(this.config.agentSecrets || {}).filter(([name]) => !claimed.has(name) && !(own && name === 'FORGEJO_TOKEN')),
-      ...(own ? [['FORGEJO_TOKEN', own] as [string, string]] : [])];
-    if (secrets.length) {
-      body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
-    }
-    // A dry run judges and schedules as usual, but starts nothing: the job ends as `dry` with the message the agent would have got.
-    // `started` stays set so that the hourly limit and the round count behave as live.
-    if (isDry(this.config, job.event.repository.full_name)) {
-      Object.assign(job, { status: 'dry', started: now, finished: now, result: 'dry', dry_prompt: body.initial_message.content[0].text });
-      this.logger.error('DRY RUN, not started: ' + job.key + ' (' + effective.profile + ', tier ' + effective.tier + ')');
-      return true;
-    }
-    try {
-      const response = await this.api('POST', '/api/conversations', body, job.event.repository.full_name);
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const created = (await response.json()) as Json;
-      if (!created?.id) throw new Error('response without conversation id');
-      Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
-      // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
-      delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
-      // The nudge is once per conversation too (see nudgeIfNoBranch).
-      delete job.nudged; delete job.nudge_settled; delete job.nudge_pending; delete job.nudge_gave_up; this.nudgeChecks.delete(job.id);
-      delete job.tokens_seen;
-      metrics.inc('forgehands_runs_started_total', { kind: this.route(job.label).kind });
-    } catch (error) {
-      job.attempts += 1;
-      job.error = error.message;
-      this.logger.error('starting conversation for ' + job.key + ' failed:', error.message);
-      if (job.attempts >= MAX_ATTEMPTS) Object.assign(job, { status: 'failed', finished: now });
-      else job.next_try = now + RETRY_BASE_MS * job.attempts;
-    }
-    return true;
-  }
-
-  async poll(job: Job, now: number): Promise<boolean> {
-    // A continued run whose run call was not answered yet: the message is in its conversation already, so only the run call is repeated.
-    // Past the run timeout the continuation is given up and the run counts as timed out, without a second message.
-    if (job.resume_pending) {
-      if (job.resumed_at! + this.config.maxRunMs >= now) {
-        await this.startResumed(job);
-        return true;
-      }
-      delete job.resume_pending;
-      // A continuation of a pause that never got its run call ends as paused: it is handed over, never split.
-      return this.failed(job, job.resumed_from === 'paused' ? 'paused' : 'timeout', now);
-    }
-    let state: string | null = null;
-    let costChanged = false;
-    let usage: TokenTotals | null = null; // the tokens of the conversation as this read sees them (null: the read failed)
-    try {
-      const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!));
-      if (response.status === 404) state = 'deleted';
-      else if (response.ok) {
-        const data = (await response.json()) as Json;
-        state = data.execution_status || data.status;
-        const cost = conversationCost(data);
-        if (cost !== null && cost !== job.cost) { job.cost = cost; costChanged = true; }
-        usage = tokenUsage(data);
-      }
-    } catch (error) {
-      this.logger.error('polling ' + job.key + ' failed:', error.message);
-    }
-    if (state === 'error') {
-      const error = await this.lastError(job);
-      // The model ran out of quota (the gateway answers with a rate limit, mostly with the time until it resets): not the ticket's fault
-      // and no reason to call a human. Hold the tier back until then (at most QUOTA_HOLD_MAX_HOURS, 15 minutes when the gateway gives no
-      // time) and run this job again afterwards; give up only when the quota has been out for QUOTA_GIVE_UP_HOURS.
-      if (error?.rateLimited) {
-        const since = job.rate_limited_since || now;
-        if (now - since < this.config.quotaGiveUpMs) {
-          // No time from the gateway: a quota without a reset time waits 15 minutes; "no model available" starts short and doubles (1, 2, 4, 8,
-          // 16, then 30 minutes), because such a window may be over in a minute or last hours.
-          const fallback = error.unavailable ? Math.min(60000 * 2 ** Math.min(job.rate_limited || 0, 5), 30 * 60000) : 15 * 60000;
-          const wait = Math.min(Math.max(error.waitMs ?? fallback, 60000), this.config.quotaHoldMaxMs);
-          const until = now + wait;
-          this.countTokens(job, usage);
-          this.cooldowns.set(this.tierOf(job) ?? this.route(job.label).tier, until);
-          this.logger.error('model quota used up for ' + job.key + ', trying again after ' + new Date(until).toISOString());
-          // The job may start again as soon as one of the routes it can run on is free: its own (or escalated) route, or that route's fallback.
-          const next = this.earliestStart(job, now);
-          Object.assign(job, { status: 'queued', started: undefined, fell_back: undefined, conversation_id: undefined, next_try: next, rate_limited: (job.rate_limited || 0) + 1, rate_limited_since: since, retry_at: next });
-          return true;
-        }
-      }
-      // The agent reached its iteration limit: OpenHands reports that as an error, but running it again does the same. It is a ticket that
-      // is too big (see reportFailure and SPLIT_LABEL), not an error that passes.
-      if (error?.code === 'MaxIterationsReached') state = 'max_iterations';
-    }
-    // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
-    if (state === 'error' && (job.error_retry || 0) < this.config.errorRetries) {
-      this.countTokens(job, usage);
-      this.logger.error(job.key + ' ended with an error, running it once more');
-      metrics.inc('forgehands_error_retries_total');
-      Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,
-        error_retry: (job.error_retry || 0) + 1, next_try: now + ERROR_RETRY_DELAY_MS, retry_at: now + ERROR_RETRY_DELAY_MS });
-      return true;
-    }
-    if (state !== null && TERMINAL.has(state)) {
-      // A run continued a moment ago may still be reported in the state it stopped in: that is not news yet.
-      if (job.resumed_from === state && now - job.resumed_at! < RESUME_SETTLE_MS) return false;
-      this.countTokens(job, usage);
-      // A pause the operator wants is not resumed: the ticket is closed or its trigger label is gone (see pauseStop). Such a run ends as it is
-      // (no split, no hand-over, no new branch update), and the operator's stop is the one thing ForgeHands does not fight.
-      let stopped: string | null = null;
-      if (state === 'paused' && (job.pause_resumes || 0) < this.config.pauseResumes) {
-        try { stopped = await this.pauseStop(job); }
-        catch (error) { this.logger.error('could not read ' + job.key + ' to see whether it was stopped, trying again:', error.message); return false; }
-      }
-      if (stopped) {
-        Object.assign(job, { status: 'failed', result: state, finished: now });
-        this.logger.error(job.key + ': paused, ' + stopped + ': not resumed');
-        this.runEnded(job, state, now);
-        await this.releaseFileWaits();
-        return true;
-      }
-      if (await this.resume(job, state, now)) return true;
-      Object.assign(job, { status: state === 'finished' ? 'done' : 'failed', result: state, finished: now });
-      this.runEnded(job, state, now);
-      await this.checkBranchAfterRun(job);
-      await this.releaseFileWaits();
-      const done = this.config.routes.get(job.label)?.kind;
-      if (done === 'ci_success') await this.checkVerdict(job);
-      else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
-      else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
-      else if (done === 'issue') await this.checkDelivery(job);
-      else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
-      else if (done === 'epic_done') await this.epicGaps.review(job);
-      // A replan run of an epic (EPIC_GAP_REPLAN) that ended: its sub-issues decide whether the epic waits, is reviewed once more, or goes to a human.
-      await this.epicGaps.afterReplan(job, now);
-      return true;
-    }
-    // A running worker that has used much of its iteration limit without a branch is nudged (NUDGE_AT_PERCENT).
-    if (state === 'running' && await this.nudgeIfNoBranch(job, now)) return true;
-    if (costChanged) return true;
-    // Free the slot of a run that never ends; the conversation itself is left alone unless the run is continued (see resume).
-    // A continued run counts its timeout from the continuation.
-    if (job.started && (job.resumed_at ?? job.started) + this.config.maxRunMs < now) {
-      this.countTokens(job, usage);
-      if (await this.resume(job, 'timeout', now)) return true;
-      return this.failed(job, 'timeout', now);
-    }
-    return false;
-  }
-
-  // Why a paused run stays stopped, or null when it may be resumed. The operator stops a run by removing its trigger label (or closing the ticket):
-  // the label of an issue route is on the issue, that of a round route on the pull request; routes that start on a CI result, a conflict or a
-  // closed epic have no label to look at, so only a closed ticket stops them. One read of the forge. Without forge access nothing can be
-  // read, so the run is resumed as it always was.
-  async pauseStop(job: Job): Promise<string | null> {
-    if (!this.config.forgejo) return null;
-    const event = job.event;
-    const repository = event.repository.full_name;
-    const kind = this.config.routes.get(job.label)?.kind;
-    const labelled = kind === 'issue' || kind === 'pull_request';
-    if (event.pull_request) {
-      const pull = await this.forge.getPull(repository, event.pull_request.number);
-      if (pull.state === 'closed' || pull.merged) return 'the pull request is closed';
-      return !labelled || (pull.labels || []).some((label) => label.name === job.label) ? null : 'the trigger label is gone';
-    }
-    const issue = await this.forge.getIssue(repository, event.issue.number);
-    if (issue.state === 'closed') return 'the issue is closed';
-    return !labelled || (issue.labels || []).some((label) => label.name === job.label) ? null : 'the trigger label is gone';
-  }
-
-  // Stage A (RESUME_ATTEMPTS): a run that ended stuck or timed out goes on in its own conversation, which keeps its context. One message says
-  // what happened and asks for another approach, then the run is started again; the job is running again and counts the resume. A paused run
-  // (an interruption, PAUSE_RESUMES) goes on the same way with a neutral message and a budget of its own. Once the budget of the state is used
-  // up, or the run is not one of RESUMABLE (an iteration limit: nothing in the API raises it, so a continued run would stop at the same limit),
-  // this returns false and the next stage decides. A message that could not be sent counts as not continued.
-  async resume(job: Job, state: string, now: number): Promise<boolean> {
-    const paused = state === 'paused';
-    const used = paused ? job.pause_resumes || 0 : job.resumes || 0;
-    const budget = paused ? this.config.pauseResumes : this.config.resumeAttempts;
-    if (!(paused || RESUMABLE.has(state)) || !job.conversation_id || used >= budget) return false;
-    const repository = job.event.repository.full_name;
-    const conversation = '/api/conversations/' + encodeURIComponent(job.conversation_id);
-    // A timed out run is still running in OpenHands: it is paused first, so that the message does not go to a busy agent (best effort).
-    if (state === 'timeout') {
-      try { await this.api('POST', conversation + '/pause', undefined, repository); }
-      catch (error) { this.logger.error('could not pause ' + job.key + ' before it is continued:', error.message); }
-    }
-    // The message and the run are two calls: a run call that is not answered is repeated on its own (startResumed), never the message.
-    const text = paused ? PAUSE_MESSAGE : 'The run stopped as ' + state + '. Do not repeat what you did last. Look at the current state of the branch and of the checks, take a different approach, and end with the finish tool and a short summary.';
-    try {
-      await this.sendMessage(job, text);
-    } catch (error) {
-      this.logger.error(job.key + ': ' + state + ', the message to continue it was not sent (' + error.message + '), the next stage decides');
-      return false;
-    }
-    const counted = paused ? { pause_resumes: used + 1 } : { resumes: used + 1 };
-    Object.assign(job, { status: 'running', ...counted, resumed_from: state, resumed_at: now, resume_pending: true, finished: undefined, result: undefined });
-    metrics.inc('forgehands_resumes_total', { kind: this.config.routes.get(job.label)?.kind || 'issue', state: known(state, [...RESUMABLE, 'paused']) });
-    this.logger.error(job.key + ': ' + state + ', resuming the conversation (' + (used + 1) + '/' + budget + ')');
-    await this.startResumed(job);
-    return true;
-  }
-
-  // The tokens of a conversation are added to the job's totals and to the counter forgehands_tokens_total when its run ends: at a terminal state,
-  // when the conversation is dropped for a retry or a quota hold, or when a run times out. `tokens_seen` is what of the current conversation is
-  // counted already, so a continued run adds only what came after. A read that failed (no usage) adds nothing.
-  countTokens(job: Job, usage: TokenTotals | null): void {
-    if (!usage) return;
-    const seen = job.tokens_seen;
-    const totals = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0, ...job.tokens };
-    const delta = { prompt: 0, completion: 0, cache_read: 0, cache_write: 0, reasoning: 0 };
-    for (const field of Object.keys(delta) as (keyof TokenTotals)[]) {
-      delta[field] = Math.max(0, usage[field] - (seen?.[field] ?? 0));
-      totals[field] += delta[field];
-    }
-    job.tokens = totals;
-    job.tokens_seen = usage;
-    const tiers = new Set([...this.config.routes.values()].map((route) => route.tier));
-    const labels = {
-      repository: known(String(job.event?.repository?.full_name).toLowerCase(), this.config.allowedRepos), tier: known(this.tierOf(job), tiers),
-      kind: known(this.config.routes.get(job.label)?.kind || 'issue', ROUTE_KINDS)
-    };
-    for (const type of TOKEN_TYPES) if (delta[type] > 0) metrics.inc('forgehands_tokens_total', { ...labels, type }, delta[type]);
   }
 
   // One message into a conversation, without a run call (run: false). Throws when OpenHands does not take it (HTTP status in the message) or the call
@@ -2700,126 +1066,6 @@ export class Dispatcher {
   async sendMessage(job: Job, text: string, timeoutMs?: number): Promise<void> {
     const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events', { role: 'user', content: [{ type: 'text', text }], run: false }, job.event.repository.full_name, timeoutMs);
     if (!response.ok) throw new Error('HTTP ' + response.status);
-  }
-
-  // NUDGE_AT_PERCENT: a worker run on an issue that has used that share of its route's iteration limit, and whose forge shows no branch ai/issue-<n>,
-  // is told once (per conversation) to stop exploring and push. Only a running conversation is looked at. Every read is best effort: when the count,
-  // the forge or OpenHands fails, nothing is sent and the next look comes a minute later. Returns true when the job changed (to be persisted).
-  async nudgeIfNoBranch(job: Job, now: number): Promise<boolean> {
-    const route = this.config.routes.get(job.label);
-    // Planner, epic and split routes are not workers: they plan, they do not push a branch of their own.
-    const worker = !!route && route.kind === 'issue' && !job.event.pull_request && !job.event.bot && job.event.type !== 'epic.done'
-      && !this.config.epicLabels.has(job.label) && job.label !== this.config.splitLabel;
-    if (!this.config.nudgeAtPercent || !worker || !this.config.forgejo || !job.started || !job.conversation_id || job.nudged !== undefined || job.nudge_settled
-      || job.nudge_gave_up || this.nudgeInflight.has(job.id)) return false;
-    if (now - job.started < NUDGE_MIN_RUN_MS) return false;
-    const last = this.nudgeChecks.get(job.id);
-    if (last !== undefined && now - last < NUDGE_CHECK_EVERY_MS) return false;
-    this.nudgeChecks.set(job.id, now);
-    // A nudge that timed out earlier is resolved first (its marker is looked for), without counting again.
-    if (job.nudge_pending) { this.startNudge(job, { used: job.nudge_pending.used, max: job.nudge_pending.max }); return false; }
-    const repository = job.event.repository.full_name;
-    const number = job.event.issue.number;
-    let used: number;
-    try {
-      used = await this.actionCount(job);
-    } catch (error) {
-      this.logger.error(job.key + ': actions not counted, no nudge yet (' + error.message + ')');
-      return false;
-    }
-    const max = route.maxIterations;
-    if (used < Math.ceil(max * this.config.nudgeAtPercent / 100)) return false;
-    let pushed: boolean;
-    try {
-      pushed = await this.branchExists(repository, 'ai/issue-' + number);
-    } catch (error) {
-      this.logger.error(job.key + ': the branch is not read, no nudge yet (' + error.message + ')');
-      return false;
-    }
-    if (pushed) { job.nudge_settled = true; return true; }
-    this.startNudge(job, { used, max });
-    return false;
-  }
-
-  // The nudge is delivered in the background: a message to a running conversation answers only after the agent's current step, so the poll
-  // path (and the dispatch loop with it) never waits for it. One delivery per job at a time (nudgeInflight); the ledger is written when it ends.
-  startNudge(job: Job, plan: { used: number; max: number }): void {
-    const flight = this.runNudge(job, plan)
-      .catch((error) => this.logger.error(job.key + ': nudge failed: ' + error.message))
-      .finally(() => {
-        this.nudgeInflight.delete(job.id);
-        this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
-      });
-    this.nudgeInflight.set(job.id, flight);
-  }
-
-  // Delivers the nudge once, with a marker in its text. A timeout does not say whether OpenHands stored the message (it may be queued behind the
-  // agent's step), so the events are read for the marker first; the message is sent again only when they do not hold it, and only NUDGE_TRIES
-  // times in all. A refusal (HTTP status: 409, 423, 429, ...) is not a delivery: the next look counts and tries again.
-  async runNudge(job: Job, plan: { used: number; max: number }): Promise<void> {
-    const number = job.event.issue.number;
-    const pending = job.nudge_pending ??= { marker: '[forgehands-nudge ' + randomUUID().slice(0, 8) + ']', tries: 0, used: plan.used, max: plan.max };
-    for (;;) {
-      if (pending.tries > 0) {
-        let stored: boolean;
-        try {
-          stored = await this.nudgeInEvents(job, pending.marker);
-        } catch (error) {
-          this.logger.error(job.key + ': nudge pending, the events could not be read (' + error.message + '), checking again on the next look');
-          return;
-        }
-        if (stored) {
-          this.logger.error(job.key + ': nudge confirmed in the events');
-          return this.nudgeDelivered(job, pending);
-        }
-        if (pending.tries >= NUDGE_TRIES) {
-          job.nudge_gave_up = true;
-          delete job.nudge_pending;
-          this.logger.error(job.key + ': the nudge was not delivered after ' + pending.tries + ' tries, no more nudges for this run');
-          return;
-        }
-      }
-      pending.tries += 1;
-      try {
-        await this.sendMessage(job, this.nudgeText(pending.used, pending.max, number) + ' ' + pending.marker, this.config.nudgeTimeoutMs);
-      } catch (error) {
-        // An answer with an HTTP status is a refusal: nothing was stored, and the next look tries again.
-        if (/^HTTP \d+$/.test(error.message)) {
-          delete job.nudge_pending;
-          this.logger.error(job.key + ': nudge refused (' + error.message + '), trying again on the next look');
-          return;
-        }
-        this.logger.error(job.key + ': nudge pending (timeout), checking the events');
-        continue;
-      }
-      return this.nudgeDelivered(job, pending);
-    }
-  }
-
-  // The nudge is in the conversation: the job is nudged once, and the count is kept.
-  nudgeDelivered(job: Job, pending: { used: number; max: number }): void {
-    job.nudged = pending.used;
-    delete job.nudge_pending;
-    metrics.inc('forgehands_nudges_total', { kind: 'issue' });
-    this.logger.error(job.key + ': nudged at ' + pending.used + '/' + pending.max + ' actions, no branch yet');
-  }
-
-  // Whether a user message with the marker is among the newest events of the conversation. Throws when the events cannot be read.
-  async nudgeInEvents(job: Job, marker: string): Promise<boolean> {
-    const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/search?limit=30&sort_order=TIMESTAMP_DESC', undefined, job.event.repository.full_name);
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    const items = ((await response.json()) as Json)?.items || [];
-    return items.some((item: Json) => item?.source !== 'agent' && JSON.stringify(item).includes(marker));
-  }
-
-  // The agent actions of a conversation so far: OpenHands' event count, restricted to ActionEvent. Throws when the count cannot be read.
-  async actionCount(job: Job): Promise<number> {
-    const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/events/count?kind=ActionEvent', undefined, job.event.repository.full_name);
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    const data = (await response.json()) as Json;
-    const count = typeof data === 'number' ? data : Number(data?.count);
-    if (!Number.isSafeInteger(count) || count < 0) throw new Error('the answer carries no count');
-    return count;
   }
 
   // Whether a branch exists in the forge. A missing branch is HTTP 404 (false); any other failure throws, so that the caller treats it as unknown.
@@ -2832,112 +1078,48 @@ export class Dispatcher {
     }
   }
 
-  // The nudge's text: the default, or NUDGE_MESSAGE with {used}, {max} and {branch} filled in.
-  nudgeText(used: number, max: number, number: number): string {
-    const branch = 'ai/issue-' + number;
-    if (this.config.nudgeMessage) return this.config.nudgeMessage.replaceAll('{used}', String(used)).replaceAll('{max}', String(max)).replaceAll('{branch}', branch);
-    return 'You have used ' + used + ' of ' + max + ' actions and have not pushed a branch yet. Stop exploring. Implement the smallest change that meets the acceptance check, '
-      + 'commit and push it to the branch ' + branch + ' and open the draft pull request; or, if something blocks you, write a comment on the issue that names the exact blocker '
-      + 'and finish. Do not start new investigations.';
-  }
+  // Reached from other modules and from the tests; the work is done by Nudger (nudge.ts).
+  get nudgeInflight(): Nudger['nudgeInflight'] { return this.nudger.nudgeInflight; }
 
-  // The run call of a continued conversation. 200 starts it, 409 says it runs already: both clear the pending call. 404 means the conversation is
-  // gone (the next poll says so). Any other answer, or no answer, keeps the call pending for the next poll.
-  async startResumed(job: Job): Promise<void> {
-    try {
-      const response = await this.api('POST', '/api/conversations/' + encodeURIComponent(job.conversation_id!) + '/run', undefined, job.event.repository.full_name);
-      if (response.ok || response.status === 409) {
-        delete job.resume_pending;
-        job.resumed_at = this.now();
-      } else if (response.status === 404) {
-        delete job.resume_pending;
-      } else {
-        this.logger.error(job.key + ': the continued run was not started (HTTP ' + response.status + '), trying again');
-      }
-    } catch (error) {
-      this.logger.error(job.key + ': the continued run was not started (' + error.message + '), trying again');
-    }
-  }
+  // Reached from other modules and from the tests; the work is done by WaitKeeper (wait-keeper.ts).
+  releaseFileWaits(...args: Parameters<WaitKeeper['releaseFileWaits']>): ReturnType<WaitKeeper['releaseFileWaits']> { return this.waitKeeper.releaseFileWaits(...args); }
 
-  // Stage B (FAILURE_ESCALATE): a round that is still stuck, timed out or out of iterations (after stage A, or at once for the iteration limit) starts
-  // once more on the profile of its escalate_to route, on the same pull request and branch, with the own route's prompt and limits. It is one
-  // extra try per head commit: a second failure on the same commit goes to the human, and it does not use up a MAX_ROUNDS round. The run is
-  // queued like any run (the escalation is the same as the last-round escalation: the job is `escalated`). Returns true when it was queued.
-  async escalateFailure(job: Job, state: string): Promise<boolean> {
-    const route = this.config.routes.get(job.label);
-    if (!this.config.failureEscalate || !route?.escalateTo || !ROUND_KINDS.has(route.kind) || !job.event.pull_request || job.escalated
-      || !ESCALATABLE.has(state) || !this.config.forgejo) return false;
-    const repository = job.event.repository.full_name;
-    const number = job.event.pull_request.number;
-    let head: string;
-    try {
-      const pr = await this.forge.getPull(repository, number);
-      if (!pr || pr.state !== 'open' || pr.merged || typeof pr.head?.sha !== 'string') return false;
-      head = pr.head.sha;
-    } catch (error) {
-      this.logger.error('could not read the head of #' + number + ', no escalation of ' + job.key + ':', error.message);
-      return false;
-    }
-    const key = this.issueKey(job.event) + ':' + job.label + ':' + head.slice(0, 8);
-    if (this.jobs.list().some((other) => other.key === key)) return false;
-    this.jobs.add({ key, label: job.label, event: { ...job.event, label: job.label }, status: 'queued', created: this.now(),
-      escalated: true, failure_escalation: true, escalated_after: state });
-    metrics.inc('forgehands_failure_escalations_total');
-    this.logger.error(job.key + ': ' + state + ', starting once more on ' + route.escalateTo + ' (head ' + head.slice(0, 8) + ')');
-    return true;
-  }
+  // Reached from other modules and from the tests; the work is done by RevertKeeper (revert-keeper.ts).
+  checkRevertRate(...args: Parameters<RevertKeeper['checkRevertRate']>): ReturnType<RevertKeeper['checkRevertRate']> { return this.revertKeeper.checkRevertRate(...args); }
+  checkReruns(...args: Parameters<RevertKeeper['checkReruns']>): ReturnType<RevertKeeper['checkReruns']> { return this.revertKeeper.checkReruns(...args); }
 
-  // A run that ran out of time (a continuation that never started counts the same): it is either escalated (stage B) or reported (stage C, as before).
-  async failed(job: Job, state: string, now: number): Promise<boolean> {
-    Object.assign(job, { status: 'failed', result: state, finished: now });
-    this.runEnded(job, state, now);
-    if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state);
-    return true;
-  }
+  // Reached from other modules and from the tests; the work is done by BranchRefresher (branch-refresh.ts).
+  get lastUpdate(): BranchRefresher['lastUpdate'] { return this.branchRefresher.lastUpdate; }
+  onMainMoved(...args: Parameters<BranchRefresher['onMainMoved']>): ReturnType<BranchRefresher['onMainMoved']> { return this.branchRefresher.onMainMoved(...args); }
+  refreshPull(...args: Parameters<BranchRefresher['refreshPull']>): ReturnType<BranchRefresher['refreshPull']> { return this.branchRefresher.refreshPull(...args); }
+  checkBranchAfterRun(...args: Parameters<BranchRefresher['checkBranchAfterRun']>): ReturnType<BranchRefresher['checkBranchAfterRun']> { return this.branchRefresher.checkBranchAfterRun(...args); }
 
-  // What the human is told about an issue run that delivered nothing. It names the escalation when one happened (the same route's escalate_to, read
-  // from job.label: a run on the fallback route of its tier is still escalated by that route), so the notice does not claim that nothing was tried.
-  deliveryNotice(job: Job): string {
-    const run = 'the run for ' + job.label;
-    const target = this.config.routes.get(job.label)?.escalateTo;
-    if (job.escalated && target && job.escalated_after === 'no_delivery') return run + ' finished twice without a pull request and without a comment, and once more after ' + target + ', so nothing was delivered';
-    if (job.escalated && target && job.escalated_after === 'handback') return run + ' was handed back by a comment, and the run after it on ' + target + ' finished without a pull request and without a comment, so nothing was delivered';
-    return run + ' finished twice without a pull request and without a comment, so nothing was delivered';
-  }
+  // Reached from other modules and from the tests; the work is done by DeliveryCheck (delivery.ts).
+  checkDelivery(...args: Parameters<DeliveryCheck['checkDelivery']>): ReturnType<DeliveryCheck['checkDelivery']> { return this.deliveryCheck.checkDelivery(...args); }
+  checkVerdict(...args: Parameters<DeliveryCheck['checkVerdict']>): ReturnType<DeliveryCheck['checkVerdict']> { return this.deliveryCheck.checkVerdict(...args); }
 
-  // A run that failed for good must not vanish into the ledger. A worker run on an issue that ran out of iterations or time (max_iterations,
-  // stuck, timeout) means a ticket that is too big: with SPLIT_LABEL the planner is asked to split it. A paused run is an interruption and is
-  // never split. Everything else is handed to the human, on the pull request (label and mention) or, without one, as a comment on the issue.
-  // Best effort: a failing call is only logged.
-  async reportFailure(job: Job, state: string): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event || state === 'deleted' || state === 'finished') return;
-    const kind = this.config.routes.get(job.label)?.kind;
-    const what = state === 'no_delivery'
-      ? this.deliveryNotice(job)
-      : 'the run for ' + job.label + (event.pull_request ? ' on pull request #' + event.pull_request.number : '') + ' ended with "' + state + '"';
-    try {
-      const exhausted = state === 'max_iterations' || state === 'stuck' || state === 'timeout';
-      if (this.config.splitLabel && kind === 'issue' && !event.pull_request && exhausted && job.label !== this.config.splitLabel && !this.config.epicLabels.has(job.label)) {
-        const number = event.issue.number;
-        const repository = event.repository.full_name;
-        const split = await this.forge.findOrCreateLabel(repository, this.config.splitLabel, '#5319e7');
-        const present = await this.forge.labelsOf(repository, number, 'issue');
-        const failed = (present || []).find((entry) => entry.name === job.label);
-        await this.forge.addComment(repository, number, 'ForgeHands: ' + what + ', so the ticket is probably too big for one run. It goes to the planner (' + this.config.splitLabel + ') to be split into slices.', 'issue');
-        if (failed) await this.forge.removeLabel(repository, number, failed, 'issue');
-        await this.forge.addLabels(repository, number, [split], 'issue');
-        this.noteTicket(this.issueKey(event), { split_at: this.now() });
-        return;
-      }
-      const text = what + '. A human has to look at it.';
-      if (event.pull_request) await this.markForHuman(event, 'ForgeHands: ' + text, 'failed_run', { why: state });
-      else {
-        this.tell('failed', event, { why: state });
-        await this.forge.addComment(event.repository.full_name, event.issue.number, mentionOf(this.config) + 'ForgeHands: ' + text, 'issue');
-      }
-    } catch (error) {
-      this.logger.error('could not report the failure of ' + job.key + ':', error.message);
-    }
-  }
+  // Reached from other modules and from the tests; the work is done by TicketCleanup (ticket-cleanup.ts).
+  dropQueuedOf(...args: Parameters<TicketCleanup['dropQueuedOf']>): ReturnType<TicketCleanup['dropQueuedOf']> { return this.ticketCleanup.dropQueuedOf(...args); }
+  sweepClosed(...args: Parameters<TicketCleanup['sweepClosed']>): ReturnType<TicketCleanup['sweepClosed']> { return this.ticketCleanup.sweepClosed(...args); }
+  archiveOld(...args: Parameters<TicketCleanup['archiveOld']>): ReturnType<TicketCleanup['archiveOld']> { return this.ticketCleanup.archiveOld(...args); }
+  deleteOld(...args: Parameters<TicketCleanup['deleteOld']>): ReturnType<TicketCleanup['deleteOld']> { return this.ticketCleanup.deleteOld(...args); }
+
+  // Reached from other modules and from the tests; the work is done by IdleReporter (idle.ts).
+  idleCounts(...args: Parameters<IdleReporter['idleCounts']>): ReturnType<IdleReporter['idleCounts']> { return this.idleReporter.idleCounts(...args); }
+  idleState(...args: Parameters<IdleReporter['idleState']>): ReturnType<IdleReporter['idleState']> { return this.idleReporter.idleState(...args); }
+
+  // Reached from other modules and from the tests; the work is done by RunWatcher (run-watcher.ts).
+  poll(...args: Parameters<RunWatcher['poll']>): ReturnType<RunWatcher['poll']> { return this.runWatcher.poll(...args); }
+  escalateFailure(...args: Parameters<RunWatcher['escalateFailure']>): ReturnType<RunWatcher['escalateFailure']> { return this.runWatcher.escalateFailure(...args); }
+  failed(...args: Parameters<RunWatcher['failed']>): ReturnType<RunWatcher['failed']> { return this.runWatcher.failed(...args); }
+  reportFailure(...args: Parameters<RunWatcher['reportFailure']>): ReturnType<RunWatcher['reportFailure']> { return this.runWatcher.reportFailure(...args); }
+  tierRunEnded(...args: Parameters<RunWatcher['tierRunEnded']>): ReturnType<RunWatcher['tierRunEnded']> { return this.runWatcher.tierRunEnded(...args); }
+
+  // Reached from other modules and from the tests; the work is done by Scheduler (scheduler.ts).
+  get cooldowns(): Scheduler['cooldowns'] { return this.scheduler.cooldowns; }
+  pickNext(...args: Parameters<Scheduler['pickNext']>): ReturnType<Scheduler['pickNext']> { return this.scheduler.pickNext(...args); }
+  holdOf(...args: Parameters<Scheduler['holdOf']>): ReturnType<Scheduler['holdOf']> { return this.scheduler.holdOf(...args); }
+  earliestStart(...args: Parameters<Scheduler['earliestStart']>): ReturnType<Scheduler['earliestStart']> { return this.scheduler.earliestStart(...args); }
+  startJob(...args: Parameters<Scheduler['startJob']>): ReturnType<Scheduler['startJob']> { return this.scheduler.startJob(...args); }
+  clearQuotaHolds(...args: Parameters<Scheduler['clearQuotaHolds']>): ReturnType<Scheduler['clearQuotaHolds']> { return this.scheduler.clearQuotaHolds(...args); }
 }
