@@ -16,7 +16,7 @@ export interface NormalizeOptions {
   bots?: BotRules & { fixRounds: number };
   /** COMMENT_RESTARTS and HUMAN_LOGIN: a comment of this login on an issue is an event (see normalizeComment). Absent: comments are ignored. */
   comments?: { human: string };
-  /** HUMAN_REVIEW_ROUNDS in comment mode: the native reviews of this login are events (approved, rejected and comment); nobody else's are. */
+  /** Comment mode with HUMAN_LOGIN: the native reviews of this login are events (approved, rejected and comment); nobody else's are. */
   humanReviews?: { human: string };
   /** The labels of the pull request before this event (the label memory of the dispatcher), or null when none is known. */
   previousLabels?: string[] | null;
@@ -33,7 +33,7 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
   if (event === 'pull_request' && branchPushes && HEAD_ACTIONS.has(String(payload?.action))) return normalizeBranchPull(payload, allowedRepos, bots);
   // The review verdict is the forge's own (VERDICT_SOURCE review or both); a comment review is no verdict and is not an event there.
   if (reviews && REVIEW_EVENTS[String(event)] && REVIEW_EVENTS[String(event)] !== 'comment') return normalizeReview(String(event), payload, allowedRepos, bots);
-  // Comment mode with HUMAN_REVIEW_ROUNDS: only the reviews of HUMAN_LOGIN are events, whatever their verdict (see the dispatcher).
+  // Comment mode with HUMAN_LOGIN: only the reviews of HUMAN_LOGIN are events, whatever their verdict (see the dispatcher).
   if (humanReviews && REVIEW_EVENTS[String(event)]) return normalizeReview(String(event), payload, allowedRepos, bots, humanReviews.human);
   if (event === 'pull_request') return normalizePullRequest(payload, allowedRepos, prLabels, approved, bots, previousLabels);
   if (event === 'issues' && payload?.action === 'closed') return normalizeClosed(payload, allowedRepos);
@@ -88,7 +88,7 @@ export function normalizeEvent(event: unknown, payload: Json, allowedRepos: Set<
 // Forgejo sends a review as an event of its own. Its code (modules/webhook/type.go) names the types pull_request_review_approved and
 // pull_request_review_rejected (what the payload's `review.type` carries); the delivery header may carry the mapped names
 // pull_request_approved / pull_request_rejected instead (HookEventType.Event()), so both spellings are accepted. A review comment
-// (pull_request_review_comment) is read only for HUMAN_REVIEW_ROUNDS.
+// (pull_request_review_comment) is read only for the reviews of HUMAN_LOGIN in comment mode.
 const REVIEW_EVENTS: Record<string, 'approved' | 'rejected' | 'comment'> = {
   pull_request_review_approved: 'approved', pull_request_approved: 'approved',
   pull_request_review_rejected: 'rejected', pull_request_rejected: 'rejected',
@@ -96,7 +96,7 @@ const REVIEW_EVENTS: Record<string, 'approved' | 'rejected' | 'comment'> = {
 };
 
 // A native review of the pull request of an agent issue (or of a bot). The event is only a trigger: what it says is checked against the
-// reviews as Forgejo has them (Merger.reviewOf), never taken from the payload. With `human` (comment mode, HUMAN_REVIEW_ROUNDS) only a
+// reviews as Forgejo has them (Merger.reviewOf), never taken from the payload. With `human` (comment mode, HUMAN_LOGIN) only a
 // review written by that login counts; its id and commit are kept so that one review starts one round (Dispatcher.onHumanReview).
 function normalizeReview(event: string, payload: Json, allowedRepos: Set<string>, bots?: NormalizeOptions['bots'], human?: string): ForgeEvent | null {
   const pr = payload?.pull_request;

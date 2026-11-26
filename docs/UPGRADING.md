@@ -516,3 +516,17 @@ Nothing stops working. These settings are deprecated and will be removed in 1.0.
 - **`FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET`.** Rename them to `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, in the environment and in `AGENT_SECRETS`. Nothing changes for the agents: they still receive the values as `FORGEJO_URL` and `FORGEJO_TOKEN`.
 - **`HUMAN_REVIEW_ROUNDS` and `HANDBACK_HANDLING`.** In 1.0.0 both are always on. If you set either to `0`, plan for that behaviour now.
 
+## Upgrading to 1.0.0: the deprecated settings are gone
+
+The settings that warned at start since the release before are removed. A start with one of them still set **stops** with a message that names what to set instead. Check your environment for them before you upgrade:
+
+| Removed | Instead |
+| --- | --- |
+| `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_WEBHOOK_SECRET` | `FORGE_URL`, `FORGE_TOKEN` and `FORGE_WEBHOOK_SECRET`, also in `AGENT_SECRETS` (for example `AGENT_SECRETS=FORGE_TOKEN,FORGE_URL`). The agents still receive the values as `FORGEJO_URL` and `FORGEJO_TOKEN`, so prompts and scripts in the agent are unchanged. |
+| `HUMAN_REVIEW_ROUNDS` | Remove it. A request for changes of `HUMAN_LOGIN` always starts a round. |
+| `HANDBACK_HANDLING` | Remove it. A run that hands its ticket back by a comment is always handled as a hand-back. |
+
+`TIER_WEEKLY_BUDGETS` (removed in 0.4.0) is no longer mentioned at start. Setting it does nothing.
+
+**Rollback.** Go back to the last 0.x release. It reads the same ledger.
+

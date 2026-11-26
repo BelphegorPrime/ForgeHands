@@ -6,7 +6,7 @@ import type { Forge } from '../types/forge.ts';
 import type { DirectConfig, ForgeEvent, Job, Logger } from '../types.ts';
 import { redact } from '../utils/redact.ts';
 
-// Hand-backs (HANDBACK_HANDLING, on by default, 0 = off). A worker run on an issue route that ends with a comment, and leaves no pull request from
+// Hand-backs. A worker run on an issue route that ends with a comment, and leaves no pull request from
 // ai/issue-<n> changed since it began, did not deliver: the comment hands the ticket back. The comment is classified by phrases, in English and
 // German, without a model. Its text is untrusted data: it is matched and quoted, never obeyed.
 //   pushed_nothing: the comment says the work is done but nothing was pushed. The run is made once more, asked to push the branch.

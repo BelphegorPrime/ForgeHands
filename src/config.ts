@@ -212,41 +212,32 @@ function parseRepoWeights(raw: string | undefined): Map<string, number> {
   return weights;
 }
 
-// The variables that still work but go in 1.0.0, with what to do instead (see the README, "Deprecated").
-export const DEPRECATED: Record<string, string> = {
-  FORGEJO_URL: 'set FORGE_URL instead (in AGENT_SECRETS too: the agent still gets it as FORGEJO_URL)',
-  FORGEJO_TOKEN: 'set FORGE_TOKEN instead (in AGENT_SECRETS too: the agent still gets it as FORGEJO_TOKEN)',
+// Settings removed in 1.0.0, with what to set instead. One that is still set stops the start: ignoring it would leave the forge unconfigured
+// (an old name of the URL, token or secret) or change behaviour unnoticed (a switch that was set to 0).
+export const REMOVED: Record<string, string> = {
+  FORGEJO_URL: 'set FORGE_URL instead (and FORGE_URL in AGENT_SECRETS: the agent still gets it as FORGEJO_URL)',
+  FORGEJO_TOKEN: 'set FORGE_TOKEN instead (and FORGE_TOKEN in AGENT_SECRETS: the agent still gets it as FORGEJO_TOKEN)',
   FORGEJO_WEBHOOK_SECRET: 'set FORGE_WEBHOOK_SECRET instead',
-  HUMAN_REVIEW_ROUNDS: 'a request for changes of HUMAN_LOGIN will always start a round',
-  HANDBACK_HANDLING: 'a run that hands its ticket back by a comment will always be handled as a hand-back'
+  HUMAN_REVIEW_ROUNDS: 'a request for changes of HUMAN_LOGIN always starts a round; remove the variable',
+  HANDBACK_HANDLING: 'a run that hands its ticket back by a comment is always handled as a hand-back; remove the variable'
 };
 
-// The neutral FORGE_* name and its FORGEJO_* alias say the same thing. Both set and different is a mistake worth stopping for.
-export function forgeEnv(env: NodeJS.ProcessEnv, neutral: string, alias: string): string | undefined {
-  const a = env[neutral] || undefined;
-  const b = env[alias] || undefined;
-  if (a && b && a !== b) throw new Error(neutral + ' and ' + alias + ' are both set, with different values; set only ' + neutral);
-  return a ?? b;
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger = console): Config {
-  // Removed in 0.4.0: a weekly cost cap per tier. Ignored (not an error) so that an existing setup still starts.
-  if (env.TIER_WEEKLY_BUDGETS) logger.error('TIER_WEEKLY_BUDGETS is ignored, it was removed in 0.4.0 (max_budget of a route still caps one run)');
-  // Deprecated: still read, removed in 1.0.0 (README, "Stability and versioning"). Said once at start, so the operator can move in time.
-  for (const [name, why] of Object.entries(DEPRECATED)) if (env[name] !== undefined && env[name] !== '') logger.error('warning: ' + name + ' is deprecated and will be removed in 1.0.0: ' + why);
+  for (const [name, instead] of Object.entries(REMOVED)) {
+    if (env[name] !== undefined && env[name] !== '') throw new Error(name + ' was removed in 1.0.0: ' + instead + ' (see docs/UPGRADING.md)');
+  }
   const forge = (env.FORGE || 'forgejo').trim().toLowerCase();
   if (!(FORGES as readonly string[]).includes(forge)) throw new Error('FORGE must be ' + FORGES.slice(0, -1).join(', ') + ' or ' + FORGES.at(-1) + ', not ' + forge);
-  // FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names; FORGEJO_* keep working.
-  const forgeUrl = forgeEnv(env, 'FORGE_URL', 'FORGEJO_URL');
-  const forgeToken = forgeEnv(env, 'FORGE_TOKEN', 'FORGEJO_TOKEN');
-  const forgejoSecret = forgeEnv(env, 'FORGE_WEBHOOK_SECRET', 'FORGEJO_WEBHOOK_SECRET') || '';
+  const forgeUrl = env.FORGE_URL || undefined;
+  const forgeToken = env.FORGE_TOKEN || undefined;
+  const forgejoSecret = env.FORGE_WEBHOOK_SECRET || '';
   const openhandsSecret = env.OPENHANDS_WEBHOOK_SECRET || '';
   const allowedRepos = new Set((env.ALLOWED_REPOS || '')
     .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
   const direct = Boolean(env.OPENHANDS_API_URL);
   if (!direct && (env.E2E_REPO || '').trim()) throw new Error('E2E_REPO needs direct mode (OPENHANDS_API_URL): the suite runs through the ForgeHands dispatcher');
 
-  const secretName = env.FORGE_WEBHOOK_SECRET ? 'FORGE_WEBHOOK_SECRET' : 'FORGEJO_WEBHOOK_SECRET';
+  const secretName = 'FORGE_WEBHOOK_SECRET';
   if (forgejoSecret.length < 16) throw new Error(secretName + ' must be at least 16 characters');
   // A GitLab signing token (whsec_<base64>) carries a key of its own: one that does not decode to at least 24 bytes is a copy mistake.
   if (forgejoSecret.startsWith('whsec_')) {
@@ -435,8 +426,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     ticketPreflight: ticketPreflightOf(env.TICKET_PREFLIGHT),
     // TICKET_PREFLIGHT_BLOCK: the rules whose findings reject a ticket (default 2,3); the other findings are advisory and go into the prompt.
     ticketPreflightBlock: ticketPreflightBlockOf(env.TICKET_PREFLIGHT_BLOCK),
-    // HANDBACK_HANDLING (1 by default, 0 = off): a worker run that ends with a comment and no pull request is handed back (src/agent/handback.ts).
-    handbackHandling: handbackHandlingOf(env.HANDBACK_HANDLING),
     // Finished runs are archived in OpenHands (tag archived=true, the other tags stay) this many days after they ended; 0 switches it off.
     archiveAfterDays: archiveDays(env.ARCHIVE_AFTER_DAYS),
     // REVERT_RETRIES (default 1, 0 = off, at most 5): after a revert of a ticket's merge is merged, the ticket is reopened and started again this many times.
@@ -471,8 +460,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     commentRestarts: commentRestartsOf(env.COMMENT_RESTARTS),
     // PLAN_ANSWER_RESTARTS: 0 to 20, default 5; a comment of HUMAN_LOGIN answers a planner that finished without sub-issues (0 switches it off).
     planAnswerRestarts: wholeOf(env.PLAN_ANSWER_RESTARTS, 5, 'PLAN_ANSWER_RESTARTS', 20),
-    // HUMAN_REVIEW_ROUNDS: a request for changes of HUMAN_LOGIN on an agent pull request starts a round in comment mode too. Off without HUMAN_LOGIN.
-    humanReviewRounds: humanReviewRoundsOf(env.HUMAN_REVIEW_ROUNDS) && parseHumanLogin(env.HUMAN_LOGIN) !== null,
     // NUDGE_AT_PERCENT: a worker run that has used this share of its iteration limit without a branch ai/issue-<n> is told to stop exploring and
     // push (once per run). 0 switches it off. NUDGE_MESSAGE replaces the text of that message.
     nudgeAtPercent: nudgePercentOf(env.NUDGE_AT_PERCENT),
@@ -594,20 +581,6 @@ function failureEscalateOf(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '1') return true;
   if (value === '0') return false;
   throw new Error('FAILURE_ESCALATE must be 0 or 1');
-}
-
-// HANDBACK_HANDLING: a 0/1 switch that is on unless set to 0; any other value is a mistake worth a clear message.
-function handbackHandlingOf(value: string | undefined): boolean {
-  if (value === undefined || value === '' || value === '1') return true;
-  if (value === '0') return false;
-  throw new Error('HANDBACK_HANDLING must be 0 or 1');
-}
-
-// HUMAN_REVIEW_ROUNDS: 1 (default) or 0; any other value is a mistake worth a clear message.
-function humanReviewRoundsOf(value: string | undefined): boolean {
-  if (value === undefined || value === '' || value === '1') return true;
-  if (value === '0') return false;
-  throw new Error('HUMAN_REVIEW_ROUNDS must be 0 or 1');
 }
 
 // REVERT_RATE_ALERT: a percentage from 0 (off) to 100, default off; a decimal share is allowed (0.5).

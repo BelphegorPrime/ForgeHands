@@ -42,24 +42,21 @@ test('FORGE defaults to forgejo, and an unsupported forge is refused with a clea
   assert.throws(() => loadConfig(env({ FORGE: 'github' })), /FORGE must be forgejo, gitea or gitlab, not github/);
 });
 
-test('FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET are the neutral names of the FORGEJO_* settings', () => {
-  const neutral = loadConfig(env());
-  assert.equal(neutral.forgejoSecret, 'forge-test-secret-long-enough');
-  assert.deepEqual(neutral.forgejo, { url: 'https://forge.example', token: 'tok-secret-value' });
-  const legacy = loadConfig(env({ FORGE_WEBHOOK_SECRET: undefined, FORGE_URL: undefined, FORGE_TOKEN: undefined,
-    FORGEJO_WEBHOOK_SECRET: 'legacy-secret-long-enough', FORGEJO_URL: 'https://old.example', FORGEJO_TOKEN: 'old-token' }));
-  assert.equal(legacy.forgejoSecret, 'legacy-secret-long-enough');
-  assert.deepEqual(legacy.forgejo, { url: 'https://old.example', token: 'old-token' });
-  // The same value under both names is fine.
-  assert.equal(loadConfig(env({ FORGEJO_URL: 'https://forge.example/' })).forgejo.url, 'https://forge.example');
+test('FORGE_URL, FORGE_TOKEN and FORGE_WEBHOOK_SECRET configure the forge', () => {
+  const config = loadConfig(env());
+  assert.equal(config.forgejoSecret, 'forge-test-secret-long-enough');
+  assert.deepEqual(config.forgejo, { url: 'https://forge.example', token: 'tok-secret-value' });
 });
 
-test('a neutral name and its FORGEJO_* alias with different values are an error, and the validation names the setting', () => {
-  assert.throws(() => loadConfig(env({ FORGEJO_URL: 'https://other.example' })), /FORGE_URL and FORGEJO_URL are both set, with different values/);
-  assert.throws(() => loadConfig(env({ FORGEJO_TOKEN: 'another' })), /FORGE_TOKEN and FORGEJO_TOKEN/);
-  assert.throws(() => loadConfig(env({ FORGEJO_WEBHOOK_SECRET: 'another-secret-long-enough' })), /FORGE_WEBHOOK_SECRET and FORGEJO_WEBHOOK_SECRET/);
+test('the settings removed in 1.0.0 stop the start when they are still set, and say what to set instead', () => {
+  assert.throws(() => loadConfig(env({ FORGEJO_URL: 'https://forge.example/' })), /FORGEJO_URL was removed in 1\.0\.0: set FORGE_URL instead .*AGENT_SECRETS/);
+  assert.throws(() => loadConfig(env({ FORGEJO_TOKEN: 'tok-secret-value' })), /FORGEJO_TOKEN was removed in 1\.0\.0: set FORGE_TOKEN instead/);
+  assert.throws(() => loadConfig(env({ FORGEJO_WEBHOOK_SECRET: 'forge-test-secret-long-enough' })), /FORGEJO_WEBHOOK_SECRET was removed in 1\.0\.0: set FORGE_WEBHOOK_SECRET instead/);
+  assert.throws(() => loadConfig(env({ HUMAN_REVIEW_ROUNDS: '1' })), /HUMAN_REVIEW_ROUNDS was removed in 1\.0\.0: .*remove the variable/);
+  assert.throws(() => loadConfig(env({ HANDBACK_HANDLING: '0' })), /HANDBACK_HANDLING was removed in 1\.0\.0: .*remove the variable/);
+  assert.doesNotThrow(() => loadConfig(env({ FORGEJO_URL: '' })), 'an empty one is not set');
   assert.throws(() => loadConfig(env({ FORGE_URL: 'ftp://x' })), /FORGE_URL/);
-  assert.throws(() => loadConfig(env({ FORGE_WEBHOOK_SECRET: 'short' })), /at least 16/);
+  assert.throws(() => loadConfig(env({ FORGE_WEBHOOK_SECRET: 'short' })), /FORGE_WEBHOOK_SECRET must be at least 16/);
 });
 
 test('MERGE_POLICY and REMIND_AFTER_DAYS accept the neutral names', () => {
@@ -70,8 +67,6 @@ test('MERGE_POLICY and REMIND_AFTER_DAYS accept the neutral names', () => {
 test('AGENT_SECRETS hands the neutral names to the agent under the names its prompt uses', () => {
   const config = loadConfig(env({ AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL' }));
   assert.deepEqual(config.agentSecrets, { FORGEJO_TOKEN: 'tok-secret-value', FORGEJO_URL: 'https://forge.example/' });
-  const legacy = loadConfig(env({ FORGE_URL: undefined, FORGE_TOKEN: undefined, FORGEJO_URL: 'https://old.example', FORGEJO_TOKEN: 'old', AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL' }));
-  assert.deepEqual(legacy.agentSecrets, { FORGEJO_TOKEN: 'old', FORGEJO_URL: 'https://old.example' });
   assert.throws(() => loadConfig(env({ FORGE_TOKEN: undefined, AGENT_SECRETS: 'FORGE_TOKEN' })), /AGENT_SECRETS names FORGE_TOKEN, but it is not set/);
 });
 
@@ -179,17 +174,3 @@ test('a fake forge drives the merger: review comment, status, files and merge go
   assert.ok(forge.calls.includes('closeIssue(26)'));
 });
 
-test('deprecated settings still work and say once at start that they go in 1.0.0, with what to do instead', () => {
-  const lines = [];
-  const logger = { error: (...args) => lines.push(args.join(' ')) };
-  const legacy = loadConfig(env({ FORGE_URL: undefined, FORGE_TOKEN: undefined, FORGEJO_URL: 'https://old.example', FORGEJO_TOKEN: 'old', AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL', HANDBACK_HANDLING: '0', HUMAN_REVIEW_ROUNDS: '0' }), logger);
-  assert.equal(legacy.forgejo.url, 'https://old.example', 'the alias still works');
-  assert.equal(legacy.handbackHandling, false, 'and so does the switch');
-  assert.ok(lines.some((line) => /^warning: FORGEJO_URL is deprecated and will be removed in 1\.0\.0: set FORGE_URL instead/.test(line)));
-  assert.ok(lines.some((line) => /^warning: FORGEJO_TOKEN is deprecated .*\(in AGENT_SECRETS too/.test(line)));
-  assert.ok(lines.some((line) => /^warning: HANDBACK_HANDLING is deprecated/.test(line)));
-  assert.ok(lines.some((line) => /^warning: HUMAN_REVIEW_ROUNDS is deprecated/.test(line)));
-  const quiet = [];
-  loadConfig(env(), { error: (...args) => quiet.push(args.join(' ')) });
-  assert.deepEqual(quiet.filter((line) => /deprecated/.test(line)), [], 'the neutral names warn about nothing');
-});

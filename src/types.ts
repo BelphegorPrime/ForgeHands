@@ -69,7 +69,7 @@ export interface ForgejoAccess {
 interface BaseConfig {
   /** FORGE: which forge ForgeHands talks to. */
   forge: ForgeKind;
-  /** The webhook secret (FORGE_WEBHOOK_SECRET or FORGEJO_WEBHOOK_SECRET); the field keeps its first name. */
+  /** The webhook secret (FORGE_WEBHOOK_SECRET); the field keeps its first name. */
   forgejoSecret: string;
   allowedRepos: Set<string>;
   allowedSenders: Set<string> | null;
@@ -156,8 +156,6 @@ export interface DirectConfig extends BaseConfig {
   ticketPreflight: boolean;
   /** TICKET_PREFLIGHT_BLOCK: the rule numbers (1 to 4) whose findings reject a ticket; the other findings are advisory. Default [2, 3]. */
   ticketPreflightBlock: number[];
-  /** HANDBACK_HANDLING (on by default, 0 = off): a worker run that ends with a comment instead of a pull request is a hand-back, not a delivery (src/agent/handback.ts). */
-  handbackHandling: boolean;
   archiveAfterDays: number;
   /** REVERT_RETRIES (0 = off, at most 5): how often a ticket whose change was reverted after a red default branch is started again. See Dispatcher.revertMerged. */
   revertRetries: number;
@@ -188,8 +186,6 @@ export interface DirectConfig extends BaseConfig {
   commentRestarts: number;
   /** PLAN_ANSWER_RESTARTS: a planner that finished without sub-issues starts again on a comment of HUMAN_LOGIN (0: off). See Dispatcher.planAnswer. */
   planAnswerRestarts: number;
-  /** HUMAN_REVIEW_ROUNDS (comment mode, needs HUMAN_LOGIN): a formal request for changes of HUMAN_LOGIN starts a follow-up round. */
-  humanReviewRounds: boolean;
   /** STALL_ALERT_MINUTES: a notification when nothing has started for this long while work waits on a hold that is not a dependency (0 = off). */
   stallAlertMinutes: number;
   /** NUDGE_AT_PERCENT: the share of a worker run's iteration limit after which, without a branch ai/issue-<n>, the run is nudged (0 = off). */
@@ -523,7 +519,7 @@ export interface Job {
   synced_at?: number;
   error_retry?: number;
   delivery_retry?: number;
-  /** HANDBACK_HANDLING: the run was made once more because it handed the ticket back with "done, but nothing pushed" (once per job); the next run is told to push. */
+  /** A hand-back: the run was made once more because it handed the ticket back with "done, but nothing pushed" (once per job); the next run is told to push. */
   handback_retry?: boolean;
   handback_push?: boolean;
   /** The run delivered as a comment of the agent on this issue, which the run's issue blocks (its parent). */
