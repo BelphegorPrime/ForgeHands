@@ -44,7 +44,7 @@ function fullLedger() {
 async function roundTrip(content) {
   const file = join(dir, 'jobs.json');
   await writeFile(file, JSON.stringify(content));
-  const store = new JobStore(file);
+  const store = new JobStore(file, { error() {} });
   await store.load();
   await store.persist(NOW);
   return { store, saved: JSON.parse(await readFile(file, 'utf8')) };
@@ -87,4 +87,36 @@ test('a missing ledger file is an empty ledger, and a file without a job list is
   assert.equal(store.list().length, 0);
   await writeFile(join(dir, 'broken.json'), JSON.stringify({ version: 2 }));
   await assert.rejects(new JobStore(join(dir, 'broken.json')).load(), /Invalid job store/);
+});
+
+test('a ledger file without a version is read as version 2, as before versions were checked', async () => {
+  const { version, ...rest } = fullLedger();
+  const { saved } = await roundTrip(rest);
+  assert.deepEqual(saved.jobs.map((entry) => entry.id), ['a', 'active-old']);
+  assert.equal(saved.version, 2);
+});
+
+test('a ledger written by a newer ForgeHands stops the start with a clear message and is left as it is', async () => {
+  const file = join(dir, 'jobs.json');
+  const text = JSON.stringify({ ...fullLedger(), version: 3 });
+  await writeFile(file, text);
+  await assert.rejects(new JobStore(file).load(), /written by a newer ForgeHands \(version 3, this one reads up to 2\)/);
+  assert.equal(await readFile(file, 'utf8'), text, 'nothing is written');
+  await writeFile(file, JSON.stringify({ ...fullLedger(), version: 'two' }));
+  await assert.rejects(new JobStore(file).load(), /Invalid job store: version "two"/);
+});
+
+test('every invalid entry dropped on load is logged with its collection and key', async () => {
+  const file = join(dir, 'jobs.json');
+  await writeFile(file, JSON.stringify(fullLedger()));
+  const lines = [];
+  await new JobStore(file, { error: (...args) => lines.push(args.join(' ')) }).load();
+  assert.deepEqual(lines.sort(), [
+    'ledger: dropped an invalid entry of dedupe (bad)', 'ledger: dropped an invalid entry of deleted_in_forge (bad)', 'ledger: dropped an invalid entry of epic_gaps (bad)',
+    'ledger: dropped an invalid entry of epic_sweeps (bad)', 'ledger: dropped an invalid entry of filed_findings (bad)', 'ledger: dropped an invalid entry of findings (2)',
+    'ledger: dropped an invalid entry of gone_checks (bad)', 'ledger: dropped an invalid entry of holds (bad)', 'ledger: dropped an invalid entry of jobs (3)',
+    'ledger: dropped an invalid entry of labels (bad)', 'ledger: dropped an invalid entry of merges (2)', 'ledger: dropped an invalid entry of operator_tickets (bad)',
+    'ledger: dropped an invalid entry of reruns (2)', 'ledger: dropped an invalid entry of reverts (2)', 'ledger: dropped an invalid entry of stalled (bad)',
+    'ledger: dropped an invalid entry of stuck (bad)'
+  ]);
 });

@@ -58,7 +58,7 @@ docker compose ps
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-`compose.yaml` binds the port to `127.0.0.1`. To accept webhooks from another host, use a secured reverse proxy and an explicit network policy. To run without Docker: `npm start`. To build a local image: `docker build -t forgehands:local .` and `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`. Keep registry and webhook secrets out of committed files. The data directory (`DATA_FILE`, `JOBS_FILE`) is a volume in `compose.yaml`; the ledger in it is what survives a restart.
+`compose.yaml` binds the port to `127.0.0.1`. To accept webhooks from another host, use a secured reverse proxy and an explicit network policy. To run without Docker: `npm start`. To build a local image: `docker build -t forgehands:local .` and `FORGEHANDS_IMAGE=forgehands:local docker compose up -d`. Keep registry and webhook secrets out of committed files. The data directory (`DATA_FILE`, `JOBS_FILE`) is a volume in `compose.yaml`; the ledger in it is what survives a restart. The ledger file says which format version it has. A ledger written by a newer ForgeHands stops the start of an older one with a message, instead of being read and saved with what the older one does not know dropped, so a rollback keeps the file intact. An entry that is not valid is left out on load, and the log says which one (`ledger: dropped an invalid entry of <collection> (<key>)`).
 
 ### Endpoints
 
