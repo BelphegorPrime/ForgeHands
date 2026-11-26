@@ -39,6 +39,7 @@ import { WaitKeeper } from './wait-keeper.ts';
 import { RevertKeeper } from './revert-keeper.ts';
 import { BranchRefresher } from './branch-refresh.ts';
 import { SecurityReview } from './security-review.ts';
+import { DeliveryCheck } from './delivery.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -93,6 +94,7 @@ export class Dispatcher {
   revertKeeper: RevertKeeper = new RevertKeeper(this);
   branchRefresher: BranchRefresher = new BranchRefresher(this);
   securityReview: SecurityReview = new SecurityReview(this);
+  deliveryCheck: DeliveryCheck = new DeliveryCheck(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -1099,136 +1101,6 @@ export class Dispatcher {
     }
   }
 
-  // A worker run on a ticket that ends as `finished` is not a delivery. A model that answers in words without a tool call can "finish" in a minute
-  // with nothing done, and the ticket then waits for ever (several tickets did). A run on an issue (not a plan or an epic) must leave a pull request
-  // from the branch ai/issue-<n> that was created or changed since the run started, or a comment on the issue written since then, or close the issue.
-  // Otherwise the run is made once more; after the second empty run a human is called. Best effort: when the forge cannot be read nothing happens.
-  async checkDelivery(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event || event.pull_request || event.type === 'epic.done' || !job.started) return;
-    if (this.config.epicLabels.has(job.label) || (event.issue.labels || []).some((name) => this.config.epicLabels.has(name))) return;
-    try {
-      const since = job.started - 60000;
-      const repository = event.repository.full_name;
-      const issue = await this.forge.getIssue(repository, event.issue.number);
-      // A ticket that is closed (by the run, or by a person) is delivered: a comment on its parent is then the report, see parentComment below.
-      if (!issue || issue.state !== 'open') return;
-      const branch = 'ai/issue-' + event.issue.number;
-      const pulls = await this.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
-      if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
-      // A need only the operator can meet, with an operator ticket this ticket depends on: the ticket waits, and that is no failed delivery.
-      const prerequisites = await this.operatorDependencies(repository, event.issue.number);
-      if (prerequisites.length) { await this.waitForOperator(job, prerequisites); return; }
-      const comments = await this.forge.listComments(repository, event.issue.number, 50);
-      // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
-      const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
-      const handback = this.config.handbackHandling && written.length ? handbackOf(written) : null;
-      if (written.length && !handback) return;
-      if (this.superseded(job)) return;
-      if (handback) {
-        await this.handback.handle(job, handback.kind, handback.text);
-        return;
-      }
-      // A comment on the parent (the issue this one blocks) is no delivery while this ticket is open: the ticket has no pull request and is not
-      // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
-      const parent = await this.parentComment(event, since);
-      if (this.superseded(job)) return;
-      if (parent && this.config.handbackHandling) {
-        this.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
-        await this.handback.handle(job, classifyHandback(parent.text) === 'blocker' ? 'blocker' : 'pushed_nothing', parent.text);
-        return;
-      }
-      if (!job.delivery_retry) {
-        Object.assign(job, { status: 'queued', delivery_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error(job.key + ' finished without a pull request or a comment, running it once more');
-        return;
-      }
-      if (this.escalateDelivery(job)) return;
-      Object.assign(job, { status: 'failed', result: 'no_delivery' });
-      this.tierRunEnded(job, 'no_delivery');
-      await this.reportFailure(job, 'no_delivery');
-    } catch (error) {
-      this.logger.error('could not check what ' + job.key + ' delivered:', error.message);
-    }
-  }
-
-  // A label set while the ended run was being looked at (the forge reads above take a while) has queued a fresh run of the same ticket. That run
-  // takes over: running the old one once more, escalating it or calling a human would put two agents on one branch.
-  superseded(job: Job): boolean {
-    const other = this.jobs.activeByKey(job.key);
-    if (!other || other === job) return false;
-    this.logger.error(job.key + ': a fresh run was queued while the last one was looked at, it takes over');
-    return true;
-  }
-
-  // The second empty run of an issue whose route has escalate_to starts once more on the profile of that route (FAILURE_ESCALATE), on the same
-  // ticket: a fresh run, `escalated` and `escalated_after` no_delivery. It is counted as the escalation and the target's tier like any escalated
-  // run. The escalated run keeps delivery_retry, so when it also ends empty the human is called at once (no third run). Returns true when queued.
-  escalateDelivery(job: Job): boolean {
-    // The route the ticket was started with (job.label): a run on the fallback route (job.fell_back) escalates like any other.
-    const route = this.config.routes.get(job.label);
-    if (!this.config.failureEscalate || !route?.escalateTo || job.escalated) return false;
-    Object.assign(job, { status: 'queued', escalated: true, failure_escalation: true, escalated_after: 'no_delivery', started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-    metrics.inc('forgehands_failure_escalations_total');
-    this.logger.error(job.key + ': no delivery twice, starting once more on ' + route.escalateTo);
-    return true;
-  }
-
-  // The newest comment of the agent since the run began on a parent (an issue this one blocks), with the parent's number, or null. A read that fails
-  // counts as no comment: an unknown answer never reads as delivered.
-  async parentComment(event: ForgeEvent, since: number): Promise<{ number: number; text: string } | null> {
-    let login: string | null;
-    let parents: Json;
-    try {
-      login = (await this.forge.agentLogin?.()) ?? null;
-      if (!login) return null;
-      parents = await this.forge.blocks(event.repository.full_name, event.issue.number);
-    } catch (error) {
-      this.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message);
-      return null;
-    }
-    for (const parent of Array.isArray(parents) ? parents : []) {
-      try {
-        const comments = await this.forge.listComments(event.repository.full_name, parent.number, 50);
-        const own = comments.filter((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since);
-        if (own.length) return { number: parent.number, text: String(own.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0].body ?? '') };
-      } catch (error) {
-        this.logger.error('could not read the comments of #' + parent.number + ':', error.message);
-      }
-    }
-    return null;
-  }
-
-  // A review run that ended without a verdict (neither the approval nor the changes label) would leave the pull request standing
-  // for ever, green and unseen. Unless it moved on meanwhile, run it once more; after the second miss hand it to a human.
-  async checkVerdict(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
-      const names = (pr.labels || []).map((label: Json) => label.name);
-      // No worker fixes a bot's pull request (BOT_FIX_ROUNDS is 0): a review that asks for changes hands it to a human, as the reviewer should have.
-      if (event.bot && !this.config.botFixRounds && names.includes(this.config.changesLabel) && ![this.config.approvedLabel, this.config.blockedLabel].some((name) => names.includes(name))) {
-        await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' asks for changes to this dependency update, and no worker fixes bot pull requests. A human has to look at it.', 'bot_pull_request');
-        return;
-      }
-      if ([this.config.approvedLabel, this.config.changesLabel, this.config.blockedLabel].some((name) => names.includes(name)) && this.config.verdictSource !== 'review') return;
-      // Native reviews: any approval or request for changes on the head commit is a verdict (the webhook of the review does the rest).
-      if (this.config.verdictSource !== 'comment' && (await this.merger.nativeReviews(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)).any) return;
-      if (this.config.verdictSource === 'review' && names.includes(this.config.blockedLabel)) return;
-      // The first time, review once more: such a run mostly ends early (a blind command, a spent iteration budget), not for good.
-      if (!job.verdict_retry) {
-        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error('review ' + job.key + ' ended without a verdict, running it once more');
-        return;
-      }
-      await this.markForHuman(event, 'ForgeHands: the review of commit ' + event.ci.commit_sha.slice(0, 8) + ' ended twice without a verdict (' + (this.config.verdictSource === 'review' ? 'no approving or rejecting review' : 'no ' + this.config.approvedLabel + ' and no ' + this.config.changesLabel) + '). A human has to look at this pull request, or push a commit to start the review again.', 'no_verdict');
-    } catch (error) {
-      this.logger.error('could not check the verdict of #' + event.pull_request.number + ':', error.message);
-    }
-  }
-
   // The hold on a tier lives in memory and is gone after a restart; the wait of a job that was queued again for a rate limit lives in the
   // ledger. A restart clears both, so that it means "try again now" (the quota may be back, or the model was changed). If the model is still
   // out of quota the first attempt fails again and sets the hold anew (a counter keeps that from going on for ever).
@@ -1801,10 +1673,10 @@ export class Dispatcher {
       await this.branchRefresher.checkBranchAfterRun(job);
       await this.waitKeeper.releaseFileWaits();
       const done = this.config.routes.get(job.label)?.kind;
-      if (done === 'ci_success') await this.checkVerdict(job);
+      if (done === 'ci_success') await this.deliveryCheck.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.securityReview.checkSecurityReview(job); else await this.securityReview.handOverAfterSecurity(job); }
       else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
-      else if (done === 'issue') await this.checkDelivery(job);
+      else if (done === 'issue') await this.deliveryCheck.checkDelivery(job);
       else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
       else if (done === 'epic_done') await this.epicGaps.review(job);
       // A replan run of an epic (EPIC_GAP_REPLAN) that ended: its sub-issues decide whether the epic waits, is reviewed once more, or goes to a human.
@@ -2031,4 +1903,8 @@ export class Dispatcher {
   onMainMoved(...args: Parameters<BranchRefresher['onMainMoved']>): ReturnType<BranchRefresher['onMainMoved']> { return this.branchRefresher.onMainMoved(...args); }
   refreshPull(...args: Parameters<BranchRefresher['refreshPull']>): ReturnType<BranchRefresher['refreshPull']> { return this.branchRefresher.refreshPull(...args); }
   checkBranchAfterRun(...args: Parameters<BranchRefresher['checkBranchAfterRun']>): ReturnType<BranchRefresher['checkBranchAfterRun']> { return this.branchRefresher.checkBranchAfterRun(...args); }
+
+  // Reached from other modules and from the tests; the work is done by DeliveryCheck (delivery.ts).
+  checkDelivery(...args: Parameters<DeliveryCheck['checkDelivery']>): ReturnType<DeliveryCheck['checkDelivery']> { return this.deliveryCheck.checkDelivery(...args); }
+  checkVerdict(...args: Parameters<DeliveryCheck['checkVerdict']>): ReturnType<DeliveryCheck['checkVerdict']> { return this.deliveryCheck.checkVerdict(...args); }
 }
