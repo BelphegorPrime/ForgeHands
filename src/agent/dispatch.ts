@@ -40,6 +40,7 @@ import { RevertKeeper } from './revert-keeper.ts';
 import { BranchRefresher } from './branch-refresh.ts';
 import { SecurityReview } from './security-review.ts';
 import { DeliveryCheck } from './delivery.ts';
+import { TicketCleanup } from './ticket-cleanup.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -74,11 +75,6 @@ export class Dispatcher {
   recurring: RecurringFindings;
   /** The digest of this local date is done (sent, or nothing to send) in a dry run, where the ledger is not written. */
   digestDone: string | undefined;
-  lastArchive = 0;
-  /** Earliest time of the next look for closed issues (sweepClosed) and when each ticket was last found open. */
-  nextClosedSweep = 0;
-  closedChecked = new Map<string, number>();
-  closeRefused = new Map<string, number>(); // repository#issue -> until when a refused close is not tried again
   cooldowns = new Map<string, number>(); // tier -> until when its model is out of quota (not kept across a restart: the next error sets it again)
   /** What holds the work back in the last pass that started nothing while something waited (null: nothing waits or the last pass started something). */
   idle: IdleState | null = null;
@@ -95,6 +91,7 @@ export class Dispatcher {
   branchRefresher: BranchRefresher = new BranchRefresher(this);
   securityReview: SecurityReview = new SecurityReview(this);
   deliveryCheck: DeliveryCheck = new DeliveryCheck(this);
+  ticketCleanup: TicketCleanup = new TicketCleanup(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -116,9 +113,9 @@ export class Dispatcher {
     this.reminder = new Reminder(config, jobs, send, logger, this.merger, this.dry);
     this.reminder.notifier = this.notifier;
     this.workspace = new Workspace(config, jobs, { logger, now, notifier: this.notifier });
-    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.markClosed(ticket), now, (ticket) => this.dropDeletedTicket(ticket),
-      (repository, number) => this.ticketGone(repository, number));
-    this.reminder.deleted = (repository, number) => this.checkAndDropDeleted(repository, number);
+    this.ledgerSync = new LedgerSync(config, jobs, this.forge, logger, (ticket) => this.ticketCleanup.markClosed(ticket), now, (ticket) => this.ticketCleanup.dropDeletedTicket(ticket),
+      (repository, number) => this.ticketCleanup.ticketGone(repository, number));
+    this.reminder.deleted = (repository, number) => this.ticketCleanup.checkAndDropDeleted(repository, number);
     // The watchdog of STUCK_PR_MINUTES (see ReviewSweep.watchStuck) hands a pull request to a human the same way a round that ran out does.
     this.sweep = new ReviewSweep(config, jobs, this.forge, this.merger, (event) => this.enqueue(event), logger, now, {
       block: (event, text, why) => this.markForHuman(event, text, why),
@@ -718,7 +715,7 @@ export class Dispatcher {
         .map((issue) => issue.number);
     } catch (error) {
       if (/HTTP 404\b/.test(error.message) && !('pull_request' in event && event.pull_request)) {
-        await this.checkAndDropDeleted(event.repository.full_name, number);
+        await this.ticketCleanup.checkAndDropDeleted(event.repository.full_name, number);
         return [];
       }
       this.logger.error('could not read the dependencies of #' + number + ':', error.message);
@@ -726,81 +723,10 @@ export class Dispatcher {
     }
   }
 
-  // Whether the forge has no such issue: a 404 on GET /issues/{n}. Any other failure throws.
-  async ticketGone(repository: string, number: number): Promise<boolean> {
-    try {
-      await this.forge.getIssue(repository, number);
-      return false;
-    } catch (error) {
-      if (/HTTP 404\b/.test(error.message)) return true;
-      throw error;
-    }
-  }
-
-  // The ticket is checked and, when the forge says it is deleted, its waiting and queued jobs are dropped. Best effort: a failed read changes nothing.
-  async checkAndDropDeleted(repository: string, number: number): Promise<boolean> {
-    try {
-      if (!(await this.ticketGone(repository, number))) return false;
-    } catch (error) {
-      this.logger.error('could not check whether #' + number + ' of ' + repository + ' still exists:', error.message);
-      return false;
-    }
-    return this.dropDeleted(repository, number, false);
-  }
-
-  // A ticket (or, with `pull`, a pull request) is deleted in the forge: its waiting and queued jobs end as `deleted`, with no comment, no hand-over
-  // and no mail. An issue's jobs are closed on the status page too (archived_view); running jobs are left alone. One log line per ticket.
-  // Dry runs change nothing.
-  async dropDeleted(repository: string, number: number, pull: boolean): Promise<boolean> {
-    if (isDry(this.config, repository)) return false;
-    const name = repository.toLowerCase();
-    const ticket = name + '#' + number;
-    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued')
-      && job.event.repository.full_name.toLowerCase() === name
-      && (pull ? job.event.pull_request?.number === number : job.key.split(':')[0] === ticket));
-    if (!jobs.length) return false;
-    const now = this.now();
-    for (const job of jobs) {
-      Object.assign(job, { status: 'deleted', finished: now, result: 'deleted' });
-      delete job.waiting_for; delete job.waiting_for_files;
-    }
-    if (!pull) this.jobs.markClosed(ticket);
-    metrics.inc('forgehands_deleted_tickets_total');
-    this.logger.error(repository + (pull ? '!pr' : '#') + number + ': deleted in the forge, its waiting jobs are dropped');
-    await this.jobs.persist(now);
-    return true;
-  }
-
   // A ticket the end-to-end suite created is left to the suite: the ticket watchdog does not restart or block it (src/e2e, ReviewSweep.watchStalled).
   // It is kept for the life of the process; a closed ticket is no candidate of the watchdog anyway.
   exemptE2eTicket(repository: string, number: number): void {
     this.e2eTickets.add(repository.toLowerCase() + '#' + number);
-  }
-
-  // The runs of an issue ("repo#n") that wait or are queued are dropped: the end-to-end suite closes its tickets this way, and a closed ticket's
-  // queued run would otherwise start later. A running run is left alone (it cannot be stopped from here). Dry runs change nothing.
-  // Returns how many were dropped.
-  async dropQueuedOf(repository: string, number: number): Promise<number> {
-    if (isDry(this.config, repository)) return 0;
-    const ticket = repository.toLowerCase() + '#' + number;
-    const jobs = this.jobs.list(true).filter((job) => (job.status === 'waiting' || job.status === 'queued') && job.key.toLowerCase().split(':')[0] === ticket);
-    if (!jobs.length) return 0;
-    const now = this.now();
-    for (const job of jobs) {
-      Object.assign(job, { status: 'deleted', finished: now, result: 'dropped: the ticket was closed before the run started' });
-      delete job.waiting_for; delete job.waiting_for_files;
-    }
-    this.jobs.markClosed(ticket);
-    this.logger.error(ticket + ': closed while its runs were queued, ' + jobs.length + ' queued run(s) dropped');
-    await this.jobs.persist(now);
-    return jobs.length;
-  }
-
-  // The same for a ticket of the ledger ("repo#n" or "repo!pr<n>"), as the ledger sync names it.
-  async dropDeletedTicket(ticket: string): Promise<boolean> {
-    const match = /^(.+?)([#!])(?:pr)?(\d+)$/.exec(ticket);
-    if (!match) return false;
-    return this.dropDeleted(match[1], Number(match[3]), match[2] === '!');
   }
 
   // An epic: an issue with an epic label, or one the ledger knows as an epic (it had a run of an epic label or of the epic review, see epic-sweep.ts).
@@ -814,7 +740,7 @@ export class Dispatcher {
   async onClosed(event: ForgeEvent): Promise<string> {
     const ticket = event.repository.full_name.toLowerCase() + '#' + event.issue.number;
     if (this.jobs.operatorTickets.delete(ticket)) await this.jobs.persist(this.now());
-    await this.markClosed(ticket);
+    await this.ticketCleanup.markClosed(ticket);
     if (!this.config.forgejo) return 'no_forgejo_access';
     await this.waitKeeper.releaseFileWaitsNow();
     let blocked: Json;
@@ -866,21 +792,21 @@ export class Dispatcher {
         if (this.revertKeeper.revertOf(repository, Number(pr.number))) continue;
         const number = Number(match[1]);
         const issue = await this.forge.getIssue(repository, number);
-        if (issue && issue.state === 'closed' && !issue.pull_request) await this.markClosed(repository.toLowerCase() + '#' + number);
+        if (issue && issue.state === 'closed' && !issue.pull_request) await this.ticketCleanup.markClosed(repository.toLowerCase() + '#' + number);
         if (!issue || issue.state !== 'open' || issue.pull_request) continue;
         // A forge may refuse to close the ticket (Forgejo answers 412 while issues it depends on are open). That must neither stop the other
         // tickets of this pass nor repeat every push (and comment every time): the refusal is remembered for six hours.
         const ticket = repository.toLowerCase() + '#' + number;
-        if ((this.closeRefused.get(ticket) || 0) > this.now()) continue;
+        if ((this.ticketCleanup.closeRefused.get(ticket) || 0) > this.now()) continue;
         try {
           await this.forge.closeIssue(repository, number);
         } catch (error) {
-          this.closeRefused.set(ticket, this.now() + 6 * 3600000);
+          this.ticketCleanup.closeRefused.set(ticket, this.now() + 6 * 3600000);
           this.logger.error('could not close #' + number + ' of ' + repository + ' (its pull request #' + pr.number + ' is merged), trying again in six hours:', error.message);
           continue;
         }
         await this.forge.addComment(repository, number, 'ForgeHands: closed, the pull request #' + pr.number + ' for this ticket is merged.', 'issue');
-        await this.markClosed(ticket);
+        await this.ticketCleanup.markClosed(ticket);
         this.noteTicket(ticket, { merged_at: Date.parse(pr.merged_at as string) || this.now(), merged_by: 'human' });
         closed += 1;
       }
@@ -1194,9 +1120,9 @@ export class Dispatcher {
     if (await this.branchRefresher.refreshMoved(now)) changed = true;
     // Two-key merges on hold (TWO_KEYS_HOLD_MINUTES): the due ones are looked at, the merge comes when the hold has ended.
     if (await this.merger.recheckHolds()) changed = true;
-    if (await this.archiveOld(now)) changed = true;
-    if (await this.deleteOld(now)) changed = true;
-    if (await this.sweepClosed(now)) changed = true;
+    if (await this.ticketCleanup.archiveOld(now)) changed = true;
+    if (await this.ticketCleanup.deleteOld(now)) changed = true;
+    if (await this.ticketCleanup.sweepClosed(now)) changed = true;
     if (await this.epicGaps.sweep(now)) changed = true;
     if (await this.reminder.run(now)) changed = true;
     if (await this.sendDigest(now)) changed = true;
@@ -1232,122 +1158,6 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('could not end the pull request of #' + number + ' after it went to ' + label + ':', error.message);
     }
-  }
-
-  // The issue ("repo#number") is closed in the forge: its jobs leave the waiting and failed lists of the status page (see JobStore.markClosed).
-  async markClosed(ticket: string): Promise<boolean> {
-    if (isDry(this.config, ticket.split('#')[0]) || !this.jobs.markClosed(ticket)) return false;
-    await this.jobs.persist(this.now()).catch((error) => this.logger.error('persist failed:', error.message));
-    return true;
-  }
-
-  // The events of a closed issue can be missed (closed by hand while ForgeHands was down, or before this was kept). Once a day and at start,
-  // look at the tickets that are in a state the status page shows as a problem (failed run, rounds used up, waiting) and mark those that the
-  // forge says are closed. At most 20 reads per pass; the rest follows in the next hourly pass. A read that fails changes nothing.
-  async sweepClosed(now: number): Promise<boolean> {
-    if (!this.config.forgejo || now < this.nextClosedSweep) return false;
-    const tickets = new Map<string, Job[]>();
-    for (const job of this.jobs.list()) if (!job.key.split(':')[0].includes('!')) tickets.set(job.key.split(':')[0], [...(tickets.get(job.key.split(':')[0]) || []), job]);
-    const candidates = [...tickets].filter(([ticket, list]) => {
-      if (isDry(this.config, ticket.split('#')[0]) || list.every((job) => job.archived_view) || list.some((job) => job.status === 'running' || job.status === 'queued')) return false;
-      const checked = this.closedChecked.get(ticket);
-      if (checked !== undefined && now - checked < 86400000) return false;
-      const rounds = list.filter((job) => ROUND_KINDS.has(this.config.routes.get(job.label)?.kind) && (job.started || job.status !== 'failed')).length;
-      return list.some((job) => job.status === 'failed' || job.status === 'waiting') || rounds >= this.config.maxRounds;
-    });
-    this.nextClosedSweep = now + (candidates.length > 20 ? 3600000 : 86400000);
-    let changed = false;
-    for (const [ticket, list] of candidates.slice(0, 20)) {
-      const [repository, number] = [list[0].event.repository.full_name, Number(ticket.split('#')[1])];
-      try {
-        const issue = await this.forge.getIssue(repository, number);
-        if (!issue) continue;
-        if (issue.state === 'closed') { if (await this.markClosed(ticket)) changed = true; }
-        else this.closedChecked.set(ticket, now);
-      } catch (error) {
-        // A 404 is the ledger sync's to decide (it marks an issue deleted in the forge after two passes): the sweep does not log it again and again.
-        if (/HTTP 404\b/.test(error.message)) { this.closedChecked.set(ticket, now); continue; }
-        this.logger.error('could not read #' + number + ' of ' + repository + ':', error.message);
-      }
-    }
-    return changed;
-  }
-
-  // Archive the conversations of runs that ended a while ago: the tag archived=true is added, every other tag stays, so the runs can still
-  // be found by issue, pull request and kind. At most once an hour and 20 at a time; a conversation that is deleted or running is skipped.
-  async archiveOld(now: number): Promise<boolean> {
-    const days = this.config.archiveAfterDays;
-    if (!days || (this.lastArchive && now - this.lastArchive < 3600000)) return false;
-    this.lastArchive = now;
-    const before = now - days * 86400000;
-    let changed = false;
-    let done = 0;
-    for (const job of this.jobs.list()) {
-      if (job.archived || !job.conversation_id || !job.finished || job.finished > before || (job.status !== 'done' && job.status !== 'failed')) continue;
-      if (isDry(this.config, job.event.repository.full_name)) continue; // a dry run archives nothing, and must not mark it as done
-      if (done++ >= 20) break;
-      try {
-        const response = await this.api('GET', '/api/conversations/' + encodeURIComponent(job.conversation_id));
-        if (response.status === 404) { job.archived = true; changed = true; continue; }
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const data = (await response.json()) as Json;
-        if ((data.execution_status || data.status) === 'running') continue;
-        const patched = await this.api('PATCH', '/api/conversations/' + encodeURIComponent(job.conversation_id), { tags: { ...(data.tags || {}), archived: 'true' } }, job.event.repository.full_name);
-        if (!patched.ok) throw new Error('HTTP ' + patched.status);
-        job.archived = true;
-        changed = true;
-      } catch (error) {
-        this.logger.error('could not archive the run of ' + job.key + ':', error.message);
-      }
-    }
-    return changed;
-  }
-
-  // DELETE_AFTER_DAYS: the step after archiving. The OpenHands conversation of an archived run that ended long enough ago is deleted (its
-  // trajectory goes); the ledger keeps the run, its result, cost and tokens, and the status page shows no conversation link for it. Kept: a run
-  // that is not terminal, a conversation another job still uses (any job of that conversation must be terminal, archived and old enough), and a
-  // ticket that is open with a nudge or a resume pending. At most DELETE_PER_PASS deletions per pass, once an hour; a failed delete is tried again on
-  // the next pass. A dry run deletes nothing. 404 means the conversation is gone already, which counts as deleted.
-  lastDelete = 0;
-  async deleteOld(now: number): Promise<boolean> {
-    const days = this.config.deleteAfterDays;
-    if (!days || (this.lastDelete && now - this.lastDelete < 3600000)) return false;
-    this.lastDelete = now;
-    const perPass = 40;
-    const cutoff = (status: string) => now - (status === 'done' ? days : this.config.deleteFailedAfterDays) * 86400000;
-    const all = this.jobs.list();
-    // The tickets with a nudge or a resume pending, and the tickets that are closed (every job of them marked archived_view).
-    const pending = new Set(all.filter((job) => job.nudge_pending || job.resume_pending).map((job) => job.key.split(':')[0]));
-    const closed = new Set(all.filter((job) => job.archived_view).map((job) => job.key.split(':')[0]));
-    const byConversation = new Map<string, Job[]>();
-    for (const job of all) if (job.conversation_id) byConversation.set(job.conversation_id, [...(byConversation.get(job.conversation_id) || []), job]);
-    let deleted = 0;
-    let kept = 0;
-    let changed = false;
-    for (const [conversation, jobs] of byConversation) {
-      if (jobs.every((job) => job.conversation_deleted)) continue;
-      // Every job of the conversation must be finished with it (terminal, archived, old enough), else a run still needs it.
-      const aged = (job: Job) => !!job.archived && !!job.finished && (job.status === 'done' || job.status === 'failed' || job.status === 'deleted') && job.finished <= cutoff(job.status);
-      if (!jobs.every((job) => job.conversation_deleted || aged(job))) continue;
-      const ticket = jobs[0].key.split(':')[0];
-      if (pending.has(ticket) && !closed.has(ticket)) { kept += 1; continue; }
-      if (deleted >= perPass) { kept += 1; continue; }
-      if (isDry(this.config, jobs[0].event.repository.full_name)) continue; // a dry run deletes nothing, and marks nothing
-      try {
-        const response = await this.api('DELETE', '/api/conversations/' + encodeURIComponent(conversation), undefined, jobs[0].event.repository.full_name);
-        if (response.status !== 404 && !response.ok) throw new Error('HTTP ' + response.status);
-        for (const job of jobs) job.conversation_deleted = true;
-        deleted += 1;
-        changed = true;
-        metrics.inc('forgehands_conversations_deleted_total');
-        this.logger.log?.(jobs[0].key + ': conversation deleted');
-      } catch (error) {
-        kept += 1;
-        this.logger.error('could not delete the conversation of ' + jobs[0].key + ', trying again on the next pass:', error.message);
-      }
-    }
-    this.logger.error('conversations: ' + deleted + ' deleted, ' + kept + ' kept');
-    return changed;
   }
 
   private route(label: string): Route {
@@ -1907,4 +1717,10 @@ export class Dispatcher {
   // Reached from other modules and from the tests; the work is done by DeliveryCheck (delivery.ts).
   checkDelivery(...args: Parameters<DeliveryCheck['checkDelivery']>): ReturnType<DeliveryCheck['checkDelivery']> { return this.deliveryCheck.checkDelivery(...args); }
   checkVerdict(...args: Parameters<DeliveryCheck['checkVerdict']>): ReturnType<DeliveryCheck['checkVerdict']> { return this.deliveryCheck.checkVerdict(...args); }
+
+  // Reached from other modules and from the tests; the work is done by TicketCleanup (ticket-cleanup.ts).
+  dropQueuedOf(...args: Parameters<TicketCleanup['dropQueuedOf']>): ReturnType<TicketCleanup['dropQueuedOf']> { return this.ticketCleanup.dropQueuedOf(...args); }
+  sweepClosed(...args: Parameters<TicketCleanup['sweepClosed']>): ReturnType<TicketCleanup['sweepClosed']> { return this.ticketCleanup.sweepClosed(...args); }
+  archiveOld(...args: Parameters<TicketCleanup['archiveOld']>): ReturnType<TicketCleanup['archiveOld']> { return this.ticketCleanup.archiveOld(...args); }
+  deleteOld(...args: Parameters<TicketCleanup['deleteOld']>): ReturnType<TicketCleanup['deleteOld']> { return this.ticketCleanup.deleteOld(...args); }
 }
