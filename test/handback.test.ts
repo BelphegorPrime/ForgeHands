@@ -280,3 +280,39 @@ test('HANDBACK_HANDLING is validated: 1 by default, 0 switches it off, anything 
   assert.equal(loadConfig({ ...base, HANDBACK_HANDLING: '0' }).handbackHandling, false);
   assert.throws(() => loadConfig({ ...base, HANDBACK_HANDLING: 'yes' }), /HANDBACK_HANDLING must be 0 or 1/);
 });
+
+// The forge reads after a run ended take a while. `t.hold()` holds the read of the issue's comments until the test lets it go, so that a
+// webhook can arrive in between, as one does in production.
+function holdComments(t) {
+  const send = t.forge.send;
+  let release; let reached;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const arrived = new Promise((resolve) => { reached = resolve; });
+  t.forge.send = async (url, request) => {
+    if (request.method === 'GET' && new URL(url).pathname === API + '/issues/26/comments') { reached(); await gate; }
+    return send(url, request);
+  };
+  return { arrived, release };
+}
+
+for (const [what, text] of [['an empty run', undefined], ['a hand-back', NOT_PUSHED]]) {
+  test(`a label set while ${what} is looked at queues the one fresh run, and the old run is not run again`, async () => {
+    const t = await setup();
+    const held = holdComments(t);
+    const ending = t.end(text);
+    await held.arrived;
+    // The human sets the label again while the ended run is being looked at: the old job is done, so this queues a fresh one.
+    assert.equal((await t.dispatcher.enqueue(event('ai:ready', 26))).status, 'queued');
+    held.release();
+    await ending;
+    await t.dispatcher.tick();
+    const active = t.jobs.list(true);
+    assert.equal(active.length, 1, 'one active run on the ticket: ' + active.map((job) => job.id + ' ' + job.status).join(', '));
+    assert.notEqual(active[0].id, t.job.id, 'the fresh run is the one that goes on');
+    assert.equal(t.job.status, 'done');
+    assert.equal(t.job.delivery_retry, undefined);
+    assert.equal(t.job.handback_retry, undefined);
+    assert.equal(t.starts().length, 2, 'the first run and the fresh one, no third');
+    assert.deepEqual(t.posted(), [], 'no human is called');
+  });
+}
