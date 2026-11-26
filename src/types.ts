@@ -565,3 +565,9 @@ export interface FiledFinding {
   issue: number;
   filed_at: number;
 }
+
+export interface ReleaseFieldContext { source: 'RELEASE_REPOS'; repository: string; field: string }
+export type ReleaseArtifact =
+  | { kind: 'container'; image: string; tagForms?: string[] }
+  | { kind: 'npm'; package: string; registry: string };
+export interface ReleaseDeployment { repository: string; file: string; pinPattern: string }
