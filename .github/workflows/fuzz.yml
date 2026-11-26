@@ -1,0 +1,39 @@
+name: Nightly replay fuzz
+
+# The replay tests run a handful of seeds in every test run. Every night they run many more, each night other ones (FUZZ_OFFSET from the
+# run number), so that a rare order of events is found without slowing npm test down. A failure names its seed: replay it with
+# FUZZ_SEED=<seed> node --test test/replay.test.ts
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Seeds per mode
+        default: "3000"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Replay fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - name: Install dev dependencies
+        run: npm ci
+
+      - name: Run the replay tests with many seeds
+        env:
+          FUZZ_SEEDS: ${{ inputs.seeds || '3000' }}
+          FUZZ_OFFSET: ${{ github.run_number }}0000
+        run: node --test test/replay.test.ts

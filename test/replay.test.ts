@@ -28,7 +28,9 @@ const DENY = (file) => file.startsWith('infra/');
 const TWO_KEYS = (file) => file.startsWith('infra/tests/');
 const SECURITY_LOGIN = 'security-bot';
 const MINUTE = 60000;
-const ISSUES = 3;
+// Issues 1 to 3 are tickets and may become epics; 4 to 6 are the sub-issues a planner creates.
+const ISSUES = 6;
+const TICKETS = 3;
 const STEPS = 40;
 const SECRET = 'forgejo-test-secret-long-enough';
 const VERDICT = (ok) => (ok ? 'Verdict: OK\n' : 'Verdict: NOT OK\n') + 'Evidence: the criterion is checked at src/a.ts line 12, bash validate.sh exits 0. '.repeat(8);
@@ -49,7 +51,9 @@ const env = (file) => ({
     'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
     'ci:failure': { profile: CHANGES, tier: 'free', on: 'ci_failure' },
     'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success' },
-    'sensitive:review': { profile: SECURITY, tier: 'strong', on: 'sensitive_review', forgejo_token_secret: 'SECURITY_TOKEN' }
+    'sensitive:review': { profile: SECURITY, tier: 'strong', on: 'sensitive_review', forgejo_token_secret: 'SECURITY_TOKEN' },
+    'epic:done': { profile: REVIEWER, tier: 'strong', on: 'epic_done' },
+    'main:red': { profile: CHANGES, tier: 'free', on: 'main_red' }
   }),
   // Two keys: infra/tests/** merges with the security review's OK, after a hold; any other infra file needs the human.
   MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['infra/**'], two_keys: ['infra/tests/**'] } }),
@@ -67,11 +71,13 @@ const env = (file) => ({
   DATA_FILE: file + '.deliveries.json'
 });
 
-// The seeds a run tries: FUZZ_SEED replays one, FUZZ_SEEDS sets how many (a handful by default, so that npm test stays fast).
+// The seeds a run tries: FUZZ_SEED replays one, FUZZ_SEEDS sets how many (a handful by default, so that npm test stays fast), and FUZZ_OFFSET
+// shifts them, so that the nightly run looks at other seeds each night.
 function seeds() {
   if (process.env.FUZZ_SEED) return [Number(process.env.FUZZ_SEED)];
   const count = Number(process.env.FUZZ_SEEDS || 8);
-  return Array.from({ length: count }, (_, index) => 1 + index * 7919);
+  const offset = Number(process.env.FUZZ_OFFSET || 0);
+  return Array.from({ length: count }, (_, index) => 1 + (index + offset) * 7919);
 }
 
 // One step of a sequence: what a human, an agent, CI or the forge does, a conversation that ends, time that passes, or (with restarts)
@@ -80,11 +86,11 @@ function steps(seed, restarts) {
   const random = prng(seed);
   const list = [];
   for (let index = 0; index < STEPS; index += 1) {
-    const number = 1 + random.int(ISSUES);
+    const number = random.next() < 0.75 ? 1 + random.int(TICKETS) : 1 + TICKETS + random.int(ISSUES - TICKETS);
     const roll = random.next();
     if (roll < 0.14) list.push({ kind: 'label', number, label: random.pick(['ai:ready', 'ai:ready', 'ai:plan']) });
     else if (roll < 0.19) list.push({ kind: 'comment', number });
-    else if (roll < 0.24) list.push({ kind: 'close', number });
+    else if (roll < 0.24) list.push({ kind: 'close', number, by: 'human' });
     else if (roll < 0.27) list.push({ kind: 'reopen', number });
     else if (roll < 0.35) list.push({ kind: 'push', number, files: random.pick(['plain', 'plain', 'twoKeys', 'twoKeys', 'human']) });
     else if (roll < 0.43) list.push({ kind: 'ci', number, outcome: random.pick(['success', 'success', 'failure']) });
@@ -92,9 +98,14 @@ function steps(seed, restarts) {
     else if (roll < 0.52) list.push({ kind: 'approve', number });
     else if (roll < 0.55) list.push({ kind: 'changes', number });
     else if (roll < 0.57) list.push({ kind: 'closePull', number });
-    else if (roll < 0.6) list.push({ kind: 'ship', number });
+    else if (roll < 0.6) list.push({ kind: 'ship', number, main: random.pick(['success', 'failure', 'none']) });
     else if (roll < 0.63) list.push({ kind: 'security', number, ok: random.next() < 0.8 });
     else if (roll < 0.65) list.push({ kind: 'hold', number, on: random.next() < 0.6 });
+    else if (roll < 0.67) list.push({ kind: 'plan', number: 1 + random.int(TICKETS) });
+    else if (roll < 0.69) list.push({ kind: 'epicVerdict', number: 1 + random.int(TICKETS), ok: random.next() < 0.6 });
+    else if (roll < 0.71) list.push({ kind: 'mainCi', outcome: random.pick(['success', 'failure', 'failure']) });
+    else if (roll < 0.73) list.push({ kind: 'revertPush' });
+    else if (roll < 0.77) list.push({ kind: 'endReruns', green: random.next() < 0.4 });
     else if (roll < 0.72) list.push({ kind: 'end', pick: random.int(1000), state: random.pick(['finished', 'finished', 'error', 'stuck', 'max_iterations']) });
     else if (restarts && roll < 0.78) list.push({ kind: 'restart' });
     else list.push({ kind: 'tick', minutes: random.pick([1, 5, 30, 240]) });
@@ -133,7 +144,8 @@ async function harness(file) {
       issue.comments.push(comment);
       await state.post(world.commentHook(step.number, comment));
     } else if (step.kind === 'close') {
-      if (issue.state !== 'open') return;
+      // A person closes tickets, not epics: an epic is closed by its review (epicVerdict), and at the end of a sequence.
+      if (issue.state !== 'open' || (step.by === 'human' && world.deps[step.number]) || (world.deps[step.number] ?? []).some((n) => world.issues[n].state === 'open')) return;
       issue.state = 'closed';
       await state.post(world.closeHook(step.number));
     } else if (step.kind === 'reopen') {
@@ -161,6 +173,8 @@ async function harness(file) {
       await apply({ kind: 'verdict', number: step.number, ok: true });
       if (pr.files.some(DENY)) await apply({ kind: 'security', number: step.number, ok: true });
       await apply({ kind: 'approve', number: step.number });
+      // A merge is a push to the default branch, and CI runs on it.
+      if (pr.merged && step.main && step.main !== 'none') { state.clock += MINUTE; await apply({ kind: 'mainCi', outcome: step.main }); }
     } else if (step.kind === 'security') {
       // The security reviewer's comment on the head commit (its own forge user, see SECURITY_REVIEWERS).
       if (!pr) return;
@@ -173,11 +187,45 @@ async function harness(file) {
       if (step.on) pr.labels.add('ai:hold'); else pr.labels.delete('ai:hold');
       world.history.push({ at: state.clock, pr: pr.number, what: step.on ? 'hold' : 'unhold' });
       await state.post(world.pullLabelHook(pr));
+    } else if (step.kind === 'plan') {
+      // The planner of an open ticket labelled ai:plan creates its sub-issues: they depend-block the ticket (now an epic) and get ai:ready.
+      if (issue.state !== 'open' || !issue.labels.has('ai:plan') || world.deps[step.number]) return;
+      const free = [4, 5, 6].filter((n) => !Object.values(world.deps).some((list) => list.includes(n)) && world.issues[n].state === 'open');
+      if (!free.length) return;
+      world.deps[step.number] = free.slice(0, 2);
+      for (const n of world.deps[step.number]) {
+        world.issues[n].labels.add('ai:ready');
+        await state.post(world.labelHook(n));
+      }
+    } else if (step.kind === 'epicVerdict') {
+      // The epic review's one comment: every criterion met closes the epic (the forge refuses while a sub-issue is open), else it names the gap.
+      if (issue.state !== 'open' || !world.deps[step.number]) return;
+      world.comments += 1;
+      issue.comments.push({ id: world.comments, created_at: new Date(state.clock).toISOString(), user: { login: 'openhands' }, body: step.ok ? 'All criteria are met.' : 'Missing: the second criterion.' });
+      if (step.ok && world.deps[step.number].every((n) => world.issues[n].state === 'closed')) await apply({ kind: 'close', number: step.number });
+    } else if (step.kind === 'mainCi') {
+      // CI ran on the tip of the default branch.
+      const sha = world.branches.main;
+      world.statuses[sha] = step.outcome;
+      await state.post(world.mainCiHook(sha, step.outcome));
+    } else if (step.kind === 'revertPush') {
+      // The revert agent pushes the revert of the newest merge, when a revert run is going.
+      const reverting = state.jobs.list('running').some((job) => job.label === 'main:red');
+      const merged = Object.values(world.pulls).filter((entry) => entry.merged && !entry.revertOf).at(-1);
+      if (reverting && merged) world.pushRevert(merged);
+    } else if (step.kind === 'endReruns') {
+      for (const run of Object.values(world.runs)) if (run.status === 'running') { run.status = step.green ? 'success' : 'failure'; if (step.green) world.statuses[run.sha] = 'success'; }
     } else if (step.kind === 'closePull') {
       if (pr) pr.state = 'closed';
     } else if (step.kind === 'end') {
       const running = Object.keys(world.conversations).filter((id) => world.conversations[id] === 'running');
-      if (running.length) world.conversations[running[step.pick % running.length]] = step.state;
+      if (!running.length) return;
+      const id = running[step.pick % running.length];
+      world.conversations[id] = step.state;
+      // A revert run that finishes has pushed its revert of the merge on the red default branch.
+      const job = state.jobs.list('running').find((entry) => entry.conversation_id === id);
+      const merged = job?.label === 'main:red' && Object.values(world.pulls).find((entry) => entry.merged && entry.merge_sha === job.event.ci?.commit_sha);
+      if (step.state === 'finished' && merged) world.pushRevert(merged);
     } else if (step.kind === 'tick') {
       state.clock += step.minutes * MINUTE;
       await state.dispatcher.tick();
@@ -239,16 +287,26 @@ function checkInvariants(state, world) {
 async function settle(state, world, apply) {
   for (const id of Object.keys(world.conversations)) if (world.conversations[id] === 'running') world.conversations[id] = 'finished';
   for (const pr of Object.values(world.pulls)) if (pr.state === 'open') pr.state = 'closed';
-  for (const number of Object.keys(world.issues)) await apply({ kind: 'close', number: Number(number) });
-  for (let round = 0; round < 12; round += 1) {
-    for (const id of Object.keys(world.conversations)) if (world.conversations[id] === 'running') world.conversations[id] = 'finished';
-    await apply({ kind: 'tick', minutes: 120 });
-  }
+  const passTime = async (rounds) => {
+    for (let round = 0; round < rounds; round += 1) {
+      for (const run of Object.values(world.runs)) if (run.status === 'running') run.status = 'failure';
+      for (const id of Object.keys(world.conversations)) if (world.conversations[id] === 'running') await apply({ kind: 'end', pick: Object.keys(world.conversations).filter((key) => world.conversations[key] === 'running').indexOf(id), state: 'finished' });
+      await apply({ kind: 'tick', minutes: 120 });
+    }
+  };
+  // The tickets and sub-issues close first, and time passes: an epic's review then runs while the epic is still open, as it does when its
+  // last sub-issue is closed by a merge. The epics close after that (the forge refuses while a sub-issue is open).
+  const epics = new Set(Object.keys(world.deps).map(Number));
+  for (const number of Object.keys(world.issues).map(Number).filter((n) => !epics.has(n))) await apply({ kind: 'close', number });
+  await passTime(6);
+  for (const number of epics) await apply({ kind: 'close', number });
+  await passTime(12);
   const left = state.jobs.list().filter((job) => ACTIVE.has(job.status)).map((job) => job.key + ' ' + job.status);
   assert.deepEqual(left, [], 'no job is left active once every issue is closed');
   assert.equal(state.jobs.holds.size, 0, 'no merge hold is left');
   assert.equal(state.jobs.stuck.size, 0, 'no stuck record is left');
   assert.equal(state.jobs.stalled.size, 0, 'no stalled record is left');
+  assert.equal(state.jobs.epicGaps.size, 0, 'no epic gap record is left once the epic is closed');
 }
 
 async function replay(seed, restarts, file, list = steps(seed, restarts)) {

@@ -16,7 +16,9 @@ const repository = { full_name: REPO, clone_url: 'https://forge.example/' + REPO
 export function createWorld(issueCount, clock) {
   const world = {
     issues: {}, pulls: {}, catalog: [], conversations: {}, started: [], writes: [], unknown: new Set(),
-    statuses: {}, commitTimes: {}, branches: { main: 'main0000' }, outbox: [], shas: 0, comments: 0,
+    statuses: {}, commitTimes: {}, branches: {}, outbox: [], shas: 0, comments: 0,
+    // Epics: an issue's dependencies (its sub-issues). Commits: the first parent of a merge commit. Action runs: their state by id.
+    deps: {}, parents: {}, runs: {},
     // What happened to the pull requests, in order: pushes, labels on and off, merges. The invariants read it.
     history: []
   };
@@ -26,6 +28,7 @@ export function createWorld(issueCount, clock) {
     if (!entry) { entry = { id: world.catalog.length + 1, name }; world.catalog.push(entry); }
     return entry.id;
   };
+
   const labelsOf = (set) => [...set].map((name) => ({ id: labelId(name), name }));
   // A new commit: its time is now, and it has no status until CI reports one.
   const commit = (prefix) => {
@@ -35,6 +38,9 @@ export function createWorld(issueCount, clock) {
     return sha;
   };
   world.commit = commit;
+  world.branches.main = commit('e');
+  // The default branch starts green, so that a red merge after it can be told from a branch that was red before.
+  world.statuses[world.branches.main] = 'success';
 
   const issueView = (issue) => ({ number: issue.number, state: issue.state, title: 'Issue ' + issue.number, body: 'B',
     html_url: 'https://forge.example/' + REPO + '/issues/' + issue.number, labels: labelsOf(issue.labels), user: { login: 'marcel' }, comments: issue.comments.length });
@@ -60,6 +66,23 @@ export function createWorld(issueCount, clock) {
     pr.head = sha;
     pr.files = files;
     pr.updated_at = iso(clock());
+    world.history.push({ at: clock(), pr: pr.number, what: 'push', sha });
+    return pr;
+  };
+
+  // The revert agent pushes ai/revert-<n> for the merged pull request n and opens its pull request (on the ticket of n).
+  world.pushRevert = (merged) => {
+    const branch = 'ai/revert-' + merged.number;
+    const sha = commit('d');
+    world.branches[branch] = sha;
+    let pr = Object.values(world.pulls).find((entry) => entry.branch === branch && entry.state === 'open');
+    if (!pr) {
+      let number = 300 + merged.issue;
+      while (world.pulls[number]) number += 100;
+      pr = world.pulls[number] = { number, issue: merged.issue, branch, state: 'open', merged: false, title: 'Revert #' + merged.number,
+        labels: new Set(), comments: [], created_at: iso(clock()), base: world.branches.main, revertOf: merged.number };
+    }
+    Object.assign(pr, { head: sha, files: merged.files, updated_at: iso(clock()) });
     world.history.push({ at: clock(), pr: pr.number, what: 'push', sha });
     return pr;
   };
@@ -90,6 +113,8 @@ export function createWorld(issueCount, clock) {
     if ((m = /^\/issues\/(\d+)$/.exec(path))) {
       const item = thread(m[1]);
       if (!item) return answer({}, 404);
+      // Forgejo refuses to close an issue that still has open dependencies (an epic with an open sub-issue).
+      if (request.method === 'PATCH' && body?.state === 'closed' && (world.deps[m[1]] ?? []).some((n) => world.issues[n].state === 'open')) return answer({}, 422);
       if (request.method === 'PATCH' && body?.state) item.state = body.state;
       return answer(world.issues[m[1]] ? issueView(item) : { ...pullView(item), pull_request: { merged: item.merged } });
     }
@@ -102,18 +127,31 @@ export function createWorld(issueCount, clock) {
     if ((m = /^\/issues\/(\d+)\/labels$/.exec(path))) {
       const item = thread(m[1]);
       if (!item) return answer({}, 404);
-      if (request.method === 'POST') for (const entry of body.labels) item.labels.add(typeof entry === 'number' ? world.catalog.find((label) => label.id === entry).name : entry);
+      if (request.method === 'POST') {
+        for (const entry of body.labels) item.labels.add(typeof entry === 'number' ? world.catalog.find((label) => label.id === entry).name : entry);
+        world.labelled(m[1]);
+      }
       return answer(labelsOf(item.labels));
     }
     if ((m = /^\/issues\/(\d+)\/labels\/(\d+)$/.exec(path)) && request.method === 'DELETE') {
       thread(m[1])?.labels.delete(world.catalog.find((label) => label.id === Number(m[2]))?.name);
+      world.labelled(m[1]);
       return answer({});
     }
     if (path === '/labels') {
       if (request.method === 'POST') return answer(world.catalog.find((label) => label.id === labelId(body.name)));
       return answer(world.catalog);
     }
-    if (/^\/issues\/(\d+)\/(dependencies|blocks)$/.test(path)) return answer([]);
+    // The dependencies of an issue are its sub-issues (an epic), and it blocks the issues that depend on it (its epic).
+    if ((m = /^\/issues\/(\d+)\/dependencies$/.exec(path))) return world.issues[m[1]] ? answer((world.deps[m[1]] ?? []).map((n) => issueView(world.issues[n]))) : answer({}, 404);
+    if ((m = /^\/issues\/(\d+)\/blocks$/.exec(path))) return world.issues[m[1]] ? answer(Object.keys(world.deps).filter((epic) => world.deps[epic].includes(Number(m[1]))).map((epic) => issueView(world.issues[epic]))) : answer({}, 404);
+    // Action runs: a rerun starts the run again; it ends when the test says so (world.endReruns).
+    if ((m = /^\/actions\/runs\/(\d+)\/rerun$/.exec(path)) && request.method === 'POST') {
+      if (!world.runs[m[1]]) return answer({}, 404);
+      world.runs[m[1]].status = 'running';
+      return answer({}, 204);
+    }
+    if ((m = /^\/actions\/runs\/(\d+)$/.exec(path))) return world.runs[m[1]] ? answer({ id: Number(m[1]), status: world.runs[m[1]].status, head_sha: world.runs[m[1]].sha }) : answer({}, 404);
     if (path === '/issues') return answer(Object.values(world.issues).filter((issue) => issue.state === (u.searchParams.get('state') || 'open')).map(issueView));
     if (path === '/pulls') {
       const state = u.searchParams.get('state') || 'open';
@@ -131,10 +169,11 @@ export function createWorld(issueCount, clock) {
     if ((m = /^\/pulls\/(\d+)\/merge$/.exec(path)) && request.method === 'POST') {
       const pr = world.pulls[m[1]];
       if (!pr || pr.state !== 'open') return answer({}, 405);
-      const sha = commit('m');
+      const sha = commit('b');
       Object.assign(pr, { state: 'closed', merged: true, merged_at: iso(clock()), merge_sha: sha });
       world.history.push({ at: clock(), pr: pr.number, what: 'merge', sha: pr.head, labels: [...pr.labels] });
       const before = world.branches.main;
+      world.parents[sha] = [before];
       world.branches.main = sha;
       world.outbox.push(world.mainPush(before, sha, pr));
       return answer({});
@@ -143,7 +182,7 @@ export function createWorld(issueCount, clock) {
     if ((m = /^\/pulls\/(\d+)\/update$/.exec(path)) && request.method === 'POST') {
       const pr = world.pulls[m[1]];
       if (!pr || pr.state !== 'open') return answer({}, 404);
-      pr.head = commit('u'); pr.base = world.branches.main; pr.updated_at = iso(clock());
+      pr.head = commit('c'); pr.base = world.branches.main; pr.updated_at = iso(clock());
       world.branches[pr.branch] = pr.head;
       return answer({});
     }
@@ -151,7 +190,7 @@ export function createWorld(issueCount, clock) {
       const state = world.statuses[m[1]];
       return answer(state ? { state, total_count: 1, statuses: [{ context: 'ci', status: state }] } : { state: 'pending', total_count: 0, statuses: [] });
     }
-    if ((m = /^\/git\/commits\/([0-9a-f]+)$/.exec(path))) return world.commitTimes[m[1]] ? answer({ sha: m[1], created: world.commitTimes[m[1]], parents: [] }) : answer({}, 404);
+    if ((m = /^\/git\/commits\/([0-9a-f]+)$/.exec(path))) return world.commitTimes[m[1]] ? answer({ sha: m[1], created: world.commitTimes[m[1]], parents: (world.parents[m[1]] ?? []).map((sha) => ({ sha })) }) : answer({}, 404);
     if ((m = /^\/branches\/(.+)$/.exec(path))) {
       const name = decodeURIComponent(m[1]);
       return world.branches[name] ? answer({ name, commit: { id: world.branches[name] } }) : answer({}, 404);
@@ -167,7 +206,13 @@ export function createWorld(issueCount, clock) {
   // The webhooks Forgejo sends, as [event, payload].
   const sender = { login: 'marcel' };
   const issuePayload = (issue) => ({ ...issueView(issue), labels: labelsOf(issue.labels) });
-  world.labelHook = (number) => ['issues', { action: 'label_updated', repository, sender, issue: issuePayload(world.issues[number]) }];
+  world.labelHook = (number, by = sender) => ['issues', { action: 'label_updated', repository, sender: by, issue: issuePayload(world.issues[number]) }];
+  // Forgejo sends a label webhook for a label change made through the API too, with ForgeHands' user as the sender.
+  world.labelled = (number) => {
+    const by = { login: 'forgehands' };
+    if (world.issues[number]) world.outbox.push(world.labelHook(number, by));
+    else if (world.pulls[number]) world.outbox.push(['pull_request', { ...world.pullLabelHook(world.pulls[number])[1], sender: by }]);
+  };
   world.closeHook = (number) => ['issues', { action: 'closed', repository, sender, issue: issuePayload(world.issues[number]) }];
   world.commentHook = (number, comment) => ['issue_comment', { action: 'created', repository, sender, issue: issuePayload(world.issues[number]), comment }];
   world.pullLabelHook = (pr) => ['pull_request', { action: 'label_updated', repository, sender, number: pr.number, pull_request: pullView(pr) }];
@@ -175,6 +220,14 @@ export function createWorld(issueCount, clock) {
     run: { id: world.shas, workflow_id: 'ci.yaml', commit_sha: pr.head, event: 'pull_request', status: outcome, html_url: 'https://forge.example/' + REPO + '/actions/runs/' + world.shas,
       repository, trigger_user: { login: 'openhands' },
       event_payload: JSON.stringify({ action: 'synchronized', number: pr.number, pull_request: { number: pr.number, state: pr.state, merged: pr.merged, title: pr.title, body: 'Closes #' + pr.issue, head: { ref: pr.branch, sha: pr.head } } }) } }];
+  // The CI run of a push to the default branch, which REVERT_ON_RED reacts to when it fails.
+  world.mainCiHook = (sha, outcome) => {
+    world.shas += 1;
+    world.runs[world.shas] = { status: outcome, sha };
+    return ['action_run_' + outcome, { action: outcome, prior_status: 'running', repository, sender,
+      run: { id: world.shas, workflow_id: 'ci.yaml', commit_sha: sha, event: 'push', status: outcome, html_url: 'https://forge.example/' + REPO + '/actions/runs/' + world.shas,
+        repository, trigger_user: { login: 'marcel' }, event_payload: JSON.stringify({ ref: 'refs/heads/main', after: sha }) } }];
+  };
   world.mainPush = (before, after, pr) => ['push', { ref: 'refs/heads/main', before, after, repository, sender,
     commits: [{ id: after, message: 'Merge pull request #' + pr.number + ' from ' + pr.branch + '\n\nCloses #' + pr.issue }], head_commit: { id: after } }];
   return world;
