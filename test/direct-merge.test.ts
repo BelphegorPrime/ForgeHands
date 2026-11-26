@@ -238,3 +238,17 @@ test('the webhook merges an approved agent pull request and says so', async () =
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('HOLD_LABEL stops a plain merge too, and taking it off lets the approval merge', async () => {
+  const held = { state: 'open', merged: false, mergeable: true, title: 'Fix it', head: { ref: 'ai/issue-26', sha: 'cafe0000cafe' }, labels: [{ name: 'ai:approved' }, { name: 'ai:hold' }] };
+  const { merger, forgejo } = await mergerFor(goodRoutes({ ['GET ' + API + '/pulls/34']: () => held }));
+  assert.equal(await merger.handle(approvedEvent()), 'held_label');
+  assert.ok(!forgejo.wrote().includes('POST /pulls/34/merge'), 'nothing merges while the label is on');
+  held.labels = [{ name: 'ai:approved' }];
+  assert.equal(await merger.handle(approvedEvent()), 'merged');
+});
+
+test('taking HOLD_LABEL off an approved pull request is an approval event, so the merge is looked at again', () => {
+  const removed = normalizeEvent('pull_request', prPayload(['ai:approved']), new Set([repo]), [], { labelEvents: true, approved: 'ai:approved', previousLabels: ['ai:approved', 'ai:hold'] });
+  assert.equal(removed.type, 'pull_request.approved');
+});

@@ -20,6 +20,13 @@ const PLANNER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
 const CHANGES = '33333333-3333-4333-8333-333333333333';
 const REVIEWER = '44444444-4444-4444-8444-444444444444';
+const SECURITY = '55555555-5555-4555-8555-555555555555';
+const HOLD_MINUTES = 30;
+// What an agent's push may change: plain code, a protected path that two keys may merge, or one that always needs the human.
+const FILES = { plain: (n) => ['src/issue-' + n + '.ts'], twoKeys: (n) => ['src/issue-' + n + '.ts', 'infra/tests/' + n + '.yaml'], human: (n) => ['infra/deploy-' + n + '.yaml'] };
+const DENY = (file) => file.startsWith('infra/');
+const TWO_KEYS = (file) => file.startsWith('infra/tests/');
+const SECURITY_LOGIN = 'security-bot';
 const MINUTE = 60000;
 const ISSUES = 3;
 const STEPS = 40;
@@ -41,9 +48,15 @@ const env = (file) => ({
     'ai:ready': { profile: WORKER, tier: 'free' },
     'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
     'ci:failure': { profile: CHANGES, tier: 'free', on: 'ci_failure' },
-    'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success' }
+    'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success' },
+    'sensitive:review': { profile: SECURITY, tier: 'strong', on: 'sensitive_review', forgejo_token_secret: 'SECURITY_TOKEN' }
   }),
-  MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['secrets/**'] } }),
+  // Two keys: infra/tests/** merges with the security review's OK, after a hold; any other infra file needs the human.
+  MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['infra/**'], two_keys: ['infra/tests/**'] } }),
+  SECURITY_REVIEWERS: SECURITY_LOGIN,
+  AGENT_SECRETS: 'FORGEJO_TOKEN,FORGEJO_URL,SECURITY_TOKEN',
+  SECURITY_TOKEN: 'security-token-value',
+  TWO_KEYS_HOLD_MINUTES: String(HOLD_MINUTES),
   APPROVAL_GRACE_SECONDS: '0',
   REVIEW_SWEEP_MINUTES: '30',
   STUCK_PR_MINUTES: '120',
@@ -73,13 +86,15 @@ function steps(seed, restarts) {
     else if (roll < 0.19) list.push({ kind: 'comment', number });
     else if (roll < 0.24) list.push({ kind: 'close', number });
     else if (roll < 0.27) list.push({ kind: 'reopen', number });
-    else if (roll < 0.35) list.push({ kind: 'push', number });
+    else if (roll < 0.35) list.push({ kind: 'push', number, files: random.pick(['plain', 'plain', 'twoKeys', 'twoKeys', 'human']) });
     else if (roll < 0.43) list.push({ kind: 'ci', number, outcome: random.pick(['success', 'success', 'failure']) });
     else if (roll < 0.48) list.push({ kind: 'verdict', number, ok: random.next() < 0.7 });
     else if (roll < 0.52) list.push({ kind: 'approve', number });
     else if (roll < 0.55) list.push({ kind: 'changes', number });
     else if (roll < 0.57) list.push({ kind: 'closePull', number });
     else if (roll < 0.6) list.push({ kind: 'ship', number });
+    else if (roll < 0.63) list.push({ kind: 'security', number, ok: random.next() < 0.8 });
+    else if (roll < 0.65) list.push({ kind: 'hold', number, on: random.next() < 0.6 });
     else if (roll < 0.72) list.push({ kind: 'end', pick: random.int(1000), state: random.pick(['finished', 'finished', 'error', 'stuck', 'max_iterations']) });
     else if (restarts && roll < 0.78) list.push({ kind: 'restart' });
     else list.push({ kind: 'tick', minutes: random.pick([1, 5, 30, 240]) });
@@ -125,7 +140,7 @@ async function harness(file) {
       issue.state = 'open';
     } else if (step.kind === 'push') {
       // The agent of the issue pushes its branch: only while the issue is open, as an agent works on open tickets.
-      if (issue.state === 'open') world.push(step.number);
+      if (issue.state === 'open') world.push(step.number, FILES[step.files ?? 'plain'](step.number));
     } else if (step.kind === 'ci') {
       if (!pr) return;
       world.statuses[pr.head] = step.outcome;
@@ -144,7 +159,20 @@ async function harness(file) {
       await apply({ kind: 'ci', number: step.number, outcome: 'success' });
       state.clock += MINUTE;
       await apply({ kind: 'verdict', number: step.number, ok: true });
+      if (pr.files.some(DENY)) await apply({ kind: 'security', number: step.number, ok: true });
       await apply({ kind: 'approve', number: step.number });
+    } else if (step.kind === 'security') {
+      // The security reviewer's comment on the head commit (its own forge user, see SECURITY_REVIEWERS).
+      if (!pr) return;
+      world.comments += 1;
+      pr.comments.push({ id: world.comments, created_at: new Date(state.clock).toISOString(), user: { login: SECURITY_LOGIN },
+        body: '## Security review: ' + (step.ok ? 'OK' : 'CONCERNS') + '\nCommit ' + pr.head.slice(0, 8) + ': ' + 'the changed paths were read line by line. '.repeat(6) });
+    } else if (step.kind === 'hold') {
+      // The operator puts HOLD_LABEL on the pull request, or takes it off.
+      if (!pr) return;
+      if (step.on) pr.labels.add('ai:hold'); else pr.labels.delete('ai:hold');
+      world.history.push({ at: state.clock, pr: pr.number, what: step.on ? 'hold' : 'unhold' });
+      await state.post(world.pullLabelHook(pr));
     } else if (step.kind === 'closePull') {
       if (pr) pr.state = 'closed';
     } else if (step.kind === 'end') {
@@ -187,10 +215,23 @@ function checkInvariants(state, world) {
     tiers.set(tier, [...(tiers.get(tier) ?? []), job.key]);
   }
   for (const [tier, keys] of tiers) assert.ok(keys.length <= 1, 'tier ' + tier + ' never runs more than MAX_CONCURRENT_PER_TIER: ' + keys.join(', '));
-  // A merge happens only for an approved pull request whose head is green and has an OK verdict written after it.
+  // A merge happens only for an approved pull request whose head is green, and never while HOLD_LABEL is on. A protected path merges only through two keys: every protected
+  // file is a two-keys file, the security reviewer said OK on that very commit, the hold had run its time since then, and HOLD_LABEL was off.
   for (const pr of Object.values(world.pulls).filter((entry) => entry.merged)) {
     assert.ok(pr.labels.has('ai:approved'), 'a merged pull request was approved: #' + pr.number);
     assert.equal(world.statuses[pr.head], 'success', 'a merged pull request had a green head: #' + pr.number);
+    const merge = world.history.find((entry) => entry.pr === pr.number && entry.what === 'merge');
+    assert.ok(!merge.labels.includes('ai:hold'), 'nothing merges while HOLD_LABEL is on: #' + pr.number);
+    const protectedFiles = pr.files.filter(DENY);
+    if (!protectedFiles.length) continue;
+    assert.ok(protectedFiles.every(TWO_KEYS), 'a deny file outside two_keys keeps the human: #' + pr.number + ' ' + pr.files.join(', '));
+    const reviews = pr.comments.filter((comment) => comment.user.login === SECURITY_LOGIN && comment.body.includes('Commit ' + pr.head.slice(0, 8)));
+    const last = reviews.at(-1);
+    assert.ok(last && last.body.startsWith('## Security review: OK'), 'two keys need the security OK of the merged commit: #' + pr.number);
+    const agreed = Date.parse(last.created_at);
+    const unheld = world.history.filter((entry) => entry.pr === pr.number && entry.what === 'unhold' && entry.at <= merge.at).at(-1)?.at ?? 0;
+    assert.ok(merge.at >= Math.max(agreed, unheld) + HOLD_MINUTES * MINUTE,
+      'a two-keys merge waits TWO_KEYS_HOLD_MINUTES after both keys agreed and after the hold label came off: #' + pr.number);
   }
 }
 

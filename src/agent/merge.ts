@@ -234,6 +234,10 @@ export class Merger {
         const gate = await this.holdGate(repository, number, sha, labels);
         if (gate !== 'go') return gate;
       }
+      // HOLD_LABEL is the operator's stop for every merge, not only a two-key one (that one waits in its hold above): a plain pull request,
+      // a revert and a two-key merge without TWO_KEYS_HOLD_MINUTES stay unmerged while it is on. Taking it off is a label change that carries
+      // the approval, so the merge is looked at again then.
+      if (labels.includes(this.config.holdLabel)) return metrics.refused('held_label');
       await this.forge.mergePull(repository, number, { method: this.config.mergeMethod, headSha: sha, deleteBranch: true });
       metrics.inc('forgehands_merges_total', { repository: repository.toLowerCase() });
       await this.recordMerge(repository, number, pullBranch(pr), twoKeys);
