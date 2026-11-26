@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { E2eRecord, EpicGapRecord, EpicSweepRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, Json, Logger, MergeRecord, NewJob, OperatorRecord, RerunRecord, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
+import { CLONE_FAILURE_CLASSES } from '../types.ts';
+import type { CloneBreakerRecord, CloneBreakerState, E2eRecord, EpicGapRecord, EpicSweepRecord, FiledFinding, FindingRecord, Hold, Job, JobStatus, Json, Logger, MergeRecord, NewJob, OperatorRecord, RerunRecord, RevertRecord, StalledRecord, StuckRecord } from '../types.ts';
 
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 // `waiting`: the issue depends on issues that are still open; it starts when the last one closes.
@@ -14,8 +15,9 @@ export class JobStore {
   file: string;
   jobs = new Map<string, Job>();
   labels = new Map<string, SeenLabels>(); // repo#issue -> { labels, seen }: the labels seen on the last event of an issue
-  /** Small facts that must outlive a restart and belong to no job: the date of the last digest (`digest_sent`, YYYY-MM-DD in NOTIFY_TIMEZONE). */
-  meta: { digest_sent?: string; e2e?: E2eRecord } = {};
+  /** Small facts that must outlive a restart and belong to no job: the date of the last digest (`digest_sent`, YYYY-MM-DD in NOTIFY_TIMEZONE),
+   * the end-to-end record (`e2e`) and the clone breaker (`clone_breaker`, see agent/clone-breaker.ts). */
+  meta: { digest_sent?: string; e2e?: E2eRecord; clone_breaker?: CloneBreakerRecord } = {};
   /** Keys of things already done, kept 30 days: a human comment that restarted a run (`comment:<repo>#<n>#<id>`), a notice sent once (`limit:<repo>#<n>:<label>`). */
   dedupe = new Map<string, number>();
   /** Two-key merges on hold (TWO_KEYS_HOLD_MINUTES), per pull request ("repo#pr<n>"). Held until merged, cleared or the pull request changes; never pruned by age. */
@@ -259,12 +261,26 @@ const number = (value: unknown): value is number => typeof value === 'number';
 const string = (value: unknown): value is string => typeof value === 'string';
 
 // The meta facts: each one is read only when it has its expected shape, anything else in the file is left out.
+const CLONE_BREAKER_STATES: CloneBreakerState[] = ['closed', 'open', 'half_open'];
+const notNegative = (value: unknown): value is number => number(value) && Number.isFinite(value) && value >= 0;
+const nullable = (value: unknown, valid: (entry: unknown) => boolean): boolean => value === null || valid(value);
+// A ledger without the breaker is a closed breaker; a broken one is left out so that the run starts closed instead of acting on junk.
+function isCloneBreaker(value: unknown): value is CloneBreakerRecord {
+  if (!isObject(value) || !CLONE_BREAKER_STATES.includes(value.state) || !notNegative(value.incident)) return false;
+  if (!nullable(value.opened_at, notNegative) || !nullable(value.retry_at, notNegative) || typeof value.notified !== 'boolean') return false;
+  if (!nullable(value.trial, (trial) => isObject(trial) && string(trial.owner) && nullable(trial.conversation, string)
+    && notNegative(trial.started) && notNegative(trial.deadline))) return false;
+  return Array.isArray(value.failures) && value.failures.every((failure: Json) => isObject(failure) && CLONE_FAILURE_CLASSES.includes(failure.class)
+    && string(failure.repository) && notNegative(failure.at) && string(failure.conversation));
+}
+
 const META: Collection = {
   file: 'meta',
   load(store, raw) {
     if (!isObject(raw)) return;
     if (string(raw.digest_sent)) store.meta.digest_sent = raw.digest_sent;
     if (isObject(raw.e2e) && string(raw.e2e.version)) store.meta.e2e = raw.e2e as E2eRecord;
+    if (isCloneBreaker(raw.clone_breaker)) store.meta.clone_breaker = raw.clone_breaker;
   },
   prune() {},
   save: (store) => store.meta

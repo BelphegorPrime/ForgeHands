@@ -241,6 +241,60 @@ export interface E2eConfig {
 
 export type Config = WebhookConfig | DirectConfig;
 
+/** The state of the clone breaker (see agent/clone-breaker.ts): `closed` starts work, `open` holds every new start, `half_open` may admit one trial. */
+export type CloneBreakerState = 'closed' | 'open' | 'half_open';
+
+/** The normalized class of a confirmed clone failure. Raw clone output never gets here: only this class, the repository, the time and the conversation. */
+export const CLONE_FAILURE_CLASSES = ['clone_failed', 'repository_not_found', 'host_misconfigured', 'auth_failed'] as const;
+export type CloneFailureClass = (typeof CLONE_FAILURE_CLASSES)[number];
+
+/** One confirmed clone failure, kept only while it can count toward the threshold (ten minutes). */
+export interface CloneFailureRecord {
+  class: CloneFailureClass;
+  /** The repository's full name, lower case; never a clone URL with credentials. */
+  repository: string;
+  /** When the failure was confirmed (ms). */
+  at: number;
+  /** The conversation that reported it: one failure per conversation while it is eligible, so a replay cannot count again. */
+  conversation: string;
+}
+
+/** The one half-open trial the breaker admits. The reservation is claimed before its conversation starts, and its claimant owns it. */
+export interface CloneBreakerTrial {
+  /** The job key (`repo#issue`) that claimed the trial. */
+  owner: string;
+  /** The conversation the start produced; null while the claim waits for the start. Only that conversation can settle the trial. */
+  conversation: string | null;
+  started: number;
+  /** After this time without positive evidence the trial is inconclusive: the breaker reopens, it never closes on time alone. */
+  deadline: number;
+}
+
+/** The durable clone breaker, kept in the ledger as `meta.clone_breaker` (see agent/clone-breaker.ts). A ledger without it starts closed. */
+export interface CloneBreakerRecord {
+  state: CloneBreakerState;
+  /** Counts the incidents: the one notification claim and a reopen belong to the same incident. */
+  incident: number;
+  opened_at: number | null;
+  /** When the hold ends and one half-open trial may be admitted. */
+  retry_at: number | null;
+  trial: CloneBreakerTrial | null;
+  /** The incident's one notification was claimed; a reopen keeps it, a recovery clears it. */
+  notified: boolean;
+  failures: CloneFailureRecord[];
+}
+
+/** What the status views may publish: only the state and its timing, never the evidence. */
+export interface CloneBreakerSnapshot {
+  state: CloneBreakerState;
+  /** When the current incident opened (ms); null while closed. */
+  since: number | null;
+  /** When the hold ends and one half-open trial may be admitted; null while closed. */
+  retry_at: number | null;
+  /** Until when the admitted trial may still give positive checkout evidence; null without a trial. */
+  trial_until: number | null;
+}
+
 /** The last end-to-end run, kept in the ledger (meta.e2e): its ForgeHands version, what started it and the result of each scenario. */
 export interface E2eRecord {
   version: string;
