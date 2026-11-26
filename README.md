@@ -22,6 +22,7 @@ In this document "pull request" also means a GitLab **merge request**, and "Forg
 - [End-to-end suite](#end-to-end-suite)
 - [Dry run](#dry-run)
 - [Security and limitations](#security-and-limitations)
+- [Stability and versioning](#stability-and-versioning)
 - [Development](#development)
 
 ## How the loop works (direct mode)
@@ -876,6 +877,28 @@ See [SECURITY.md](SECURITY.md) for the trust model in full.
 - `STATUS_TOKEN` protects the status page and metrics; without it they are open.
 - The delivery store and the ledger are local JSON files: **single instance only**. Use a shared atomic database before scaling out.
 - Retries rely on the forge's retries or a manual redelivery. A failure after OpenHands accepted a webhook-mode request but before ForgeHands recorded it can cause a duplicate; configure OpenHands's `event_id_header` for defense in depth. There is no durable outgoing queue in webhook mode: if OpenHands is down the answer is HTTP 502.
+
+## Stability and versioning
+
+ForgeHands follows [semantic versioning](https://semver.org). Until 1.0.0 a minor release (0.x.0) may change behaviour; [docs/UPGRADING.md](docs/UPGRADING.md) says what changed and how to keep the old way where there is one. From 1.0.0 on, the interface below changes only in a major release.
+
+**Covered:**
+
+- **Environment variables.** Their names, defaults and meaning, as documented in [Configuration](#configuration). A new variable can come in a minor release. If it changes behaviour, it starts out off, or its default is the behaviour from before.
+- **The ledger file** (`jobs.json`). A release reads every ledger written since 0.2.5 (`version` 2 and later), migrating it on load (`LEDGER_VERSION`). A ledger written by a newer release stops the start instead of being read with parts lost.
+- **Webhook paths and the signatures checked on them**: `/webhooks/forgejo`, `/webhooks/gitea` and `/webhooks/gitlab`.
+- **What ForgeHands writes to the forge that people and tools act on**: the labels it sets or reads (`APPROVED_LABEL`, `BLOCKED_LABEL`, `HOLD_LABEL`, the route labels), the branch names (`ai/issue-<n>`, `ai/revert-<n>`), and the verdict lines a review must carry (`Verdict: OK|NOT OK`, `## Security review: OK|CONCERNS`).
+- **Observability**: the metric names and their labels on `/metrics`, and the fields of `/status.json`.
+
+**Not covered:**
+
+- **Wording** of comments, prompts, log lines and the HTML of the status page.
+- **The end-to-end suite** (`E2E_*`), which is operations tooling.
+- **The source code** under `src/`. ForgeHands is a service, not a library.
+
+**Deprecation.** A variable that is renamed or removed in a minor release keeps working, or is ignored, with a warning at start for at least one further minor release. It is then dropped only in the next major release. `TIER_WEEKLY_BUDGETS` went this way.
+
+`test/interface.test.ts` pins the variables (each must be documented here and in `.env.example`), the metric names, the webhook paths and the ledger version. A change that touches them fails that test and has to update it on purpose.
 
 ## Development
 
