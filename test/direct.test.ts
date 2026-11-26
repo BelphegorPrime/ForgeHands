@@ -34,9 +34,10 @@ test('conversations get the agent secrets, and the ledger never stores them', as
   await dispatcher.enqueue(event('ai:ready', 3));
   await dispatcher.tick();
   const { body } = starts()[0];
-  assert.deepEqual(Object.keys(body.secrets), ['FORGEJO_TOKEN', 'FORGEJO_URL']);
+  assert.deepEqual(Object.keys(body.secrets), ['FORGEJO_TOKEN', 'FORGEJO_URL', 'GIT_CONFIG_GLOBAL']);
   assert.equal(body.secrets.FORGEJO_TOKEN.kind, 'StaticSecret');
   assert.equal(body.secrets.FORGEJO_TOKEN.value, 'tok-secret-value');
+  assert.equal(body.secrets.GIT_CONFIG_GLOBAL.kind, 'StaticSecret');
   assert.doesNotMatch(body.initial_message.content[0].text, /tok-secret-value/);
   await jobs.persist();
   const { readFile } = await import('node:fs/promises');

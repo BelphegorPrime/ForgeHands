@@ -2,7 +2,7 @@
 // Review mode: native reviews as the verdict (VERDICT_SOURCE, REQUIRED_APPROVALS).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/server/app.ts';
 import { DeliveryStore } from '../src/store/deliveries.ts';
@@ -12,7 +12,7 @@ import { loadConfig } from '../src/config.ts';
 import { buildPrompt } from '../src/agent/prompt.ts';
 import { normalizeEvent } from '../src/webhook/events.ts';
 import { normalizeGiteaEvent } from '../src/forge/gitea/webhook.ts';
-import { ctx, WORKER, repo, quiet, env, fakeApi, event, starts, webhook, CHANGES, REVIEWER, ciEvent, withMerge, API, fakeForgejo, goodRoutes, mergerFor, approvedEvent, issue, buildVerdict, reviewJob, prWith, verdict, pull, BOT_RULES, botEvent, RV2, HEAD, reviewEnv, rev, reviewsRoute, unlabelled, reviewMerger, reviewPayload, reviewHook, reviewApp } from './helpers/direct.ts';
+import { ctx, WORKER, repo, quiet, env, fakeApi, event, starts, webhook, CHANGES, REVIEWER, ciEvent, withMerge, API, fakeForgejo, goodRoutes, mergerFor, approvedEvent, issue, buildVerdict, reviewJob, prWith, verdict, pull, BOT_RULES, botEvent, RV2, HEAD, reviewEnv, rev, reviewsRoute, unlabelled, reviewMerger, reviewPayload, reviewHook, reviewApp, build } from './helpers/direct.ts';
 
 test('review mode config: VERDICT_SOURCE, REQUIRED_APPROVALS and the reviewer token of a route are validated', () => {
   assert.equal(loadConfig(env(withMerge())).verdictSource, 'comment');
@@ -202,6 +202,77 @@ test('a reviewer route hands its own Forgejo token to its conversation as FORGEJ
   assert.ok(!('REVIEWER_TOKEN' in review));
   assert.equal(worker.FORGEJO_TOKEN.value, 'tok-secret-value');
   assert.ok(!JSON.stringify(worker).includes('tok-reviewer'));
+  // Both get a Git global config of their own, under their own checkout: the worker's path never appears in the review's payload.
+  assert.ok(review.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-26-review-abcdef01/'));
+  assert.ok(worker.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-27/'));
+  assert.equal(posix.basename(review.GIT_CONFIG_GLOBAL.value), '.gitconfig');
+  assert.notEqual(review.GIT_CONFIG_GLOBAL.value, worker.GIT_CONFIG_GLOBAL.value);
+});
+
+test('every start always gets a ForgeHands-owned GIT_CONFIG_GLOBAL below its checkout, even with no agent secrets', async () => {
+  const config = loadConfig(env({ AGENT_SECRETS: '', WORKSPACE_DIR: '/workspace/checkouts' }));
+  const jobs = new JobStore(join(ctx.dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => ctx.clock);
+  await dispatcher.enqueue(event('ai:ready', 7));
+  await dispatcher.tick();
+  const body = starts()[0].body;
+  assert.deepEqual(Object.keys(body.secrets), ['GIT_CONFIG_GLOBAL']);
+  const entry = body.secrets.GIT_CONFIG_GLOBAL;
+  assert.equal(entry.kind, 'StaticSecret');
+  assert.equal(entry.description, 'Provided by ForgeHands');
+  assert.ok(posix.isAbsolute(entry.value), 'absolute POSIX path');
+  const checkout = '/workspace/checkouts/owner-hello-issue-7';
+  assert.ok(entry.value.startsWith(checkout + '/'), 'inside the run checkout');
+  assert.equal(posix.relative(checkout, entry.value).split('/').length, 2, 'one UUID directory and the .gitconfig basename');
+  assert.equal(posix.basename(entry.value), '.gitconfig');
+  assert.equal(body.workspace.working_dir, '/workspace/checkouts', 'working directory unchanged');
+  const own = new RegExp(entry.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  assert.doesNotMatch(body.initial_message.content[0].text, own, 'not in the prompt');
+  await jobs.persist();
+  const { readFile } = await import('node:fs/promises');
+  assert.doesNotMatch(await readFile(join(ctx.dir, 'jobs.json'), 'utf8'), own, 'not in the ledger');
+});
+
+test('a configured GIT_CONFIG_GLOBAL is overridden by the per-start path', async () => {
+  const config = loadConfig(env({
+    AGENT_SECRETS: 'GIT_CONFIG_GLOBAL,FORGE_TOKEN,FORGE_URL',
+    GIT_CONFIG_GLOBAL: '/tmp/operator-global',
+    WORKSPACE_DIR: '/projects'
+  }));
+  const jobs = new JobStore(join(ctx.dir, 'jobs.json'));
+  await jobs.load();
+  const dispatcher = new Dispatcher(config, jobs, fakeApi(), quiet, () => ctx.clock);
+  await dispatcher.enqueue(event('ai:ready', 9));
+  await dispatcher.tick();
+  const secrets = starts()[0].body.secrets;
+  assert.deepEqual(Object.keys(secrets), ['FORGEJO_TOKEN', 'FORGEJO_URL', 'GIT_CONFIG_GLOBAL']);
+  assert.notEqual(secrets.GIT_CONFIG_GLOBAL.value, '/tmp/operator-global');
+  assert.ok(secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-9/'));
+  assert.equal(posix.basename(secrets.GIT_CONFIG_GLOBAL.value), '.gitconfig');
+});
+
+test('a retry of the same checkout gets a fresh GIT_CONFIG_GLOBAL path', async () => {
+  const { dispatcher, jobs } = await build();
+  await dispatcher.enqueue(event('ai:ready', 42));
+  ctx.failStarts = true;
+  await dispatcher.tick();
+  const first = starts()[0].body.secrets.GIT_CONFIG_GLOBAL.value;
+  assert.equal(jobs.list()[0].attempts, 1);
+  ctx.failStarts = false;
+  ctx.clock += 60000;
+  await dispatcher.tick();
+  const bodies = starts().map((call) => call.body);
+  assert.equal(bodies.length, 2);
+  const [a, b] = bodies.map((body) => body.secrets.GIT_CONFIG_GLOBAL.value);
+  assert.equal(a, first);
+  const checkout = '/projects/owner-hello-issue-42';
+  for (const value of [a, b]) {
+    assert.ok(value.startsWith(checkout + '/'), 'same checkout');
+    assert.equal(posix.basename(value), '.gitconfig');
+  }
+  assert.notEqual(a, b, 'a fresh UUID directory on the retry');
+  assert.equal(bodies[1].workspace.working_dir, '/projects', 'working directory unchanged');
 });
 
 test('a second reviewer is a second route on ci_success: each starts once per commit, with its own token', async () => {
