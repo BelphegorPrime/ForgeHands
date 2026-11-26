@@ -1,0 +1,79 @@
+# CI on Forgejo, the primary repository: typecheck and tests on every pull request and on master. ForgeHands starts its
+# reviews when this run is green. The image is still built and published by .github/workflows/ghcr.yml on GitHub, which
+# receives master and the tags through Forgejo's push mirror.
+# Jobs run in a container on the runner labelled `docker`; actions/checkout is replaced by a plain git fetch. A failed run
+# leaves the tail of its output as a comment on its pull request (Forgejo has no job log API).
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: docker
+    timeout-minutes: 20
+    container:
+      image: node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1
+    steps:
+      - name: install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: checkout
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q . && git config --global --add safe.directory "$PWD"
+          git -c http.extraheader="Authorization: token $TOKEN" fetch -q --no-tags "${{ github.server_url }}/${{ github.repository }}.git" "${{ github.sha }}"
+          git checkout -q "${{ github.sha }}"
+      # `set -o pipefail` keeps the exit code of the command, `tee` keeps its output for the failure step below.
+      - name: install
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee ci-output.log
+      - name: typecheck
+        run: |
+          set -o pipefail
+          npm run typecheck 2>&1 | tee ci-output.log
+      - name: test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee ci-output.log
+      - name: comment the tail of the failed run
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          TOKEN: ${{ github.token }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          JOB: test
+          LOG: ci-output.log
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The last 80 lines, without ANSI colours and without anything that looks like a credential.
+          { if [ -s "$LOG" ]; then tail -n 80 "$LOG"; else echo "no output: $LOG is missing or empty"; fi; } |
+            sed -E -e 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+              -e 's/(token|password|passwd|secret)([[:space:]]*[=:][[:space:]]*)[^[:space:]`]+/\1\2<redacted>/Ig' \
+              -e 's/(bearer)([[:space:]]+)[^[:space:]`]+/\1\2<redacted>/Ig' \
+              -e 's/[A-Za-z0-9+]{40,}/<redacted>/g' |
+            tr -d '\000-\010\013\014\016-\037\177' > ci-output.tail
+          {
+            printf 'CI job `%s` failed for commit `%s`.\n\n```\n' "$JOB" "$COMMIT"
+            cat ci-output.tail
+            printf '\n```\n'
+          } > ci-comment.md
+          # The API takes JSON: join the lines of the body, then escape what JSON needs.
+          body=$(sed -e ':a' -e 'N' -e '$!ba' -e 's/[\\"]/\\&/g' -e 's/\t/\\t/g' -e 's/\r//g' -e 's/\n/\\n/g' ci-comment.md)
+          printf '{"body":"%s"}' "$body" > ci-comment.json
+          code=$(curl -sS -o ci-response.json -w '%{http_code}' -X POST \
+            -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            --data-binary @ci-comment.json "$SERVER/api/v1/repos/$REPO/issues/$PR/comments")
+          echo "comment: HTTP $code"
+          if [ "$code" != 201 ] && [ "$code" != 200 ]; then cat ci-response.json; exit 1; fi
