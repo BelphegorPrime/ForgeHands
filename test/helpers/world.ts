@@ -44,8 +44,8 @@ export function createWorld(issueCount, clock) {
 
   const issueView = (issue) => ({ number: issue.number, state: issue.state, title: 'Issue ' + issue.number, body: 'B',
     html_url: 'https://forge.example/' + REPO + '/issues/' + issue.number, labels: labelsOf(issue.labels), user: { login: 'marcel' }, comments: issue.comments.length });
-  const pullView = (pr) => ({ number: pr.number, state: pr.state, merged: pr.merged, mergeable: pr.state === 'open', title: pr.title, body: 'Closes #' + pr.issue,
-    html_url: 'https://forge.example/' + REPO + '/pulls/' + pr.number, user: { login: 'openhands' }, labels: labelsOf(pr.labels),
+  const pullView = (pr) => ({ number: pr.number, state: pr.state, merged: pr.merged, mergeable: pr.state === 'open', title: pr.title, body: pr.issue ? 'Closes #' + pr.issue : 'Updates a dependency.',
+    html_url: 'https://forge.example/' + REPO + '/pulls/' + pr.number, user: { login: pr.author ?? 'openhands' }, labels: labelsOf(pr.labels),
     head: { ref: pr.branch, sha: pr.head, repo: { full_name: REPO } }, base: { ref: 'main', sha: pr.base, repo: repository },
     created_at: pr.created_at, updated_at: pr.updated_at, merged_at: pr.merged_at ?? null, merge_commit_sha: pr.merge_sha ?? null, comments: pr.comments.length });
   // Forgejo numbers issues and pull requests in one sequence: the pull request of issue n is 100 + n (a later one of the same issue 200 + n, ...).
@@ -61,7 +61,7 @@ export function createWorld(issueCount, clock) {
       let number = 100 + issue;
       while (world.pulls[number]) number += 100;
       pr = world.pulls[number] = { number, issue, branch: 'ai/issue-' + issue, state: 'open', merged: false, title: 'WIP: Fix #' + issue,
-        labels: new Set(), comments: [], created_at: iso(clock()), base: world.branches.main };
+        labels: new Set(), comments: [], reviews: [], created_at: iso(clock()), base: world.branches.main };
     }
     pr.head = sha;
     pr.files = files;
@@ -85,6 +85,31 @@ export function createWorld(issueCount, clock) {
     Object.assign(pr, { head: sha, files: merged.files, updated_at: iso(clock()) });
     world.history.push({ at: clock(), pr: pr.number, what: 'push', sha });
     return pr;
+  };
+
+  // A dependency bot (renovate) opens or updates its pull request renovate/dep-<k>: no ticket behind it.
+  world.pushBot = (k) => {
+    const branch = 'renovate/dep-' + k;
+    const sha = commit('f');
+    world.branches[branch] = sha;
+    let pr = Object.values(world.pulls).find((entry) => entry.branch === branch && entry.state === 'open');
+    if (!pr) {
+      let number = 500 + k;
+      while (world.pulls[number]) number += 10;
+      pr = world.pulls[number] = { number, issue: null, branch, author: 'renovate', state: 'open', merged: false, title: 'Update dependency dep-' + k,
+        labels: new Set(), comments: [], reviews: [], created_at: iso(clock()), base: world.branches.main };
+    }
+    Object.assign(pr, { head: sha, files: ['package-lock.json'], updated_at: iso(clock()) });
+    world.history.push({ at: clock(), pr: pr.number, what: 'push', sha });
+    return pr;
+  };
+  // A native review of the head commit by a reviewer user (VERDICT_SOURCE=review): approved or a request for changes.
+  world.review = (pr, login, approve, body) => {
+    pr.reviews ??= [];
+    pr.reviews.push({ id: pr.reviews.length + 1, user: { login }, state: approve ? 'APPROVED' : 'REQUEST_CHANGES', body, commit_id: pr.head,
+      submitted_at: iso(clock()), dismissed: false, stale: false, official: true });
+    return [approve ? 'pull_request_review_approved' : 'pull_request_review_rejected', { action: 'reviewed', repository, sender: { login },
+      number: pr.number, pull_request: pullView(pr), review: { type: approve ? 'pull_request_review_approved' : 'pull_request_review_rejected', content: body } }];
   };
 
   world.send = async (url, request) => {
@@ -115,6 +140,8 @@ export function createWorld(issueCount, clock) {
       if (!item) return answer({}, 404);
       // Forgejo refuses to close an issue that still has open dependencies (an epic with an open sub-issue).
       if (request.method === 'PATCH' && body?.state === 'closed' && (world.deps[m[1]] ?? []).some((n) => world.issues[n].state === 'open')) return answer({}, 422);
+      // A ticket closed right after a bot's pull request was merged: a bot's pull request belongs to no ticket (see the replay invariants).
+      if (request.method === 'PATCH' && body?.state === 'closed' && world.lastMerge?.author === 'renovate') (world.botClosed ??= []).push(Number(m[1]));
       if (request.method === 'PATCH' && body?.state) item.state = body.state;
       return answer(world.issues[m[1]] ? issueView(item) : { ...pullView(item), pull_request: { merged: item.merged } });
     }
@@ -164,14 +191,16 @@ export function createWorld(issueCount, clock) {
       return answer(pullView(pr));
     }
     if ((m = /^\/pulls\/(\d+)\/files$/.exec(path))) return world.pulls[m[1]] ? answer(Number(u.searchParams.get('page') || 1) > 1 ? [] : world.pulls[m[1]].files.map((filename) => ({ filename, status: 'modified' }))) : answer({}, 404);
-    if ((m = /^\/pulls\/(\d+)\/reviews$/.exec(path))) return answer([]);
+    if ((m = /^\/pulls\/(\d+)\/reviews$/.exec(path))) return answer(world.pulls[m[1]]?.reviews ?? []);
     // A merge moves the default branch to a merge commit, and Forgejo sends the push of it.
     if ((m = /^\/pulls\/(\d+)\/merge$/.exec(path)) && request.method === 'POST') {
       const pr = world.pulls[m[1]];
       if (!pr || pr.state !== 'open') return answer({}, 405);
+      world.lastMerge = null;
       const sha = commit('b');
       Object.assign(pr, { state: 'closed', merged: true, merged_at: iso(clock()), merge_sha: sha });
       world.history.push({ at: clock(), pr: pr.number, what: 'merge', sha: pr.head, labels: [...pr.labels] });
+      world.lastMerge = pr;
       const before = world.branches.main;
       world.parents[sha] = [before];
       world.branches.main = sha;
@@ -219,7 +248,8 @@ export function createWorld(issueCount, clock) {
   world.ciHook = (pr, outcome) => ['action_run_' + outcome, { action: outcome, prior_status: 'running', repository, sender,
     run: { id: world.shas, workflow_id: 'ci.yaml', commit_sha: pr.head, event: 'pull_request', status: outcome, html_url: 'https://forge.example/' + REPO + '/actions/runs/' + world.shas,
       repository, trigger_user: { login: 'openhands' },
-      event_payload: JSON.stringify({ action: 'synchronized', number: pr.number, pull_request: { number: pr.number, state: pr.state, merged: pr.merged, title: pr.title, body: 'Closes #' + pr.issue, head: { ref: pr.branch, sha: pr.head } } }) } }];
+      event_payload: JSON.stringify({ action: 'synchronized', number: pr.number, pull_request: { number: pr.number, state: pr.state, merged: pr.merged, title: pr.title,
+        body: pr.issue ? 'Closes #' + pr.issue : 'Updates a dependency.', user: { login: pr.author ?? 'openhands' }, head: { ref: pr.branch, sha: pr.head, repo: { full_name: REPO } } } }) } }];
   // The CI run of a push to the default branch, which REVERT_ON_RED reacts to when it fails.
   world.mainCiHook = (sha, outcome) => {
     world.shas += 1;
@@ -229,7 +259,7 @@ export function createWorld(issueCount, clock) {
         repository, trigger_user: { login: 'marcel' }, event_payload: JSON.stringify({ ref: 'refs/heads/main', after: sha }) } }];
   };
   world.mainPush = (before, after, pr) => ['push', { ref: 'refs/heads/main', before, after, repository, sender,
-    commits: [{ id: after, message: 'Merge pull request #' + pr.number + ' from ' + pr.branch + '\n\nCloses #' + pr.issue }], head_commit: { id: after } }];
+    commits: [{ id: after, message: 'Merge pull request #' + pr.number + ' from ' + pr.branch + (pr.issue ? '\n\nCloses #' + pr.issue : '') }], head_commit: { id: after } }];
   return world;
 }
 

@@ -38,7 +38,10 @@ const quiet = { error() {} };
 let dir;
 
 // Issue routes, rounds on the pull request, CI fix rounds and the review of a green commit, and merges of approved pull requests.
-const env = (file) => ({
+// Odd seeds run with native reviews as the verdict (VERDICT_SOURCE=review, a reviewer user of its own), even seeds with comments and labels.
+const modeOf = (seed) => (Number(String(seed).replace(/\D/g, '')) % 2 === 1 ? 'review' : 'comment');
+const REVIEWER_LOGIN = 'reviewer-bot';
+const env = (file, mode = 'comment') => ({
   FORGE_WEBHOOK_SECRET: SECRET,
   OPENHANDS_API_URL: 'http://openhands:8000/',
   OPENHANDS_API_KEY: 'k'.repeat(24),
@@ -50,7 +53,7 @@ const env = (file) => ({
     'ai:ready': { profile: WORKER, tier: 'free' },
     'ai:changes': { profile: CHANGES, tier: 'free', on: 'pull_request' },
     'ci:failure': { profile: CHANGES, tier: 'free', on: 'ci_failure' },
-    'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success' },
+    'ci:success': { profile: REVIEWER, tier: 'strong', on: 'ci_success', ...(mode === 'review' ? { forgejo_token_secret: 'REVIEWER_TOKEN' } : {}) },
     'sensitive:review': { profile: SECURITY, tier: 'strong', on: 'sensitive_review', forgejo_token_secret: 'SECURITY_TOKEN' },
     'epic:done': { profile: REVIEWER, tier: 'strong', on: 'epic_done' },
     'main:red': { profile: CHANGES, tier: 'free', on: 'main_red' }
@@ -58,7 +61,12 @@ const env = (file) => ({
   // Two keys: infra/tests/** merges with the security review's OK, after a hold; any other infra file needs the human.
   MERGE_POLICY: JSON.stringify({ [REPO]: { deny: ['infra/**'], two_keys: ['infra/tests/**'] } }),
   SECURITY_REVIEWERS: SECURITY_LOGIN,
-  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN',
+  AGENT_SECRETS: 'FORGE_TOKEN,FORGE_URL,SECURITY_TOKEN' + (mode === 'review' ? ',REVIEWER_TOKEN' : ''),
+  ...(mode === 'review' ? { VERDICT_SOURCE: 'review', REVIEWER_TOKEN: 'reviewer-token-value' } : {}),
+  // Dependency bot pull requests: renovate's branches renovate/..., one fix round on a red commit.
+  BOT_AUTHORS: 'renovate',
+  BOT_BRANCH_PREFIXES: 'renovate/',
+  BOT_FIX_ROUNDS: '1',
   SECURITY_TOKEN: 'security-token-value',
   TWO_KEYS_HOLD_MINUTES: String(HOLD_MINUTES),
   APPROVAL_GRACE_SECONDS: '0',
@@ -84,6 +92,7 @@ function seeds() {
 // ForgeHands restarting.
 function steps(seed, restarts) {
   const random = prng(seed);
+  const mode = modeOf(seed);
   const list = [];
   for (let index = 0; index < STEPS; index += 1) {
     const number = random.next() < 0.75 ? 1 + random.int(TICKETS) : 1 + TICKETS + random.int(ISSUES - TICKETS);
@@ -106,6 +115,10 @@ function steps(seed, restarts) {
     else if (roll < 0.71) list.push({ kind: 'mainCi', outcome: random.pick(['success', 'failure', 'failure']) });
     else if (roll < 0.73) list.push({ kind: 'revertPush' });
     else if (roll < 0.77) list.push({ kind: 'endReruns', green: random.next() < 0.4 });
+    else if (roll < 0.79) list.push({ kind: 'botPush', k: 1 + random.int(2) });
+    else if (roll < 0.81) list.push({ kind: 'botCi', k: 1 + random.int(2), outcome: random.pick(['success', 'success', 'failure']) });
+    else if (roll < 0.82) list.push({ kind: 'botShip', k: 1 + random.int(2) });
+    else if (mode === 'review' && roll < 0.85) list.push({ kind: 'review', number, approve: random.next() < 0.6 });
     else if (roll < 0.72) list.push({ kind: 'end', pick: random.int(1000), state: random.pick(['finished', 'finished', 'error', 'stuck', 'max_iterations']) });
     else if (restarts && roll < 0.78) list.push({ kind: 'restart' });
     else list.push({ kind: 'tick', minutes: random.pick([1, 5, 30, 240]) });
@@ -115,10 +128,10 @@ function steps(seed, restarts) {
 
 // A run of ForgeHands over one sequence. `clock` and the world live across restarts; the store, the dispatcher and the app are built again from
 // the files. Events reach ForgeHands as signed webhooks through the real app, as Forgejo sends them.
-async function harness(file) {
+async function harness(file, mode = 'comment') {
   const state = { clock: 1_700_000_000_000 };
   const world = createWorld(ISSUES, () => state.clock);
-  const config = loadConfig(env(file));
+  const config = loadConfig(env(file, mode));
   const boot = async () => {
     if (state.server) await new Promise((resolve) => state.server.close(resolve));
     state.jobs = new JobStore(file, quiet);
@@ -165,6 +178,25 @@ async function harness(file) {
       if (!pr) return;
       pr.labels.add(step.kind === 'approve' ? 'ai:approved' : 'ai:changes');
       await state.post(world.pullLabelHook(pr));
+    } else if (step.kind === 'review') {
+      // The reviewer user's native review of the head commit (review mode).
+      const target = step.pr ? world.pulls[step.pr] : pr;
+      if (!target || target.state !== 'open') return;
+      await state.post(world.review(target, REVIEWER_LOGIN, step.approve, VERDICT(step.approve)));
+    } else if (step.kind === 'botPush') {
+      world.pushBot(step.k);
+    } else if (step.kind === 'botCi' || step.kind === 'botShip') {
+      const bot = Object.values(world.pulls).find((entry) => entry.branch === 'renovate/dep-' + step.k && entry.state === 'open');
+      if (!bot) return;
+      if (step.kind === 'botCi') { world.statuses[bot.head] = step.outcome; await state.post(world.ciHook(bot, step.outcome)); return; }
+      // The happy path of a bot's pull request: green, an OK verdict, approved (by label, or by a native review in review mode).
+      world.statuses[bot.head] = 'success';
+      await state.post(world.ciHook(bot, 'success'));
+      state.clock += MINUTE;
+      world.comments += 1;
+      bot.comments.push({ id: world.comments, created_at: new Date(state.clock).toISOString(), user: { login: 'openhands' }, body: VERDICT(true) });
+      if (mode === 'review') await apply({ kind: 'review', pr: bot.number, approve: true });
+      else { bot.labels.add('ai:approved'); await state.post(world.pullLabelHook(bot)); }
     } else if (step.kind === 'ship') {
       // The happy path in one step: CI turns the head green, the reviewer writes OK and approves.
       if (!pr) return;
@@ -172,7 +204,8 @@ async function harness(file) {
       state.clock += MINUTE;
       await apply({ kind: 'verdict', number: step.number, ok: true });
       if (pr.files.some(DENY)) await apply({ kind: 'security', number: step.number, ok: true });
-      await apply({ kind: 'approve', number: step.number });
+      if (mode === 'review') await apply({ kind: 'review', number: step.number, approve: true });
+      else await apply({ kind: 'approve', number: step.number });
       // A merge is a push to the default branch, and CI runs on it.
       if (pr.merged && step.main && step.main !== 'none') { state.clock += MINUTE; await apply({ kind: 'mainCi', outcome: step.main }); }
     } else if (step.kind === 'security') {
@@ -245,11 +278,11 @@ async function harness(file) {
     while (world.outbox.length) await state.post(world.outbox.shift());
   };
   const close = async () => { await drain(); await new Promise((resolve) => state.server.close(resolve)); };
-  return { state, world, apply, drain, close, config };
+  return { state, world, apply, drain, close, config, mode };
 }
 
 // What must hold after every step, whatever came before.
-function checkInvariants(state, world) {
+function checkInvariants(state, world, mode = 'comment') {
   const jobs = state.jobs.list();
   const active = jobs.filter((job) => ACTIVE.has(job.status));
   const keys = active.map((job) => job.key);
@@ -257,6 +290,7 @@ function checkInvariants(state, world) {
   for (const job of jobs.filter((entry) => entry.status === 'running')) {
     assert.ok(job.conversation_id && world.conversations[job.conversation_id], 'a running job has a conversation OpenHands knows: ' + job.key);
   }
+  assert.deepEqual(world.botClosed ?? [], [], 'a merged bot pull request closes no ticket');
   const tiers = new Map();
   for (const job of jobs.filter((entry) => entry.status === 'running')) {
     const tier = state.dispatcher.tierOf(job) ?? state.dispatcher.config.routes.get(job.label)?.tier;
@@ -266,7 +300,14 @@ function checkInvariants(state, world) {
   // A merge happens only for an approved pull request whose head is green, and never while HOLD_LABEL is on. A protected path merges only through two keys: every protected
   // file is a two-keys file, the security reviewer said OK on that very commit, the hold had run its time since then, and HOLD_LABEL was off.
   for (const pr of Object.values(world.pulls).filter((entry) => entry.merged)) {
-    assert.ok(pr.labels.has('ai:approved'), 'a merged pull request was approved: #' + pr.number);
+    if (mode === 'review') {
+      // Native reviews: an approval of a reviewer on exactly the merged commit, and no later request for changes on it.
+      const onHead = (pr.reviews ?? []).filter((review) => review.commit_id === pr.head);
+      assert.ok(onHead.some((review) => review.state === 'APPROVED'), 'review mode: a merged pull request has an approval of its commit: #' + pr.number);
+      assert.notEqual(onHead.at(-1)?.state, 'REQUEST_CHANGES', 'review mode: the latest review of the merged commit is no request for changes: #' + pr.number);
+    } else {
+      assert.ok(pr.labels.has('ai:approved'), 'a merged pull request was approved: #' + pr.number);
+    }
     assert.equal(world.statuses[pr.head], 'success', 'a merged pull request had a green head: #' + pr.number);
     const merge = world.history.find((entry) => entry.pr === pr.number && entry.what === 'merge');
     assert.ok(!merge.labels.includes('ai:hold'), 'nothing merges while HOLD_LABEL is on: #' + pr.number);
@@ -310,17 +351,18 @@ async function settle(state, world, apply) {
 }
 
 async function replay(seed, restarts, file, list = steps(seed, restarts)) {
-  const { state, world, apply, close } = await harness(file);
+  const mode = modeOf(seed);
+  const { state, world, apply, close } = await harness(file, mode);
   let index = 0;
   try {
     for (; index < list.length; index += 1) {
       await apply(list[index]);
-      checkInvariants(state, world);
+      checkInvariants(state, world, mode);
     }
     await settle(state, world, apply);
   } catch (error) {
     // The node test reporter prints the stack of an assertion, so the seed and the steps go into a new error of their own.
-    const replayed = new Error(error.message + '\nseed ' + seed + (restarts ? ' (with restarts)' : '') + ', at step ' + index + ' of\n' +
+    const replayed = new Error(error.message + '\nseed ' + seed + ' (' + mode + ' mode' + (restarts ? ', with restarts' : '') + ')' + ', at step ' + index + ' of\n' +
       list.map((step, at) => at + ' ' + JSON.stringify(step)).join('\n'), { cause: error });
     replayed.stack = replayed.message;
     throw replayed;
@@ -360,8 +402,8 @@ test('a restart in the middle of a sequence ends in the same ledger as the run w
     const at = 1 + random.int(plain.length - 1);
     const fileA = join(dir, 'a-' + seed + '.json');
     const fileB = join(dir, 'b-' + seed + '.json');
-    const a = await harness(fileA);
-    const b = await harness(fileB);
+    const a = await harness(fileA, modeOf(seed));
+    const b = await harness(fileB, modeOf(seed));
     for (let index = 0; index < plain.length; index += 1) {
       if (index === at) await b.apply({ kind: 'restart' });
       // Both runs wait for the pass a webhook starts in the background, so that only the restart tells them apart.
