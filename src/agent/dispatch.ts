@@ -38,6 +38,7 @@ import type { PreExisting } from './run-states.ts';
 import { WaitKeeper } from './wait-keeper.ts';
 import { RevertKeeper } from './revert-keeper.ts';
 import { BranchRefresher } from './branch-refresh.ts';
+import { SecurityReview } from './security-review.ts';
 export { conversationCost, tokenUsage } from './run-states.ts';
 
 
@@ -91,6 +92,7 @@ export class Dispatcher {
   waitKeeper: WaitKeeper = new WaitKeeper(this);
   revertKeeper: RevertKeeper = new RevertKeeper(this);
   branchRefresher: BranchRefresher = new BranchRefresher(this);
+  securityReview: SecurityReview = new SecurityReview(this);
   constructor(config: DirectConfig, jobs: JobStore, send: Fetch = fetch, logger: Logger = console, now: () => number = Date.now, notifier?: Notifier) {
     this.config = config;
     this.jobs = jobs;
@@ -568,7 +570,7 @@ export class Dispatcher {
     if (open.length) return { status: 'waiting' };
     // The earlier approval does not cover what this run will push or review.
     if (event.pull_request) await this.merger.clearApproval(event);
-    if (kind === 'ci_success') await this.startSecurityReview(event);
+    if (kind === 'ci_success') await this.securityReview.startSecurityReview(event);
     this.tick().catch((error) => this.logger.error('dispatch failed:', error.message));
     return { status: 'queued' };
   }
@@ -939,7 +941,7 @@ export class Dispatcher {
     delete job.waiting_for_run;
     job.status = 'queued';
     await this.merger.clearApproval(event);
-    if (kind === 'ci_success') await this.startSecurityReview(event);
+    if (kind === 'ci_success') await this.securityReview.startSecurityReview(event);
     return true;
   }
 
@@ -981,62 +983,6 @@ export class Dispatcher {
     } catch (error) {
       this.logger.error('commit status failed:', error.message);
       return false;
-    }
-  }
-
-  // A green commit of a pull request that changes a protected path (the deny list of the merge policy of its repository) also gets a
-  // security review, once per commit, when a route of kind sensitive_review exists. It is advisory: no label, no round, no merge.
-  async startSecurityReview(event: ForgeEvent): Promise<void> {
-    const route = [...this.config.routes].find(([, entry]) => entry.kind === 'sensitive_review')?.[0];
-    if (!route || !event.pull_request || !event.ci || !this.config.forgejo) return;
-    const key = this.issueKey(event) + ':' + route + ':' + event.ci.commit_sha.slice(0, 8);
-    if (this.jobs.list().some((job) => job.key === key)) return;
-    const policy = this.config.mergePolicy.get(event.repository.full_name.toLowerCase());
-    if (!policy) return;
-    try {
-      const files = await this.merger.changedFiles(event.repository.full_name, event.pull_request.number);
-      const hit = [...new Set(files.filter((name) => policy.deny.some((pattern) => pattern.test(name))))];
-      if (!hit.length) return;
-      this.jobs.add({ key, label: route, event: { ...event, type: 'ci.sensitive', label: route, protected_files: hit.slice(0, 20) }, status: 'queued', created: this.now() });
-      await this.jobs.persist(this.now());
-    } catch (error) {
-      this.logger.error('could not start the security review of ' + this.issueKey(event) + ':', error.message);
-    }
-  }
-
-  // The security review is advisory: when its run ends without the comment, run it once more; after that it is only logged.
-  async checkSecurityReview(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || (pr.head?.sha && pr.head.sha !== event.ci.commit_sha)) return;
-      if (await this.merger.securityReview(event.repository.full_name, event.pull_request.number, event.ci.commit_sha)) { await this.handOverAfterSecurity(job); return; }
-      if (!job.verdict_retry) {
-        Object.assign(job, { status: 'queued', verdict_retry: 1, started: undefined, conversation_id: undefined, finished: undefined, result: undefined });
-        this.logger.error('security review ' + job.key + ' ended without a comment, running it once more');
-        return;
-      }
-      this.logger.error('security review ' + job.key + ' ended twice without a comment');
-      await this.handOverAfterSecurity(job);
-    } catch (error) {
-      this.logger.error('could not check the security review of #' + event.pull_request.number + ':', error.message);
-    }
-  }
-
-  // The hand-over of an approved protected-path pull request waits for its security review (see Merger.handle); when that run has ended
-  // (with its comment, without one, or failed) the approval is looked at again, which hands the pull request over with what was found.
-  async handOverAfterSecurity(job: Job): Promise<void> {
-    const event = job.event;
-    if (!this.config.forgejo || !event?.pull_request || !event.ci) return;
-    try {
-      const pr = await this.forge.getPull(event.repository.full_name, event.pull_request.number);
-      if (!pr || pr.state !== 'open' || pr.merged || pr.head?.sha !== event.ci.commit_sha) return;
-      const labelled = (pr.labels || []).some((label: Json) => label.name === this.config.approvedLabel);
-      if (!labelled && !(this.config.verdictSource !== 'comment' && (await this.merger.reviewOf(event.repository.full_name, event.pull_request.number, pr.head.sha)).ok)) return;
-      await this.merger.handle(event);
-    } catch (error) {
-      this.logger.error('could not hand #' + event.pull_request.number + ' over after its security review:', error.message);
     }
   }
 
@@ -1856,7 +1802,7 @@ export class Dispatcher {
       await this.waitKeeper.releaseFileWaits();
       const done = this.config.routes.get(job.label)?.kind;
       if (done === 'ci_success') await this.checkVerdict(job);
-      else if (done === 'sensitive_review') { if (state === 'finished') await this.checkSecurityReview(job); else await this.handOverAfterSecurity(job); }
+      else if (done === 'sensitive_review') { if (state === 'finished') await this.securityReview.checkSecurityReview(job); else await this.securityReview.handOverAfterSecurity(job); }
       else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
       else if (done === 'issue') await this.checkDelivery(job);
       else if (done === 'pull_request') await this.checkRoundsAfterRun(job);
