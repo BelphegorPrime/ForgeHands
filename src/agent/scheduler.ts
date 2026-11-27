@@ -2,7 +2,7 @@
 // and the start of a conversation.
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
-import { buildPrompt, workspacePath } from './prompt.ts';
+import { buildPrompt } from './prompt.ts';
 import { checkFacts } from './checks.ts';
 import { isDry } from '../dry.ts';
 import { stallLine } from './review-sweep.ts';
@@ -180,9 +180,10 @@ export class Scheduler {
     const notes = !job.event.pull_request && this.host.config.routes.get(job.label)?.kind === 'issue' && !this.host.isPlannerLabel(job.label)
       ? await this.host.preflight.notesOf(job.event) : [];
     // A Git global config file of the run's own, so that two conversations of the same checkout never share what one writes with
-    // `git config --global` (a credential helper, an include, a URL rewrite). The path is only a name below the checkout and is
-    // never created here; a Git process that inherits the conversation environment points GIT_CONFIG_GLOBAL at it.
-    const gitConfigGlobal = posix.join(workspacePath(this.host.config, job.event), randomUUID(), '.gitconfig');
+    // `git config --global` (a credential helper, an include, a URL rewrite). It lives outside every checkout: created before a
+    // clone it must not make the clone directory non-empty, and written after it must not land in the working tree. The path is
+    // only a name and is never created here; a Git process that inherits the conversation environment points GIT_CONFIG_GLOBAL at it.
+    const gitConfigGlobal = posix.join(this.host.config.workspaceDir, '.gitconfig.d', randomUUID() + '.gitconfig');
     const body: Json = {
       workspace: { working_dir: this.host.config.workspaceDir },
       agent_profile_id: effective.profile,

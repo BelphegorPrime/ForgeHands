@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/server/app.ts';
 import { DeliveryStore } from '../src/store/deliveries.ts';
@@ -38,6 +38,9 @@ test('conversations get the agent secrets, and the ledger never stores them', as
   assert.equal(body.secrets.FORGEJO_TOKEN.kind, 'StaticSecret');
   assert.equal(body.secrets.FORGEJO_TOKEN.value, 'tok-secret-value');
   assert.equal(body.secrets.GIT_CONFIG_GLOBAL.kind, 'StaticSecret');
+  assert.ok(body.secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/.gitconfig.d/'));
+  assert.ok(!body.secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-3/'));
+  assert.match(posix.basename(body.secrets.GIT_CONFIG_GLOBAL.value), /^[0-9a-f-]{36}\.gitconfig$/);
   assert.doesNotMatch(body.initial_message.content[0].text, /tok-secret-value/);
   await jobs.persist();
   const { readFile } = await import('node:fs/promises');

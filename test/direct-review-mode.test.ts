@@ -202,14 +202,16 @@ test('a reviewer route hands its own Forgejo token to its conversation as FORGEJ
   assert.ok(!('REVIEWER_TOKEN' in review));
   assert.equal(worker.FORGEJO_TOKEN.value, 'tok-secret-value');
   assert.ok(!JSON.stringify(worker).includes('tok-reviewer'));
-  // Both get a Git global config of their own, under their own checkout: the worker's path never appears in the review's payload.
-  assert.ok(review.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-26-review-abcdef01/'));
-  assert.ok(worker.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-27/'));
-  assert.equal(posix.basename(review.GIT_CONFIG_GLOBAL.value), '.gitconfig');
+  // Both get a Git global config of their own, below the workspace's .gitconfig.d and outside every checkout: neither can leak
+  // what the other writes, and the worker's path never appears in the review's payload.
+  assert.ok(review.GIT_CONFIG_GLOBAL.value.startsWith('/projects/.gitconfig.d/'));
+  assert.ok(worker.GIT_CONFIG_GLOBAL.value.startsWith('/projects/.gitconfig.d/'));
+  assert.ok(!review.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-26-review-abcdef01/'));
+  assert.match(posix.basename(review.GIT_CONFIG_GLOBAL.value), /^[0-9a-f-]{36}\.gitconfig$/);
   assert.notEqual(review.GIT_CONFIG_GLOBAL.value, worker.GIT_CONFIG_GLOBAL.value);
 });
 
-test('every start always gets a ForgeHands-owned GIT_CONFIG_GLOBAL below its checkout, even with no agent secrets', async () => {
+test('every start always gets a ForgeHands-owned GIT_CONFIG_GLOBAL below WORKSPACE_DIR/.gitconfig.d, even with no agent secrets', async () => {
   const config = loadConfig(env({ AGENT_SECRETS: '', WORKSPACE_DIR: '/workspace/checkouts' }));
   const jobs = new JobStore(join(ctx.dir, 'jobs.json'));
   await jobs.load();
@@ -223,9 +225,10 @@ test('every start always gets a ForgeHands-owned GIT_CONFIG_GLOBAL below its che
   assert.equal(entry.description, 'Provided by ForgeHands');
   assert.ok(posix.isAbsolute(entry.value), 'absolute POSIX path');
   const checkout = '/workspace/checkouts/owner-hello-issue-7';
-  assert.ok(entry.value.startsWith(checkout + '/'), 'inside the run checkout');
-  assert.equal(posix.relative(checkout, entry.value).split('/').length, 2, 'one UUID directory and the .gitconfig basename');
-  assert.equal(posix.basename(entry.value), '.gitconfig');
+  assert.ok(entry.value.startsWith('/workspace/checkouts/.gitconfig.d/'), 'below the workspace .gitconfig.d');
+  assert.ok(!entry.value.startsWith(checkout + '/'), 'not inside the run checkout');
+  assert.equal(posix.relative('/workspace/checkouts', entry.value).split('/').length, 2, '.gitconfig.d and the UUID file');
+  assert.match(posix.basename(entry.value), /^[0-9a-f-]{36}\.gitconfig$/);
   assert.equal(body.workspace.working_dir, '/workspace/checkouts', 'working directory unchanged');
   const own = new RegExp(entry.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   assert.doesNotMatch(body.initial_message.content[0].text, own, 'not in the prompt');
@@ -248,8 +251,9 @@ test('a configured GIT_CONFIG_GLOBAL is overridden by the per-start path', async
   const secrets = starts()[0].body.secrets;
   assert.deepEqual(Object.keys(secrets), ['FORGEJO_TOKEN', 'FORGEJO_URL', 'GIT_CONFIG_GLOBAL']);
   assert.notEqual(secrets.GIT_CONFIG_GLOBAL.value, '/tmp/operator-global');
-  assert.ok(secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-9/'));
-  assert.equal(posix.basename(secrets.GIT_CONFIG_GLOBAL.value), '.gitconfig');
+  assert.ok(secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/.gitconfig.d/'));
+  assert.ok(!secrets.GIT_CONFIG_GLOBAL.value.startsWith('/projects/owner-hello-issue-9/'));
+  assert.match(posix.basename(secrets.GIT_CONFIG_GLOBAL.value), /^[0-9a-f-]{36}\.gitconfig$/);
 });
 
 test('a retry of the same checkout gets a fresh GIT_CONFIG_GLOBAL path', async () => {
@@ -266,12 +270,12 @@ test('a retry of the same checkout gets a fresh GIT_CONFIG_GLOBAL path', async (
   assert.equal(bodies.length, 2);
   const [a, b] = bodies.map((body) => body.secrets.GIT_CONFIG_GLOBAL.value);
   assert.equal(a, first);
-  const checkout = '/projects/owner-hello-issue-42';
+  const configDir = '/projects/.gitconfig.d';
   for (const value of [a, b]) {
-    assert.ok(value.startsWith(checkout + '/'), 'same checkout');
-    assert.equal(posix.basename(value), '.gitconfig');
+    assert.ok(value.startsWith(configDir + '/'), 'outside every checkout');
+    assert.match(posix.basename(value), /^[0-9a-f-]{36}\.gitconfig$/);
   }
-  assert.notEqual(a, b, 'a fresh UUID directory on the retry');
+  assert.notEqual(a, b, 'a fresh UUID file name on the retry');
   assert.equal(bodies[1].workspace.working_dir, '/projects', 'working directory unchanged');
 });
 
