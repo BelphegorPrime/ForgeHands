@@ -155,6 +155,63 @@ test('a parent comment with owner/repo#n attribution is reported once', async ()
   assert.equal(byNumber(27).clone_retries, undefined);
 });
 
+test('a parent comment naming owner/repo#261 reports only ticket 261, not 26', async () => {
+  const started = ctx.clock;
+  const attributed = 'git clone https://forge.example/owner/hello.git failed: fatal: owner/hello#261 could not read from remote repository';
+  const blocks = { 26: [{ number: 4 }], 261: [{ number: 4 }] };
+  const t = await buildTickets({ tickets: [26, 261], comments: { 4: [comment(attributed, 'openhands', started)] }, blocks });
+  await t.endAll();
+  const record = failures(t.jobs);
+  assert.equal(record.length, 1);
+  const byNumber = (number) => t.jobs.list().find((job) => job.event.issue.number === number);
+  assert.equal(byNumber(261).clone_retries, 1);
+  assert.equal(byNumber(26).clone_retries, undefined);
+});
+
+test('the comments of a pull request whose head is in this repository are read', async () => {
+  const started = ctx.clock;
+  const pull = { number: 34, head: { ref: 'ai/issue-26', repo: { full_name: 'owner/hello' } }, updated_at: new Date(started - 2 * 60000).toISOString() };
+  const t = await buildDelivery({ pulls: [pull], routes: { ['GET ' + API + '/issues/34/comments']: () => [comment(CLONE, 'openhands', started)] } });
+  await t.end();
+  assert.equal(failures(t.jobs).length, 1);
+  assert.equal(t.job.clone_retries, 1);
+});
+
+test('the comments of a fork pull request with the same branch name are not read', async () => {
+  const started = ctx.clock;
+  const pull = { number: 34, head: { ref: 'ai/issue-26', repo: { full_name: 'fork/hello' } }, updated_at: new Date(started - 2 * 60000).toISOString() };
+  const t = await buildDelivery({ pulls: [pull], routes: { ['GET ' + API + '/issues/34/comments']: () => [comment(CLONE, 'openhands', started)] } });
+  await t.end();
+  assert.equal(failures(t.jobs).length, 0);
+  assert.equal(t.job.clone_retries, undefined);
+  assert.equal(t.forgejo.calls.some((call) => call.path === API + '/issues/34/comments'), false);
+  assert.equal(t.job.delivery_retry, 1);
+});
+
+test('a run replaced while its comments are read is neither requeued nor escalated', async () => {
+  const started = ctx.clock;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let arrived;
+  const reading = new Promise((resolve) => { arrived = resolve; });
+  const t = await buildDelivery({ routes: {
+    ['GET ' + API + '/issues/26/comments']: async () => { arrived(); await gate; return [comment(CLONE, 'openhands', started)]; }
+  } });
+  const job = t.job;
+  ctx.clock += 5 * 60000;
+  ctx.states[job.conversation_id] = 'finished';
+  const ended = t.dispatcher.tick();
+  await reading;
+  const enqueued = await t.dispatcher.enqueue(event('ai:ready', 26));
+  assert.equal(enqueued.status, 'queued');
+  release();
+  await ended;
+  assert.equal(failures(t.jobs).length, 0);
+  assert.equal(job.clone_retries, undefined);
+  assert.equal(job.status, 'done');
+  assert.equal(job.delivery_retry, undefined);
+});
+
 test('a replay of the same conversation counts once and retries again', async () => {
   const comments = [];
   const t = await buildDelivery({ comments });

@@ -166,6 +166,8 @@ export class DeliveryCheck {
     } catch (error) {
       this.host.logger.error('could not read what #' + issue + ' blocks:', error.message);
     }
+    // The reads take a while: a fresh run queued meanwhile takes over, so nothing here may requeue or escalate the old one.
+    if (this.superseded(job)) return true;
     for (const candidate of candidates) {
       for (const comment of Array.isArray(candidate.comments) ? candidate.comments : []) {
         const report = classifyCloneHandback({ comment: { login: comment.user?.login, created_at: comment.created_at, body: comment.body },
@@ -176,6 +178,7 @@ export class DeliveryCheck {
         } catch (error) {
           this.host.logger.error('could not report the clone failure of ' + job.key + ':', error.message);
         }
+        if (this.superseded(job)) return true;
         if ((job.clone_retries ?? 0) >= CLONE_RETRY_LIMIT) return false;
         Object.assign(job, { status: 'queued', next_try: now + CLONE_RETRY_DELAY_MS, started: undefined, conversation_id: undefined,
           finished: undefined, result: undefined, clone_retries: (job.clone_retries ?? 0) + 1 });
