@@ -62,6 +62,8 @@ const T = {
     operatorSubject: 'needs an operator (a prerequisite only a person can set up)',
     operatorText: 'The plan needs something only an operator can set up. The tickets that depend on this one wait until it is closed.',
     epicGaps: 'The review found the epic still open, after the planner had its try. A human decides: close it, add sub-issues for what is missing, or change its criteria.',
+    cloneBreakerSubject: 'ForgeHands: new starts are paused',
+    cloneBreakerText: 'New starts are paused after repeated failed repository clones. They resume after one successful trial. Check the sandbox and the forge address.',
     epicReviewer: (reason: string) => 'Reviewer: ' + reason,
     protectedPaths: 'it touches protected paths',
     files: (count: number) => 'Files in protected paths: ' + count,
@@ -105,6 +107,8 @@ const T = {
     operatorSubject: 'braucht einen Operator (eine Voraussetzung, die nur ein Mensch einrichten kann)',
     operatorText: 'Der Plan braucht etwas, das nur ein Operator einrichten kann. Die Tickets, die davon abhängen, warten, bis dieses Ticket geschlossen ist.',
     epicGaps: 'Die Prüfung hat das Epic offen gelassen, nachdem der Planer es versucht hatte. Eine Entscheidung von dir: schließen, Unter-Issues für das Fehlende anlegen oder die Kriterien ändern.',
+    cloneBreakerSubject: 'ForgeHands: neue Starts sind pausiert',
+    cloneBreakerText: 'Neue Starts sind nach wiederholten fehlgeschlagenen Repository-Klonen pausiert. Sie laufen nach einem erfolgreichen Probelauf wieder an. Prüfe die Sandbox und die Forge-Adresse.',
     epicReviewer: (reason: string) => 'Prüfer: ' + reason,
     protectedPaths: 'er berührt geschützte Pfade',
     files: (count: number) => 'Dateien in geschützten Pfaden: ' + count,
@@ -156,6 +160,7 @@ function immediatePlain(language: NotifyLanguage, kind: string, facts: Facts): N
     const reviewer = String(facts.reason ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim().slice(0, 300);
     return { ...base, subject: head(facts) + ' ' + t.epicSubject, text: lines(title, t.epicGaps, reviewer ? t.epicReviewer(reviewer) : '') };
   }
+  if (kind === 'handover' && facts.why === 'clone_breaker') return { ...base, subject: t.cloneBreakerSubject, text: t.cloneBreakerText };
   if (kind === 'handover') {
     const reason = String(facts.reason ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim().slice(0, 200) || t.protectedPaths;
     return { ...base, subject: head(facts) + ' ' + t.handoverSubject, text: lines(title, t.handoverDone(facts.security ?? 'none'), t.handoverWhy(reason), facts.files ? t.files(facts.files) : '') };

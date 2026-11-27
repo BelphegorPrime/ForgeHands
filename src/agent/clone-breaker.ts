@@ -138,13 +138,16 @@ export class CloneBreaker {
   }
 
   // The incident's one notification: claimed durably before it is sent. A reopen keeps the claim; only a new incident claims again.
+  // The claim counts only once the ledger holds it: on a failed write it is taken back, so a later call (after the ledger recovers)
+  // can claim it, and a restart never finds an incident marked as told that was not.
   async claimNotification(now = this.now()): Promise<boolean> {
     this.normalize(now);
     const record = this.record();
     if (record.state === 'closed' || record.notified) return false;
     record.notified = true;
-    await this.save(now);
-    return true;
+    if (await this.save(now)) return true;
+    record.notified = false;
+    return false;
   }
 
   // What the status views publish: state and timing only, never the evidence behind it.
@@ -257,11 +260,14 @@ export class CloneBreaker {
     return { class: report.class, repository, conversation };
   }
 
-  private async save(now: number): Promise<void> {
+  // True when the ledger was written.
+  private async save(now: number): Promise<boolean> {
     try {
       await this.jobs.persist(now);
+      return true;
     } catch (error) {
       this.logger.error('clone breaker: the ledger could not be written:', (error as Error)?.message);
+      return false;
     }
   }
 }

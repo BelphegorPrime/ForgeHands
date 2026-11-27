@@ -39,7 +39,8 @@ test('every environment variable ForgeHands reads is documented in the README an
 
 // The metric names are part of the interface: dashboards and alerts are built on them.
 const METRICS = [
-  'forgehands_blocks_total', 'forgehands_branch_conflicts_total', 'forgehands_branch_updates_total', 'forgehands_clone_breaker_state', 'forgehands_comment_ignored_total',
+  'forgehands_blocks_total', 'forgehands_branch_conflicts_total', 'forgehands_branch_updates_total', 'forgehands_clone_breaker_state',
+  'forgehands_clone_breaker_transitions_total', 'forgehands_comment_ignored_total',
   'forgehands_comment_restarts_total', 'forgehands_conversations_deleted_total', 'forgehands_deleted_tickets_total', 'forgehands_dry_run_writes_total',
   'forgehands_epic_gaps_total', 'forgehands_epic_sweep_starts_total', 'forgehands_error_retries_total', 'forgehands_escalated_rounds_total',
   'forgehands_failure_escalations_total', 'forgehands_forgejo_api_errors_total', 'forgehands_handbacks_total', 'forgehands_idle_jobs', 'forgehands_jobs',

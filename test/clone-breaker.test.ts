@@ -296,3 +296,17 @@ test('a recovered incident needs a new trip before it notifies again', async () 
   assert.equal(await breaker.claimNotification(), true);
   assert.equal(await breaker.claimNotification(), false);
 });
+
+test('a notification claim counts only when the ledger is written, and is retried after the ledger recovers', async () => {
+  const { jobs, breaker } = await loaded();
+  await trip(breaker);
+  const persist = jobs.persist.bind(jobs);
+  jobs.persist = async () => { throw new Error('disk full'); };
+  assert.equal(await breaker.claimNotification(), false, 'no claim while the ledger cannot be written');
+  jobs.persist = persist;
+  const restarted = (await loaded()).breaker;
+  assert.equal(restarted.snapshot().state, 'open');
+  assert.equal(await restarted.claimNotification(), true, 'the incident is still unclaimed after a restart');
+  assert.equal((await saved()).meta.clone_breaker.notified, true);
+  assert.equal(await restarted.claimNotification(), false, 'claimed once per incident');
+});

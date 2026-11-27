@@ -49,7 +49,8 @@ const COUNTERS: Record<string, string> = {
   forgehands_merges_reverted_total: 'Merges ForgeHands made whose revert pull request was merged, by repository (counted once per merge).',
   forgehands_reverts_needing_human_total: 'Merges after which a red default branch needed a human (no revert route, a revert that went red, a ticket blocked after its revert), by repository.',
   forgehands_comment_ignored_total: 'Answers of HUMAN_LOGIN to a planner that started nothing, by reason (has_sub_issues, not_open, label_gone, links_unknown, issue_unreadable, plan_answers_used_up).',
-  forgehands_preflight_total: 'Worker tickets checked by the ticket pre-flight (TICKET_PREFLIGHT), by result (ok, rejected, advised, skipped) and rule (1 to 4 for a rejection or an advisory finding, none otherwise); a rejection counts once per blocking rule it breaks (TICKET_PREFLIGHT_BLOCK), an advised finding once per advisory rule, a skip is a ticket worked on before or with an open pull request.'
+  forgehands_preflight_total: 'Worker tickets checked by the ticket pre-flight (TICKET_PREFLIGHT), by result (ok, rejected, advised, skipped) and rule (1 to 4 for a rejection or an advisory finding, none otherwise); a rejection counts once per blocking rule it breaks (TICKET_PREFLIGHT_BLOCK), an advised finding once per advisory rule, a skip is a ticket worked on before or with an open pull request.',
+  forgehands_clone_breaker_transitions_total: 'Transitions of the clone breaker, by the state before and after (closed, open, half_open).'
 };
 const GAUGES: Record<string, string> = {
   forgehands_jobs: 'Jobs in the ledger (it keeps 30 days), by status and route kind.',
@@ -76,6 +77,8 @@ export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_r
   'Issue Hook', 'Merge Request Hook', 'Pipeline Hook', 'Push Hook'];
 const STATUSES = ['waiting', 'queued', 'running', 'done', 'failed', 'deleted'];
 const KINDS = ['issue', 'pull_request', 'ci_failure', 'ci_success', 'epic_done', 'conflict', 'sensitive_review', 'main_red'];
+// The states the ledger accepts (src/store/jobs.ts keeps the same list): both labels of the transition counter are bounded to them.
+export const CLONE_BREAKER_STATES: readonly CloneBreakerState[] = ['closed', 'open', 'half_open'];
 
 const escapeLabel = (value: string): string => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 const escapeHelp = (value: string): string => value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
@@ -159,7 +162,7 @@ class Metrics {
 }
 // Counters that always carry labels: without a sample they show no line (a bare `name 0` would be a series of its own).
 const LABELLED: Record<string, true> = Object.fromEntries(['forgehands_webhook_deliveries_total', 'forgehands_runs_started_total', 'forgehands_runs_finished_total', 'forgehands_merges_total',
-  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_stalled_ticket_actions_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total', 'forgehands_comment_ignored_total', 'forgehands_preflight_total'].map((name) => [name, true]));
+  'forgehands_merge_refusals_total', 'forgehands_blocks_total', 'forgehands_tier_runs_total', 'forgehands_openhands_api_errors_total', 'forgehands_forgejo_api_errors_total', 'forgehands_notifications_total', 'forgehands_resumes_total', 'forgehands_nudges_total', 'forgehands_tokens_total', 'forgehands_wait_cycles_broken_total', 'forgehands_stuck_pr_blocks_total', 'forgehands_epic_gaps_total', 'forgehands_stalled_ticket_actions_total', 'forgehands_merges_reverted_total', 'forgehands_reverts_needing_human_total', 'forgehands_comment_ignored_total', 'forgehands_preflight_total', 'forgehands_clone_breaker_transitions_total'].map((name) => [name, true]));
 
 export const metrics = new Metrics();
 
