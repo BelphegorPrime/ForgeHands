@@ -17,9 +17,11 @@ import { Notifier, mentionOf, pullUrl } from '../notify/index.ts';
 import { collectDigest, collectFixes, digestDue } from '../notify/digest.ts';
 import { digestIsEmpty, digestMessage, immediateMessage } from '../notify/texts.ts';
 import type { Facts } from '../notify/texts.ts';
-import { metrics } from '../metrics.ts';
+import { metrics, known, CLONE_BREAKER_STATES } from '../metrics.ts';
+import { CloneBreaker } from './clone-breaker.ts';
+import type { CloneFailureReport, CloneTrialOutcome } from './clone-breaker.ts';
 import { isBotPull } from './bot.ts';
-import type { BranchPushEvent, DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NormalizedEvent, PushEvent } from '../types.ts';
+import type { BranchPushEvent, CloneBreakerState, DirectConfig, Route, Fetch, ForgeEvent, Job, Json, Logger, NormalizedEvent, PushEvent } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
 import type { Forge } from '../forge/index.ts';
 import type { Issue } from '../types/forge.ts';
@@ -72,6 +74,9 @@ export class Dispatcher {
   e2eTickets = new Set<string>();
   /** When a job last started (a start of this process counts from its start): the stall alert measures the quiet time from it. */
   lastStart: number;
+  /** The shared clone breaker: one sandbox outage holds every new start until one successful trial. Hydrated once in the first pass. */
+  cloneBreaker: CloneBreaker;
+  cloneBreakerHydrated = false;
 
   nudger: Nudger = new Nudger(this);
   waitKeeper: WaitKeeper = new WaitKeeper(this);
@@ -89,6 +94,7 @@ export class Dispatcher {
     this.send = send;
     this.logger = logger;
     this.now = now;
+    this.cloneBreaker = new CloneBreaker(jobs, now, logger);
     this.lastStart = now();
     this.dry = new DryLog(logger);
     this.transport = createTransport(config, send, this.dry);
@@ -590,6 +596,55 @@ export class Dispatcher {
     this.notifier.notify(immediateMessage(this.config.notify.language, 'handover', { repository, number, title, link: link ?? undefined, why: 'operator_prerequisite' }), repository);
   }
 
+  // One confirmed clone failure; when it opens the breaker from closed, the incident's one hand-over is claimed and sent.
+  async reportCloneFailure(report: CloneFailureReport, repository: string): Promise<boolean> {
+    const from = this.cloneBreaker.state();
+    const changed = await this.cloneBreaker.reportFailure(report);
+    const to = this.cloneBreaker.state();
+    this.cloneTransition(from, to);
+    if (from === 'closed' && to === 'open' && await this.cloneBreaker.claimNotification()) this.tellCloneBreaker(repository);
+    return changed;
+  }
+
+  async admitCloneTrial(owner: string): Promise<boolean> {
+    const from = this.cloneBreaker.state();
+    const admitted = await this.cloneBreaker.admitTrial(owner);
+    this.cloneTransition(from, this.cloneBreaker.state());
+    return admitted;
+  }
+
+  async confirmCloneTrial(owner: string, conversation: string): Promise<boolean> {
+    const from = this.cloneBreaker.state();
+    const confirmed = await this.cloneBreaker.confirmTrial(owner, conversation);
+    this.cloneTransition(from, this.cloneBreaker.state());
+    return confirmed;
+  }
+
+  async abandonCloneTrial(owner: string): Promise<boolean> {
+    const from = this.cloneBreaker.state();
+    const abandoned = await this.cloneBreaker.abandonTrial(owner);
+    this.cloneTransition(from, this.cloneBreaker.state());
+    return abandoned;
+  }
+
+  async settleCloneTrial(conversation: string, outcome: CloneTrialOutcome): Promise<boolean> {
+    const from = this.cloneBreaker.state();
+    const settled = await this.cloneBreaker.settleTrial(conversation, outcome);
+    this.cloneTransition(from, this.cloneBreaker.state());
+    return settled;
+  }
+
+  private cloneTransition(from: CloneBreakerState, to: CloneBreakerState): void {
+    if (from === to) return;
+    metrics.inc('forgehands_clone_breaker_transitions_total', { from: known(from, CLONE_BREAKER_STATES), to: known(to, CLONE_BREAKER_STATES) });
+  }
+
+  // One hand-over per incident: the claim is durable, so a restart or a reopen sends nothing.
+  private tellCloneBreaker(repository: string): void {
+    if (!this.notifier.wants('handover')) return;
+    this.notifier.notify(immediateMessage(this.config.notify.language, 'handover', { repository, number: 0, title: 'ForgeHands: new starts are paused', why: 'clone_breaker' }), repository);
+  }
+
   // The operator tickets for /status (waiting_for_human): the ones not closed yet, with their titles.
   operatorWaiting(): OperatorEntry[] {
     return [...this.jobs.operatorTickets.values()].map((record) => ({ repository: record.repository, issue: record.issue, pr: null, since: record.at,
@@ -986,6 +1041,10 @@ export class Dispatcher {
   }
 
   async pass(): Promise<void> {
+    if (!this.cloneBreakerHydrated) {
+      this.cloneBreakerHydrated = true;
+      await this.cloneBreaker.hydrate();
+    }
     let changed = false;
     const now = this.now();
     // The disk guard is read first: a hold set here keeps the queued jobs waiting in the loop below.
