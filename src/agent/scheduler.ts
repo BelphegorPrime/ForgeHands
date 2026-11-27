@@ -13,7 +13,7 @@ import { RETRY_BASE_MS, MAX_ATTEMPTS, ROUND_KINDS, RECENT_STARTS } from './run-s
 import type { Dispatcher } from './dispatch.ts';
 
 // What Scheduler reaches on the dispatcher. Read through the host on every call, so that a test that swaps the config or a fake keeps working.
-export type SchedulerHost = Pick<Dispatcher, 'api' | 'commitGreen' | 'commitRecovered' | 'config' | 'effectiveRoute' | 'escalationTarget' | 'forge' | 'isPlannerLabel' | 'isStale' | 'jobs' | 'logger' | 'merger' | 'nudger' | 'openDependencies' | 'parallelReview' | 'preflight' | 'roundLimit' | 'rounds' | 'roundsUsedUp' | 'route' | 'securityReview' | 'tierOf' | 'waitKeeper' | 'workspace'>;
+export type SchedulerHost = Pick<Dispatcher, 'abandonCloneTrial' | 'admitCloneTrial' | 'api' | 'cloneBreaker' | 'commitGreen' | 'commitRecovered' | 'config' | 'confirmCloneTrial' | 'effectiveRoute' | 'escalationTarget' | 'forge' | 'isPlannerLabel' | 'isStale' | 'jobs' | 'logger' | 'merger' | 'nudger' | 'openDependencies' | 'parallelReview' | 'preflight' | 'roundLimit' | 'rounds' | 'roundsUsedUp' | 'route' | 'securityReview' | 'tierOf' | 'waitKeeper' | 'workspace'>;
 
 export class Scheduler {
   host: SchedulerHost;
@@ -108,9 +108,11 @@ export class Scheduler {
     return this.holdOf(job, now) === null;
   }
 
-  // The limit that keeps a queued job from starting now, checked in this order, or null when it may start: low disk space (DISK_MIN_FREE_GB, running
-  // jobs are not touched), the global concurrency, the quota hold of its tier (`tier` is that tier), the concurrency of its tier, the hourly limit.
-  holdOf(job: Job, now: number): { reason: 'disk' | 'quota' | 'concurrency' | 'hourly'; tier?: string } | null {
+  // The limit that keeps a queued job from starting now, checked in this order, or null when it may start: the clone breaker (no start while it
+  // is open, and only the one half-open trial when its hold has passed), low disk space (DISK_MIN_FREE_GB, running jobs are not touched), the
+  // global concurrency, the quota hold of its tier (`tier` is that tier), the concurrency of its tier, the hourly limit.
+  holdOf(job: Job, now: number): { reason: 'clone_breaker' | 'disk' | 'quota' | 'concurrency' | 'hourly'; tier?: string } | null {
+    if (this.host.cloneBreaker.holds() && !this.host.cloneBreaker.trialReady()) return { reason: 'clone_breaker' };
     if (this.host.workspace.holding) return { reason: 'disk' };
     const running = this.host.jobs.list('running');
     if (running.length >= this.host.config.maxConcurrent) return { reason: 'concurrency' };
@@ -151,6 +153,12 @@ export class Scheduler {
       this.host.jobs.remove(job.id);
       return true;
     }
+    const dry = isDry(this.host.config, job.event.repository.full_name);
+    // Only one start may be the half-open trial: claim it before the route is picked and any start side effect, so that a second job
+    // in the same pass stays queued. A dry run starts nothing and admits nothing.
+    const trial = !dry && this.host.cloneBreaker.holds() && this.host.cloneBreaker.trialReady();
+    if (trial && !(await this.host.admitCloneTrial(job.id))) return false;
+    let confirmed = false;
     const route = this.host.route(job.label);
     // The last round goes to the stronger profile of "escalate_to": same branch, same kind, same prompt and the limits of its own route.
     const target = this.host.escalationTarget(job);
@@ -203,7 +211,7 @@ export class Scheduler {
     body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
     // A dry run judges and schedules as usual, but starts nothing: the job ends as `dry` with the message the agent would have got.
     // `started` stays set so that the hourly limit and the round count behave as live.
-    if (isDry(this.host.config, job.event.repository.full_name)) {
+    if (dry) {
       Object.assign(job, { status: 'dry', started: now, finished: now, result: 'dry', dry_prompt: body.initial_message.content[0].text });
       this.host.logger.error('DRY RUN, not started: ' + job.key + ' (' + effective.profile + ', tier ' + effective.tier + ')');
       return true;
@@ -213,6 +221,10 @@ export class Scheduler {
       if (!response.ok) throw new Error('HTTP ' + response.status);
       const created = (await response.json()) as Json;
       if (!created?.id) throw new Error('response without conversation id');
+      if (trial) {
+        confirmed = await this.host.confirmCloneTrial(job.id, created.id);
+        if (!confirmed) await this.host.abandonCloneTrial(job.id);
+      }
       Object.assign(job, { status: 'running', conversation_id: created.id, started: now, error: undefined });
       // A new conversation gets its own resumes (the fields described Job.resumes belong to the one before).
       delete job.resumes; delete job.pause_resumes; delete job.resumed_from; delete job.resumed_at; delete job.resume_pending;
@@ -221,6 +233,8 @@ export class Scheduler {
       delete job.tokens_seen;
       metrics.inc('forgehands_runs_started_total', { kind: this.host.route(job.label).kind });
     } catch (error) {
+      // An unanswered start is not positive evidence: give the trial back, and the existing attempt and retry handling runs as before.
+      if (trial && !confirmed) await this.host.abandonCloneTrial(job.id);
       job.attempts += 1;
       job.error = error.message;
       this.host.logger.error('starting conversation for ' + job.key + ' failed:', error.message);

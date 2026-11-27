@@ -70,6 +70,7 @@ export function idleLine(reasons: IdleCounts, tiers: string[]): string {
   return 'idle: ' + total + ' waiting: ' + reasons.dependencies + ' on dependencies, ' + reasons.files + ' on files of older tickets, '
     + reasons.quota + ' held (quota ' + (tiers.join('/') || 'none') + '), ' + reasons.disk + ' held (low disk), '
     + reasons.hourly + ' over the hourly limit, ' + reasons.concurrency + ' over a concurrency limit'
+    + (reasons.clone_breaker ? ', ' + reasons.clone_breaker + ' held (clone breaker)' : '')
     + (reasons.could_start ? ', ' + reasons.could_start + ' could start but did not' : '')
     + (reasons.cycle ? ', ' + reasons.cycle + ' in a dependency cycle' : '')
     + (reasons.stuck ? ', ' + reasons.stuck + ' behind a blocked pull request' : '');
