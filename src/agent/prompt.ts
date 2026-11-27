@@ -277,9 +277,21 @@ export function preflightNoteLines(notes: string[]): string[] {
   return ['Pre-flight notes, not blockers: ' + notes.slice(0, MAX_NOTES).join('; ') + more + '. Stay within the Files list unless the step clearly needs it, and say so in the pull request.'];
 }
 
+export const GIT_AUTH_RULE_HEADING = 'Git authentication (trusted rule):';
+// Appended by buildPrompt, outside every untrusted block, so issue and pull request text can never replace it.
+const GIT_AUTH_RULE: string = [
+  GIT_AUTH_RULE_HEADING,
+  'Never write global or system Git configuration for `url.*`, `http.*.extraHeader`, `credential.*` or `core.sshCommand`: no `git config --global`, no `git config --system`, no edit of `~/.gitconfig` or `/etc/gitconfig`, and no `GIT_CONFIG_GLOBAL` redirect.',
+  'Authenticate per command with the literal environment reference `$FORGEJO_TOKEN`, for example `git -c http.extraHeader="Authorization: token $FORGEJO_TOKEN" clone …`, or write only with `git config --local` inside the clone.',
+  'If a clone fails, that is a blocker: report it (the command and the error line without secrets) and do not change any Git configuration to get past it.'
+].join('\n');
 // `checks`: the check result of the pull request's head as ForgeHands read it (checkFacts); null when CHECKS_FROM_CI is off.
 // `notes`: the advisory findings of the ticket pre-flight (preflightNoteLines); empty when there are none or the pre-flight is off.
 export function buildPrompt(event: ForgeEvent, config: DirectConfig, checks: CheckFacts | null = null, notes: string[] = []): string {
+  return buildVariantPrompt(event, config, checks, notes) + '\n' + GIT_AUTH_RULE;
+}
+
+function buildVariantPrompt(event: ForgeEvent, config: DirectConfig, checks: CheckFacts | null, notes: string[]): string {
   if (event.type === 'epic.done') return buildEpicPrompt(event, config);
   if (event.type === 'ci.main_failure') return buildRevertPrompt(event, config);
   if (event.pull_request) return buildPullRequestPrompt(event, config, checks);
