@@ -621,7 +621,8 @@ export class Dispatcher {
       const changed = await mutate();
       const to = this.cloneBreaker.state();
       this.cloneTransition(from, to);
-      if (reportRepository !== undefined && from === 'closed' && to === 'open' && await this.cloneBreaker.claimNotification()) {
+      // Any report while open may claim: the claim is idempotent per incident and is retried when an earlier ledger write failed.
+      if (reportRepository !== undefined && to === 'open' && await this.cloneBreaker.claimNotification()) {
         this.tellCloneBreaker(reportRepository);
       }
       return changed;
