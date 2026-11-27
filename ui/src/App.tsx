@@ -41,7 +41,7 @@ import { LinkedText } from "./components/forge-link.tsx";
 import { listedIssues } from "./factory-view.ts";
 import { matchesFilter } from "./ticket-filter.ts";
 import type { IssueFilter } from "./ticket-filter.ts";
-import type { DashboardStatus, Issue, Summary } from "./types.ts";
+import type { CloneBreakerStatus, DashboardStatus, Issue, Summary } from "./types.ts";
 
 type WindowKey = "last_7_days" | "last_30_days";
 type Connection = "connecting" | "live" | "reconnecting";
@@ -116,6 +116,56 @@ function Metric({
           <p className="metric-detail">{detail}</p>
         </div>
       </CardContent>
+    </Card>
+  );
+}
+
+function CloneBreaker({ breaker }: { breaker: CloneBreakerStatus }) {
+  const variant =
+    breaker.state === "closed"
+      ? "success"
+      : breaker.state === "open"
+        ? "danger"
+        : "warning";
+  const detail =
+    breaker.state === "closed"
+      ? "New starts run normally. Only positive checkout evidence from a half-open trial closes it; time alone never does."
+      : breaker.state === "open"
+        ? "Held since " +
+          shortDate(breaker.since) +
+          ". New starts wait until " +
+          shortDate(breaker.retry_at) +
+          "; then one half-open trial may start. A failed or inconclusive trial holds them again for ten minutes."
+        : breaker.trial_until
+          ? "One trial is running and may still show a checkout until " +
+            shortDate(breaker.trial_until) +
+            ". Without that evidence the breaker reopens for ten minutes."
+          : "The hold has passed: the next start claims the single trial. Only a positive checkout closes the breaker; time alone never does.";
+  return (
+    <Card className="panel" id="clone-breaker">
+      <CardHeader className="panel-header">
+        <div>
+          <CardTitle>Clone breaker</CardTitle>
+          <p className="panel-subtitle">{detail}</p>
+        </div>
+        <Badge variant={variant}>{breaker.state.replace("_", " ")}</Badge>
+      </CardHeader>
+      {breaker.state !== "closed" && (
+        <CardContent className="capacity-content">
+          <div className="capacity-meta">
+            <span>
+              {breaker.state === "open" ? "Next trial" : "Trial until"}
+            </span>
+            <strong>
+              {shortDate(
+                breaker.state === "open"
+                  ? breaker.retry_at
+                  : (breaker.trial_until ?? breaker.retry_at),
+              )}
+            </strong>
+          </div>
+        </CardContent>
+      )}
     </Card>
   );
 }
@@ -525,6 +575,8 @@ function App() {
                 </div>
               </CardContent>
             </Card>
+
+            {status && <CloneBreaker breaker={status.clone_breaker} />}
           </div>
 
           {status && <FactoryHealth status={status} />}

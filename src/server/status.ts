@@ -1,7 +1,8 @@
 import { isDry } from '../dry.ts';
 import type { DryLog, DryWrite } from '../dry.ts';
-import type { DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
+import type { CloneBreakerState, DirectConfig, IdleCounts, IdleState, Job } from '../types.ts';
 import type { JobStore } from '../store/jobs.ts';
+import { CloneBreaker } from '../agent/clone-breaker.ts';
 import { notifyChannels } from '../notify/config.ts';
 import type { WorkspaceState } from '../agent/workspace.ts';
 import type { E2eState } from '../e2e/controller.ts';
@@ -37,9 +38,18 @@ export interface TierStats {
 }
 // The tokens of the runs of one tier that started in the last 7 days (the sums of the runs' totals, see Dispatcher.countTokens).
 export interface TierTokens { prompt: number; completion: number; cache_read: number }
+// The clone breaker as the views publish it (see agent/clone-breaker.ts): state and timing only, never the failures or the trial's owner.
+export interface CloneBreakerStatus {
+  state: CloneBreakerState;
+  since: string | null;
+  retry_at: string | null;
+  trial_until: string | null;
+}
 export interface Status {
   generated: string;
   limits: { running: number; max_concurrent: number; max_rounds: number; max_runs_per_hour: number };
+  // The durable clone breaker at this request (see agent/clone-breaker.ts): open holds every new start, half_open admits one trial.
+  clone_breaker: CloneBreakerStatus;
   // Where the human is told (no secrets): the channels, the immediate kinds and the time of the digest.
   notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | 'all'; would_write: DryWrite[] } | null;
@@ -65,6 +75,16 @@ export interface Status {
 }
 
 const DAY_MS = 24 * 3600 * 1000;
+
+const iso = (value: number | null): string | null => value === null ? null : new Date(value).toISOString();
+
+// The published breaker view: normalize the durable record at `now` as the scheduler does, then keep only state and timing. Evidence,
+// conversation ids and the trial's owner never leave the ledger.
+function cloneBreakerStatus(jobs: JobStore, now: number): CloneBreakerStatus {
+  const snapshot = new CloneBreaker(jobs, () => now).snapshot();
+  return { state: snapshot.state, since: iso(snapshot.since), retry_at: iso(snapshot.retry_at), trial_until: iso(snapshot.trial_until) };
+}
+
 const ROUND_KINDS = new Set<string | undefined>(['pull_request', 'ci_failure', 'conflict']);
 
 function webUrl(value: unknown): string | null {
@@ -326,6 +346,7 @@ export function buildStatus(config: DirectConfig, jobs: JobStore, now = Date.now
     dry_run: config.dryRun ? { repositories: config.dryRunRepos.size ? [...config.dryRunRepos] : 'all', would_write: dry?.writes.slice(-50) || [] } : null,
     notify: { channels: notifyChannels(config.notify), immediate: config.notify.immediate, digest: config.notify.digest },
     limits: { running, max_concurrent: config.maxConcurrent, max_rounds: config.maxRounds, max_runs_per_hour: config.maxRunsPerHour },
+    clone_breaker: cloneBreakerStatus(jobs, now),
     summary: Object.fromEntries(Object.keys(month).sort().map((repo) => [repo, { last_7_days: week[repo], last_30_days: month[repo],
       tiers: Object.fromEntries(Object.keys(tierMonth[repo] || {}).sort().map((tier) => [tier, { last_7_days: tierWeek[repo]?.[tier] || emptyTier(), last_30_days: tierMonth[repo][tier], tokens: tokensWeek[repo]?.[tier] || emptyTokens() }])) }])),
     issues,
@@ -404,6 +425,21 @@ const linkedText = (text: string, links: Record<string, string> = {}): string =>
   return match && links[match[1] as string] ? linkTo(links[match[1] as string], part) : escape(part);
 }).join('');
 
+// The clone breaker for people: what it holds, when the trial may start or runs out, and that only a checkout closes it.
+function renderCloneBreaker(status: Status): string {
+  const breaker = status.clone_breaker;
+  const head = '<h2>Clone breaker</h2>';
+  if (breaker.state === 'closed')
+    return head + '<p><strong>Recovered.</strong> New starts run normally. Only positive checkout evidence from a half-open trial closes the breaker; a timeout never resets it.</p>';
+  if (breaker.state === 'open')
+    return head + '<p><strong>Held since ' + escape(breaker.since) + '.</strong> New starts wait until ' + escape(breaker.retry_at)
+      + '; then one half-open trial may start. A failed or inconclusive trial holds them again for ten minutes, and only a successful checkout closes the breaker.</p>';
+  return head + '<p><strong>Half-open.</strong> ' + (breaker.trial_until
+    ? 'One trial is running; it may still show a checkout until ' + escape(breaker.trial_until) + '. Without that evidence the breaker reopens for ten minutes.'
+    : 'The hold has passed, so the next start claims the single trial. Only a successful checkout closes the breaker; time alone does not.')
+    + '</p>';
+}
+
 export function renderStatus(status: Status): string {
   const line = (issue: Status['issues'][number]) => '<tr><td>' + linkTo(issue.issue_url, issue.issue) + '</td><td>' + escape(issue.title) + '</td><td>' + (issue.pr ? linkTo(issue.pr_url, '#' + issue.pr) : '') + '</td><td>'
     + linkedText(issue.state, issue.state_links) + (issue.merge_decision ? ' (not merged: ' + escape(issue.merge_decision.reason) + ')' : '') + '</td><td>' + issue.rounds + '/' + status.limits.max_rounds + '</td><td>' + escape(issue.runs.map((run) => run.label + ':' + run.status).join(', ')) + '</td></tr>';
@@ -417,7 +453,7 @@ export function renderStatus(status: Status): string {
   const banner = status.dry_run ? '<p style="background:#fd0;color:#000;padding:.6rem;font-weight:bold">DRY RUN (' + (status.dry_run.repositories === 'all' ? 'all repositories' : escape(status.dry_run.repositories.join(', '))) + '): nothing is written to Forgejo or OpenHands, runs are only judged. Would-be writes: <a href="/status.json">JSON</a>.</p>' : '';
   return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>ForgeHands status</title>'
     + '<style>body{font:14px system-ui;margin:1.5rem}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left;vertical-align:top}</style>'
-    + '<h1>ForgeHands</h1>' + banner + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + renderWorkspace(status) + waiting
+    + '<h1>ForgeHands</h1>' + banner + renderCloneBreaker(status) + '<p>' + status.limits.running + ' of ' + status.limits.max_concurrent + ' runs active, generated ' + escape(status.generated) + '. <a href="/status.json">JSON</a></p>' + renderWorkspace(status) + waiting
     + renderE2e(status) + renderSummary(status) + renderTiers(status) + '<h2>Tickets</h2>'
     + head + rows + '</table>' + closedSection + hiddenNote;
 }

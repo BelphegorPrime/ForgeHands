@@ -3,10 +3,16 @@
 // that interface: then the change is deliberate, the README and .env.example say so, and the release notes name it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LEDGER_VERSION } from '../src/store/jobs.ts';
+import { LEDGER_VERSION, JobStore } from '../src/store/jobs.ts';
 import { createForge } from '../src/forge/index.ts';
+import { createApp } from '../src/server/app.ts';
+import { DeliveryStore } from '../src/store/deliveries.ts';
+import { Dispatcher } from '../src/agent/dispatch.ts';
+import { loadConfig } from '../src/config.ts';
 
 // Every .ts file under src/.
 function sources(dir = 'src') {
@@ -33,7 +39,7 @@ test('every environment variable ForgeHands reads is documented in the README an
 
 // The metric names are part of the interface: dashboards and alerts are built on them.
 const METRICS = [
-  'forgehands_blocks_total', 'forgehands_branch_conflicts_total', 'forgehands_branch_updates_total', 'forgehands_comment_ignored_total',
+  'forgehands_blocks_total', 'forgehands_branch_conflicts_total', 'forgehands_branch_updates_total', 'forgehands_clone_breaker_state', 'forgehands_comment_ignored_total',
   'forgehands_comment_restarts_total', 'forgehands_conversations_deleted_total', 'forgehands_deleted_tickets_total', 'forgehands_dry_run_writes_total',
   'forgehands_epic_gaps_total', 'forgehands_epic_sweep_starts_total', 'forgehands_error_retries_total', 'forgehands_escalated_rounds_total',
   'forgehands_failure_escalations_total', 'forgehands_forgejo_api_errors_total', 'forgehands_handbacks_total', 'forgehands_idle_jobs', 'forgehands_jobs',
@@ -57,4 +63,110 @@ test('the webhook paths and the ledger file version are the ones the versioning 
   assert.deepEqual(['forgejo', 'gitea', 'gitlab'].map((forge) => createForge({ forge }, call).webhookPath), ['/webhooks/forgejo', '/webhooks/gitea', '/webhooks/gitlab']);
   // A new version needs a step in MIGRATIONS (src/store/jobs.ts) and an upgrade note; this line is changed with them.
   assert.equal(LEDGER_VERSION, 2);
+});
+
+// The clone breaker is exercised through the real status handler and a fixed clock: only state and timing may leave the ledger.
+const BREAKER_NOW = Date.UTC(2026, 5, 30, 12);
+const breakerRecord = (fields) => ({ state: 'closed', incident: 0, opened_at: null, retry_at: null, trial: null, notified: false, failures: [], ...fields });
+
+async function serveBreaker(record) {
+  const dir = await mkdtemp(join(tmpdir(), 'forgehands-breaker-'));
+  const config = loadConfig({
+    FORGE_WEBHOOK_SECRET: 'forgejo-test-secret-long-enough',
+    OPENHANDS_API_URL: 'http://openhands:8000/',
+    OPENHANDS_API_KEY: 'k'.repeat(24),
+    ALLOWED_REPOS: 'owner/hello',
+    LABEL_ROUTES: JSON.stringify({ 'ai:ready': { profile: '22222222-2222-4222-8222-222222222222', tier: 'free' } }),
+    DATA_FILE: join(dir, 'deliveries.json'),
+    STATUS_PUBLIC: '1'
+  });
+  const jobs = new JobStore(join(dir, 'jobs.json'));
+  jobs.meta.clone_breaker = record;
+  const dispatcher = new Dispatcher(config, jobs, async () => ({ ok: true, status: 200, json: async () => ({}) }), { error() {} }, () => BREAKER_NOW);
+  const server = createApp(config, new DeliveryStore(config.dataFile), undefined, { error() {} }, dispatcher);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    base: 'http://127.0.0.1:' + server.address().port,
+    async close() {
+      await new Promise((resolve) => server.close(resolve));
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+  };
+}
+
+async function breakerViews(base) {
+  const json = await (await fetch(base + '/status.json')).text();
+  const html = await (await fetch(base + '/status')).text();
+  const metrics = await (await fetch(base + '/metrics')).text();
+  return { json, body: JSON.parse(json), html, metrics };
+}
+
+test('a held clone breaker is published as state and timing, and the status views show no evidence', async () => {
+  const openedAt = BREAKER_NOW - 2 * 60_000;
+  const retryAt = BREAKER_NOW + 8 * 60_000;
+  const server = await serveBreaker(breakerRecord({
+    state: 'open', incident: 1, opened_at: openedAt, retry_at: retryAt, notified: true,
+    failures: [{ class: 'auth_failed', repository: 'owner/hello', at: openedAt, conversation: 'conversation-secret-held' }]
+  }));
+  try {
+    const { json, body, html, metrics } = await breakerViews(server.base);
+    assert.deepEqual(body.clone_breaker, {
+      state: 'open',
+      since: new Date(openedAt).toISOString(),
+      retry_at: new Date(retryAt).toISOString(),
+      trial_until: null
+    });
+    assert.match(html, /Clone breaker/);
+    assert.match(html, /Held since/);
+    assert.ok(html.includes(new Date(retryAt).toISOString()), 'the next trial time is readable');
+    assert.match(metrics, /^forgehands_clone_breaker_state 2$/m);
+    for (const secret of ['conversation-secret-held', 'auth_failed', 'owner/hello#']) {
+      assert.equal(json.includes(secret), false, 'the JSON leaks ' + secret);
+      assert.equal(html.includes(secret), false, 'the HTML leaks ' + secret);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test('a half-open trial is published with its deadline, and nothing about its owner or conversation', async () => {
+  const deadline = BREAKER_NOW + 5 * 60_000;
+  const server = await serveBreaker(breakerRecord({
+    state: 'half_open', incident: 1, opened_at: BREAKER_NOW - 20 * 60_000, retry_at: BREAKER_NOW - 5 * 60_000, notified: true,
+    trial: { owner: 'owner/hello#7', conversation: 'conversation-secret-trial', started: BREAKER_NOW - 60_000, deadline },
+    failures: [{ class: 'clone_failed', repository: 'owner/hello', at: BREAKER_NOW - 20 * 60_000, conversation: 'conversation-secret-held' }]
+  }));
+  try {
+    const { json, body, html, metrics } = await breakerViews(server.base);
+    assert.equal(body.clone_breaker.state, 'half_open');
+    assert.equal(body.clone_breaker.retry_at, new Date(BREAKER_NOW - 5 * 60_000).toISOString());
+    assert.equal(body.clone_breaker.trial_until, new Date(deadline).toISOString());
+    assert.match(html, /Half-open/);
+    assert.match(html, /One trial is running/);
+    assert.match(metrics, /^forgehands_clone_breaker_state 1$/m);
+    for (const secret of ['owner/hello#7', 'conversation-secret-trial', 'conversation-secret-held', 'clone_failed']) {
+      assert.equal(json.includes(secret), false, 'the JSON leaks ' + secret);
+      assert.equal(html.includes(secret), false, 'the HTML leaks ' + secret);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test('a recovered clone breaker publishes closed with no timing left, and the views say how it recovers', async () => {
+  const server = await serveBreaker(breakerRecord({
+    state: 'closed', incident: 1,
+    failures: [{ class: 'clone_failed', repository: 'owner/hello', at: BREAKER_NOW - 60_000, conversation: 'conversation-secret-recovered' }]
+  }));
+  try {
+    const { json, body, html, metrics } = await breakerViews(server.base);
+    assert.deepEqual(body.clone_breaker, { state: 'closed', since: null, retry_at: null, trial_until: null });
+    assert.match(html, /Recovered\./);
+    assert.match(html, /positive checkout evidence/);
+    assert.match(metrics, /^forgehands_clone_breaker_state 0$/m);
+    assert.equal(json.includes('conversation-secret-recovered'), false);
+    assert.equal(html.includes('conversation-secret-recovered'), false);
+  } finally {
+    await server.close();
+  }
 });
