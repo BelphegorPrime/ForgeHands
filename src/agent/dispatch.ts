@@ -77,6 +77,7 @@ export class Dispatcher {
   /** The shared clone breaker: one sandbox outage holds every new start until one successful trial. Hydrated once in the first pass. */
   cloneBreaker: CloneBreaker;
   cloneBreakerHydrated = false;
+  private cloneBreakerMutations: Promise<void> = Promise.resolve();
 
   nudger: Nudger = new Nudger(this);
   waitKeeper: WaitKeeper = new WaitKeeper(this);
@@ -597,41 +598,36 @@ export class Dispatcher {
   }
 
   // One confirmed clone failure; when it opens the breaker from closed, the incident's one hand-over is claimed and sent.
-  async reportCloneFailure(report: CloneFailureReport, repository: string): Promise<boolean> {
-    const from = this.cloneBreaker.state();
-    const changed = await this.cloneBreaker.reportFailure(report);
-    const to = this.cloneBreaker.state();
-    this.cloneTransition(from, to);
-    if (from === 'closed' && to === 'open' && await this.cloneBreaker.claimNotification()) this.tellCloneBreaker(repository);
-    return changed;
+  reportCloneFailure(report: CloneFailureReport, repository: string): Promise<boolean> {
+    return this.mutateCloneBreaker(() => this.cloneBreaker.reportFailure(report), repository);
+  }
+  admitCloneTrial(owner: string): Promise<boolean> {
+    return this.mutateCloneBreaker(() => this.cloneBreaker.admitTrial(owner));
+  }
+  confirmCloneTrial(owner: string, conversation: string): Promise<boolean> {
+    return this.mutateCloneBreaker(() => this.cloneBreaker.confirmTrial(owner, conversation));
+  }
+  abandonCloneTrial(owner: string): Promise<boolean> {
+    return this.mutateCloneBreaker(() => this.cloneBreaker.abandonTrial(owner));
+  }
+  settleCloneTrial(conversation: string, outcome: CloneTrialOutcome): Promise<boolean> {
+    return this.mutateCloneBreaker(() => this.cloneBreaker.settleTrial(conversation, outcome));
   }
 
-  async admitCloneTrial(owner: string): Promise<boolean> {
-    const from = this.cloneBreaker.state();
-    const admitted = await this.cloneBreaker.admitTrial(owner);
-    this.cloneTransition(from, this.cloneBreaker.state());
-    return admitted;
-  }
-
-  async confirmCloneTrial(owner: string, conversation: string): Promise<boolean> {
-    const from = this.cloneBreaker.state();
-    const confirmed = await this.cloneBreaker.confirmTrial(owner, conversation);
-    this.cloneTransition(from, this.cloneBreaker.state());
-    return confirmed;
-  }
-
-  async abandonCloneTrial(owner: string): Promise<boolean> {
-    const from = this.cloneBreaker.state();
-    const abandoned = await this.cloneBreaker.abandonTrial(owner);
-    this.cloneTransition(from, this.cloneBreaker.state());
-    return abandoned;
-  }
-
-  async settleCloneTrial(conversation: string, outcome: CloneTrialOutcome): Promise<boolean> {
-    const from = this.cloneBreaker.state();
-    const settled = await this.cloneBreaker.settleTrial(conversation, outcome);
-    this.cloneTransition(from, this.cloneBreaker.state());
-    return settled;
+  // Keep snapshots and the claim together: a ledger write yields before the mutation returns.
+  private mutateCloneBreaker(mutate: () => Promise<boolean>, reportRepository?: string): Promise<boolean> {
+    const result = this.cloneBreakerMutations.then(async () => {
+      const from = this.cloneBreaker.state();
+      const changed = await mutate();
+      const to = this.cloneBreaker.state();
+      this.cloneTransition(from, to);
+      if (reportRepository !== undefined && from === 'closed' && to === 'open' && await this.cloneBreaker.claimNotification()) {
+        this.tellCloneBreaker(reportRepository);
+      }
+      return changed;
+    });
+    this.cloneBreakerMutations = result.then(() => {}, () => {});
+    return result;
   }
 
   private cloneTransition(from: CloneBreakerState, to: CloneBreakerState): void {

@@ -71,6 +71,20 @@ test('three reports in two repositories open the breaker: one closed->open trans
   assert.match(sent[0].text, /resume after one successful trial/i);
 });
 
+test('overlapping reports count one closed->open transition and send one hand-over', async () => {
+  const { notifier, sent } = recording();
+  const { dispatcher } = await build(notifier);
+  const results = await Promise.all([
+    dispatcher.reportCloneFailure(report('conv-1', 'owner/a'), 'owner/a'),
+    dispatcher.reportCloneFailure(report('conv-2', 'owner/a'), 'owner/a'),
+    dispatcher.reportCloneFailure(report('conv-3', 'owner/b'), 'owner/b'),
+  ]);
+  assert.deepEqual(results, [true, true, true]);
+  assert.equal(dispatcher.cloneBreaker.state(), 'open');
+  assert.equal(transition('closed', 'open'), 1);
+  assert.equal(sent.length, 1);
+});
+
 test('a fourth report does not notify again', async () => {
   const { notifier, sent } = recording();
   const { dispatcher } = await build(notifier);
