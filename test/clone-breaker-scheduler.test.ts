@@ -220,7 +220,7 @@ test('a trial whose claim the ledger cannot hold starts nothing and spends no at
   await trip(t.dispatcher);
   const job = addJob(t, 'ai:ready', 57);
   clock += CLONE_BREAKER_HOLD_MS + 1;
-  // A real store write failure: the ledger's parent path is a regular file, so the temporary file cannot be created.
+  // A real store write failure: the ledger's directory path is a regular file, so the directory cannot be created.
   const blocked = join(dir, 'blocked-ledger');
   await writeFile(blocked, 'not a directory');
   t.jobs.file = join(blocked, 'jobs.json');
