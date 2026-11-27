@@ -751,7 +751,10 @@ test('a second start while a run is going is refused', async () => {
     assert.equal(first.status, 'started');
     assert.equal(controller.start('manual').status, 'busy');
     await first.done;
-    assert.equal(controller.start('manual').status, 'started');
+    const third = controller.start('manual');
+    assert.equal(third.status, 'started');
+    // The run writes the ledger when it ends, so let it finish before the directory is deleted.
+    await third.done;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
