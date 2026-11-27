@@ -43,7 +43,7 @@ export type NotifyLanguage = 'en' | 'de';
 export const NOTIFY_KINDS = ['handover', 'blocked', 'conflict', 'failed', 'reminder', 'stalled', 'checks'] as const;
 
 /** What holds the queued and waiting jobs back, counted per job (see Dispatcher.idleCounts). `could_start`: a job that could start and did not. */
-export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; could_start: number; /** waiting jobs of a dependency cycle (no way out by itself) */ cycle: number; /** waiting jobs that wait, directly or transitively, behind a blocked pull request (see stuck.ts) */ stuck: number }
+export interface IdleCounts { dependencies: number; files: number; quota: number; disk: number; hourly: number; concurrency: number; clone_breaker: number; could_start: number; /** waiting jobs of a dependency cycle (no way out by itself) */ cycle: number; /** waiting jobs that wait, directly or transitively, behind a blocked pull request (see stuck.ts) */ stuck: number }
 /** The last pass in which something waited and nothing could start: since when, the counts, and the tiers whose quota holds the queued jobs. */
 export interface IdleState { since: number; reasons: IdleCounts; tiers: string[]; /** the dependency cycles of the ledger, as text (see cycleText) */ cycles: string[] }
 

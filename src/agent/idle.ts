@@ -26,7 +26,7 @@ export class IdleReporter {
   // job is held by holdOf. A queued job with a retry timer (next_try: a failed start, an error that is run again) waits for its time, not for a limit,
   // and is not counted.
   idleCounts(now: number): { reasons: IdleCounts; tiers: string[]; cycles: string[] } {
-    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 };
+    const reasons: IdleCounts = { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 0, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 };
     const tiers = new Set<string>();
     // Explicit dependencies only: a cycle of them is not broken by ForgeHands (the planner or a human made it), so its jobs wait for ever.
     const cycles = findCycles(waitGraph(this.host.jobs.list(), false));

@@ -59,7 +59,7 @@ const GAUGES: Record<string, string> = {
   forgehands_workspace_disk_used_percent: 'Used share of the filesystem of WORKSPACE_CLEANUP_DIR, in percent (absent while the cleanup is off).',
   forgehands_workspace_disk_free_bytes: 'Bytes available to ForgeHands on the filesystem of WORKSPACE_CLEANUP_DIR (absent while the cleanup is off).',
   forgehands_tier_cooldown_active: '1 while the model of a tier is out of quota and no run of it starts, by tier.',
-  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, cycle, stuck); 0 while nothing waits.',
+  forgehands_idle_jobs: 'Queued and waiting jobs by what holds them back now (dependencies, files, quota, disk, hourly, concurrency, clone_breaker, cycle, stuck); 0 while nothing waits.',
   forgehands_stuck_pull_requests: 'Agent pull requests blocked for a human (BLOCKED_LABEL) that tickets may wait behind, from the ledger at the scrape.',
   forgehands_e2e_scenario_ok: '1 when the steps of the scenario held in the last end-to-end run (E2E_REPO), 0 when a step failed; absent until a run.',
   forgehands_e2e_cleanup_ok: '1 when the cleanup of the scenario held in the last end-to-end run (E2E_REPO), 0 when it did not; absent until a run.',
@@ -68,7 +68,7 @@ const GAUGES: Record<string, string> = {
   forgehands_merges_reverted_ratio: 'Share (0 to 1) of the merges ForgeHands made in the last 30 days whose revert was merged, by repository; absent without merges in the window.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
-const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle', 'stuck'] as const;
+const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'clone_breaker', 'cycle', 'stuck'] as const;
 const CLONE_BREAKER_VALUES: Record<CloneBreakerState, number> = { closed: 0, half_open: 1, open: 2 };
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 

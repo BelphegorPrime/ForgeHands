@@ -127,7 +127,7 @@ test('every wait the dispatcher decides is counted once: dependencies, files, qu
   addJob(t, 'ai:cheap', 63);
   await t.dispatcher.tick();
   const { reasons, tiers } = t.dispatcher.idleState();
-  assert.deepEqual(reasons, { dependencies: 1, files: 1, quota: 2, disk: 0, hourly: 1, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 });
+  assert.deepEqual(reasons, { dependencies: 1, files: 1, quota: 2, disk: 0, hourly: 1, concurrency: 0, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 });
   assert.deepEqual(tiers, ['free']);
   assert.equal(lastIdle(), 'idle: 5 waiting: 1 on dependencies, 1 on files of older tickets, 2 held (quota free), 0 held (low disk), 1 over the hourly limit, 0 over a concurrency limit');
 });
@@ -137,19 +137,19 @@ test('disk, global and per-tier concurrency holds are counted as their own reaso
   addJob(disk, 'ai:ready', 57);
   disk.dispatcher.workspace.holding = true;
   await disk.dispatcher.tick();
-  assert.deepEqual(disk.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 1, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 });
+  assert.deepEqual(disk.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 1, hourly: 0, concurrency: 0, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 });
 
   const global = await setup({ MAX_CONCURRENT: '1' });
   global.jobs.add({ key: repo + '#90:ai:cheap', label: 'ai:cheap', event: { ...issueEvent('ai:cheap', 90), label: 'ai:cheap' }, status: 'running', created: clock, started: clock, conversation_id: 'conv-x', attempts: 0 });
   addJob(global, 'ai:ready', 57);
   await global.dispatcher.tick();
-  assert.deepEqual(global.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 1, could_start: 0, cycle: 0, stuck: 0 });
+  assert.deepEqual(global.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 1, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 });
 
   const tier = await setup({ MAX_CONCURRENT_PER_TIER: '1' });
   tier.jobs.add({ key: repo + '#90:ai:ready', label: 'ai:ready', event: { ...issueEvent('ai:ready', 90), label: 'ai:ready' }, status: 'running', created: clock, started: clock, conversation_id: 'conv-y', attempts: 0 });
   addJob(tier, 'ai:ready', 57);
   await tier.dispatcher.tick();
-  assert.deepEqual(tier.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 1, could_start: 0, cycle: 0, stuck: 0 });
+  assert.deepEqual(tier.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 0, disk: 0, hourly: 0, concurrency: 1, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 });
 });
 
 test('a pass that starts something logs no idle line', async () => {
@@ -169,7 +169,7 @@ test('a queued job with a retry timer is not one of the counted waits', async ()
   addJob(t, 'ai:ready', 57);
   addJob(t, 'ai:ready', 59, { next_try: clock + 10 * MINUTE });
   await t.dispatcher.tick();
-  assert.deepEqual(t.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 1, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 });
+  assert.deepEqual(t.dispatcher.idleState().reasons, { dependencies: 0, files: 0, quota: 1, disk: 0, hourly: 0, concurrency: 0, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 });
 });
 
 test('pure dependency waits do not raise the stall alert', async () => {
@@ -257,7 +257,7 @@ test('the status JSON carries the idle state only while work waits, with the tie
   const status = buildStatus(t.config, t.jobs, clock, undefined, [], null, { idle: t.dispatcher.idleState() });
   assert.deepEqual(status.idle, {
     since: new Date(clock).toISOString(),
-    reasons: { dependencies: 1, files: 0, quota: 1, disk: 0, hourly: 0, concurrency: 0, could_start: 0, cycle: 0, stuck: 0 },
+    reasons: { dependencies: 1, files: 0, quota: 1, disk: 0, hourly: 0, concurrency: 0, clone_breaker: 0, could_start: 0, cycle: 0, stuck: 0 },
     quota_tiers: ['free'],
     cycles: []
   });
@@ -269,13 +269,13 @@ test('the status JSON carries the idle state only while work waits, with the tie
   assert.equal('idle' in buildStatus(t.config, t.jobs, clock, undefined, [], null, { idle: t.dispatcher.idleState() }), false);
 });
 
-test('the idle gauge carries the eight reasons (stuck: a wait behind a blocked pull request, see stuck.ts), zero while nothing waits', async () => {
+test('the idle gauge carries the nine reasons (a clone breaker hold, stuck: a wait behind a blocked pull request, see stuck.ts), zero while nothing waits', async () => {
   const t = await setup();
   t.dispatcher.cooldowns.set('free', clock + 20 * HOUR);
   addJob(t, 'ai:ready', 57);
   await t.dispatcher.tick();
   const samples = gaugeSamples(t.config, t.jobs, t.dispatcher.cooldowns, clock, null, t.dispatcher.idleState()).filter((sample) => sample.name === 'forgehands_idle_jobs');
-  assert.deepEqual(samples.map((sample) => [sample.labels.reason, sample.value]), [['dependencies', 0], ['files', 0], ['quota', 1], ['disk', 0], ['hourly', 0], ['concurrency', 0], ['cycle', 0], ['stuck', 0]]);
+  assert.deepEqual(samples.map((sample) => [sample.labels.reason, sample.value]), [['dependencies', 0], ['files', 0], ['quota', 1], ['disk', 0], ['hourly', 0], ['concurrency', 0], ['clone_breaker', 0], ['cycle', 0], ['stuck', 0]]);
   const idle = gaugeSamples(t.config, t.jobs, t.dispatcher.cooldowns, clock, null, null).filter((sample) => sample.name === 'forgehands_idle_jobs');
   assert.equal(idle.every((sample) => sample.value === 0), true);
 });
