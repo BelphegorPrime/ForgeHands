@@ -355,6 +355,30 @@ Route kinds, set by `"on"` (a route without it fires for a label on an issue):
 | `BOT_BRANCH_PREFIXES` | none        | Optional comma separated head branch prefixes (for example `renovate/`); a bot's pull request must match one when set.                                                                                                                                                              |
 | `BOT_FIX_ROUNDS`      | 0           | Fix rounds per bot pull request after a red commit (1 to 100); `0` starts nothing on red.                                                                                                                                                                                           |
 
+### Release settings (opt-in)
+
+| Variable       | Default | Meaning                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RELEASE_REPOS` | none    | JSON, per repository release settings: `{"owner/repo": {"tag_pattern": "v{version}", "version_files": ["package.json", "package-lock.json"], "changelog_path": "CHANGELOG.md", "prerelease_identifier": "rc"}}`. A repository without an entry has no release settings. The values shown are the defaults; `upgrade_notes_path`, `artifact_check` and `deployment` stay absent unless set. ForgeHands loads and validates these settings at start only: release routes stay off, and nothing is probed, published or deployed. |
+
+A complete entry, with the optional parts:
+
+```json
+{
+  "team/app": {
+    "tag_pattern": "v{version}",
+    "version_files": ["package.json", "package-lock.json"],
+    "changelog_path": "CHANGELOG.md",
+    "prerelease_identifier": "rc",
+    "upgrade_notes_path": "UPGRADING.md",
+    "artifact_check": {"kind": "npm", "package": "@team/app", "registry": "https://registry.example"},
+    "deployment": {"repository": "team/infra", "file": "deploy/app.yml", "pin_pattern": "image: team/app:.*"}
+  }
+}
+```
+
+`tag_pattern` must contain exactly one literal `{version}`. `version_files`, `changelog_path` and `upgrade_notes_path` are safe repository-relative paths (no absolute, Windows rooted or drive-qualified paths, no `..` segment). `prerelease_identifier` is one SemVer prerelease identifier: ASCII letters, digits and hyphens, with no leading zero in a multi-digit all-numeric identifier. `artifact_check` is either `{"kind": "container", "image": "..."}` with optional `tag_forms`, or `{"kind": "npm", "package": "...", "registry": "https://..."}` without credentials. `deployment` names the target repository, file and `pin_pattern`. An invalid value stops the start with `RELEASE_REPOS[<repository>].<field>: ...`, which never echoes the rejected value.
+
 ### Humans, failures, housekeeping
 
 | Variable | Default | Meaning |

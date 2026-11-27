@@ -5,7 +5,8 @@ import { FORGES } from './forge/index.ts';
 import type { ForgeKind } from './types/forge.ts';
 import { parseNotify } from './notify/config.ts';
 import { SCENARIO_NAMES } from './e2e/scenarios.ts';
-import type { Config, DirectConfig, E2eConfig, Json, Logger, MergeRule, Route, RouteKind } from './types.ts';
+import { parseReleaseArtifact, parseReleaseDeployment, parseReleaseFile } from './release-config.ts';
+import type { Config, DirectConfig, E2eConfig, Json, Logger, MergeRule, ReleaseFieldContext, ReleaseRepoSettings, Route, RouteKind } from './types.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // owner/name; GitLab projects may sit in subgroups (group/sub/name).
@@ -212,6 +213,74 @@ function parseRepoWeights(raw: string | undefined): Map<string, number> {
   return weights;
 }
 
+function releaseError(repository: string, field: string | null, text: string): never {
+  throw new Error('RELEASE_REPOS[' + repository + ']' + (field === null ? '' : '.' + field) + ': ' + text);
+}
+
+function releaseField(repository: string, field: string): ReleaseFieldContext {
+  return { source: 'RELEASE_REPOS', repository, field };
+}
+
+// RELEASE_REPOS: {"owner/repo": {"tag_pattern": "v{version}", "version_files": ["package.json"], "changelog_path": "CHANGELOG.md",
+// "prerelease_identifier": "rc", "upgrade_notes_path": "...", "artifact_check": {...}, "deployment": {...}}}. Opt-in only: a repository
+// without an entry gets no release settings, and loading them starts no route. Every error names the repository and field, never the value.
+function parseReleaseRepos(raw: string | undefined): Map<string, ReleaseRepoSettings> {
+  const repos = new Map<string, ReleaseRepoSettings>();
+  if (!raw || !raw.trim()) return repos;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch {
+    throw new Error('RELEASE_REPOS must be a JSON object keyed by repository such as {"owner/repo": {}}');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('RELEASE_REPOS must be a JSON object keyed by repository such as {"owner/repo": {}}');
+  }
+  for (const [rawKey, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const key = rawKey.trim().toLowerCase();
+    if (!REPO.test(key)) throw new Error('RELEASE_REPOS: invalid repository key; use a full name such as owner/name (GitLab: group/sub/name)');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      releaseError(key, null, 'must be an object');
+    }
+    const entry = value as Record<string, unknown>;
+
+    const rawTag = entry.tag_pattern === undefined ? 'v{version}' : entry.tag_pattern;
+    if (typeof rawTag !== 'string' || (rawTag.match(/\{version\}/g) || []).length !== 1) {
+      releaseError(key, 'tag_pattern', 'must be a string with exactly one literal {version}');
+    }
+    const tagPattern = rawTag;
+
+    const rawVersionFiles = entry.version_files === undefined ? ['package.json', 'package-lock.json'] : entry.version_files;
+    if (!Array.isArray(rawVersionFiles)) releaseError(key, 'version_files', 'must be an array of safe relative file paths');
+    const versionFiles = rawVersionFiles.map((file) => parseReleaseFile(file, releaseField(key, 'version_files')));
+
+    const changelogPath = parseReleaseFile(
+      entry.changelog_path === undefined ? 'CHANGELOG.md' : entry.changelog_path,
+      releaseField(key, 'changelog_path'),
+    );
+
+    const prereleaseIdentifier = entry.prerelease_identifier === undefined ? 'rc' : entry.prerelease_identifier;
+    if (
+      typeof prereleaseIdentifier !== 'string'
+      || !/^[0-9A-Za-z-]+$/.test(prereleaseIdentifier)
+      || (/^[0-9]+$/.test(prereleaseIdentifier) && /^0[0-9]+$/.test(prereleaseIdentifier))
+    ) {
+      releaseError(key, 'prerelease_identifier', 'must be one SemVer prerelease identifier of ASCII letters, digits and hyphens, with no leading zero in a numeric identifier');
+    }
+
+    const upgradeNotesPath = entry.upgrade_notes_path === undefined
+      ? undefined
+      : parseReleaseFile(entry.upgrade_notes_path, releaseField(key, 'upgrade_notes_path'));
+    const artifact = parseReleaseArtifact(entry.artifact_check, releaseField(key, 'artifact_check'));
+    const deployment = parseReleaseDeployment(entry.deployment, releaseField(key, 'deployment'), (repository) => REPO.test(repository.toLowerCase()));
+
+    const settings: ReleaseRepoSettings = { tagPattern, versionFiles, changelogPath, prereleaseIdentifier };
+    if (upgradeNotesPath !== undefined) settings.upgradeNotesPath = upgradeNotesPath;
+    if (artifact !== undefined) settings.artifact = artifact;
+    if (deployment !== undefined) settings.deployment = deployment;
+    repos.set(key, settings);
+  }
+  return repos;
+}
+
 // Settings removed in 1.0.0, with what to set instead. One that is still set stops the start: ignoring it would leave the forge unconfigured
 // (an old name of the URL, token or secret) or change behaviour unnoticed (a switch that was set to 0).
 export const REMOVED: Record<string, string> = {
@@ -283,7 +352,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger: Logger 
     timeoutMs: 10000,
     maxBodyBytes: 1024 * 1024,
     dryRun,
-    dryRunRepos
+    dryRunRepos,
+    releaseRepos: parseReleaseRepos(env.RELEASE_REPOS)
   };
 
   if (!direct) {
