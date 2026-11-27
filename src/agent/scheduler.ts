@@ -1,6 +1,8 @@
 // Which queued job starts next, and starting it: the order of the queue, the limits per tier, repository and hour, quota and disk holds,
 // and the start of a conversation.
-import { buildPrompt } from './prompt.ts';
+import { randomUUID } from 'node:crypto';
+import { posix } from 'node:path';
+import { buildPrompt, workspacePath } from './prompt.ts';
 import { checkFacts } from './checks.ts';
 import { isDry } from '../dry.ts';
 import { stallLine } from './review-sweep.ts';
@@ -177,6 +179,10 @@ export class Scheduler {
     // The advisory findings of the ticket pre-flight are given to a worker's prompt as notes (preflight.ts); blocking ones never get here.
     const notes = !job.event.pull_request && this.host.config.routes.get(job.label)?.kind === 'issue' && !this.host.isPlannerLabel(job.label)
       ? await this.host.preflight.notesOf(job.event) : [];
+    // A Git global config file of the run's own, so that two conversations of the same checkout never share what one writes with
+    // `git config --global` (a credential helper, an include, a URL rewrite). The path is only a name below the checkout and is
+    // never created here; a Git process that inherits the conversation environment points GIT_CONFIG_GLOBAL at it.
+    const gitConfigGlobal = posix.join(workspacePath(this.host.config, job.event), randomUUID(), '.gitconfig');
     const body: Json = {
       workspace: { working_dir: this.host.config.workspaceDir },
       agent_profile_id: effective.profile,
@@ -189,11 +195,11 @@ export class Scheduler {
     // A route's own Forgejo token (the reviewer user) goes to its conversations only, as FORGEJO_TOKEN; no other conversation gets it.
     const claimed = new Set([...this.host.config.routes.values()].map((entry) => entry.forgejoTokenSecret).filter(Boolean));
     const own = route.forgejoTokenSecret ? this.host.config.agentSecrets[route.forgejoTokenSecret] : undefined;
-    const secrets = [...Object.entries(this.host.config.agentSecrets || {}).filter(([name]) => !claimed.has(name) && !(own && name === 'FORGEJO_TOKEN')),
-      ...(own ? [['FORGEJO_TOKEN', own] as [string, string]] : [])];
-    if (secrets.length) {
-      body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
-    }
+    // GIT_CONFIG_GLOBAL always comes from ForgeHands: a configured value of that name is dropped so that the per-start path wins.
+    const secrets = [...Object.entries(this.host.config.agentSecrets || {}).filter(([name]) => name !== 'GIT_CONFIG_GLOBAL' && !claimed.has(name) && !(own && name === 'FORGEJO_TOKEN')),
+      ...(own ? [['FORGEJO_TOKEN', own] as [string, string]] : []),
+      ['GIT_CONFIG_GLOBAL', gitConfigGlobal] as [string, string]];
+    body.secrets = Object.fromEntries(secrets.map(([name, value]) => [name, { kind: 'StaticSecret', value, description: 'Provided by ForgeHands' }]));
     // A dry run judges and schedules as usual, but starts nothing: the job ends as `dry` with the message the agent would have got.
     // `started` stays set so that the hourly limit and the round count behave as live.
     if (isDry(this.host.config, job.event.repository.full_name)) {
