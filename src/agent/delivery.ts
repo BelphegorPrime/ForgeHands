@@ -11,6 +11,12 @@ import type { Dispatcher } from './dispatch.ts';
 // What DeliveryCheck reaches on the dispatcher. Read through the host on every call, so that a test that swaps the config or a fake keeps working.
 export type DeliveryCheckHost = Pick<Dispatcher, 'config' | 'forge' | 'handback' | 'jobs' | 'logger' | 'markForHuman' | 'merger' | 'now' | 'operatorDependencies' | 'reportCloneFailure' | 'reportFailure' | 'tierRunEnded' | 'waitForOperator'>;
 
+// A pull request found by its branch name counts only when its head is in this repository: a fork can carry the same branch name.
+const sameRepository = (pr: PullRequest, repository: string): boolean => {
+  const head = pr?.head?.repo?.full_name;
+  return typeof head !== 'string' || head.toLowerCase() === repository.toLowerCase();
+};
+
 type CommentReads = {
   login: () => Promise<string | null>;
   parents: () => Promise<Issue[]>;
@@ -40,7 +46,7 @@ export class DeliveryCheck {
       if (!issue || issue.state !== 'open') return;
       const branch = 'ai/issue-' + event.issue.number;
       const pulls = await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
-      if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
+      if (pulls.some((pr) => sameRepository(pr, repository) && pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
       // A confirmed clone failure is no delivery to judge: the job waits for a later attempt instead of being run once more or escalated (clone-handback.ts).
       if (this.superseded(job)) return;
       const reads = this.commentReads(event);
@@ -139,7 +145,7 @@ export class DeliveryCheck {
     try {
       const branch = 'ai/issue-' + issue;
       pulls ??= await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
-      const pull = (Array.isArray(pulls) ? pulls : []).find((pr) => pullBranch(pr) === branch);
+      const pull = (Array.isArray(pulls) ? pulls : []).find((pr) => sameRepository(pr, repository) && pullBranch(pr) === branch);
       if (pull) {
         const comments = await reads.comments(pull.number);
         candidates.push({ scope: 'pull_request', issue, comments });
