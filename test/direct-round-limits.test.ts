@@ -35,7 +35,8 @@ test('rounds are limited per issue; the pull request is told and marked when the
   // every started round first looks whether an earlier approval has to be taken back
   // (after every run the branch is looked at once, see checkBranchAfterRun, and a finished round reads its pull request once, see checkRoundsAfterRun:
   // those reads are not part of the marking)
-  const marking = forgejo.filter((call) => !(call.method === 'GET' && (call.path.endsWith('/issues/34/labels') || call.path.endsWith('/pulls/34') || call.path.includes('/branches/'))));
+  // The agent login is read once after each finished run to judge a clone hand-back, then the comments and the pull request (delivery.ts).
+  const marking = forgejo.filter((call) => !(call.method === 'GET' && (call.path.endsWith('/issues/34/labels') || call.path.endsWith('/pulls/34') || call.path.includes('/branches/') || call.path === '/api/v1/user')));
   const paths = marking.map((call) => call.method + ' ' + call.path);
   assert.deepEqual(paths, [
     'POST /api/v1/repos/owner/hello/issues/34/comments',
