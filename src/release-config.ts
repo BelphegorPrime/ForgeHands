@@ -27,6 +27,9 @@ function isHttpUrl(value: string): boolean {
 export function parseReleaseArtifact(value: unknown, ctx: ReleaseFieldContext): ReleaseArtifact | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) fail(ctx, 'must be an object');
+  // Only a plain object carries configuration; a class instance can hide behaviour behind its prototype.
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) fail(ctx, 'must be an object');
   const input = value as Record<string, unknown>;
 
   if (input.kind === 'container') {

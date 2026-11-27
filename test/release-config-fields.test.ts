@@ -104,6 +104,22 @@ test('parseReleaseArtifact rejects a non-object', () => {
   assert.throws(() => parseReleaseArtifact(42, artifactCtx), objectError);
 });
 
+test('parseReleaseArtifact rejects a class instance with valid fields', () => {
+  const objectError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact: must be an object/;
+  class Artifact {
+    kind = 'container';
+    image = 'example/app';
+  }
+  assert.throws(() => parseReleaseArtifact(new Artifact(), artifactCtx), objectError);
+});
+
+test('parseReleaseArtifact accepts a null-prototype plain object', () => {
+  const input = Object.create(null) as Record<string, unknown>;
+  input.kind = 'container';
+  input.image = 'example/app';
+  assert.deepEqual(parseReleaseArtifact(input, artifactCtx), { kind: 'container', image: 'example/app' });
+});
+
 test('parseReleaseArtifact rejects an unknown or missing kind without printing it', () => {
   const kindError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.kind: must be "container" or "npm"/;
   assert.throws(() => parseReleaseArtifact({ kind: 'deb' }, artifactCtx), kindError);
