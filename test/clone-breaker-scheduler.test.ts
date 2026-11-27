@@ -3,7 +3,7 @@
 // and a trial that cannot be confirmed reopens instead of leaving a second start behind.
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JobStore } from '../src/store/jobs.ts';
@@ -213,4 +213,23 @@ test('a dry run admits nothing, even when the hold has passed', async () => {
   assert.equal(job.status, 'dry');
   assert.equal(t.dispatcher.cloneBreaker.state(), 'half_open');
   assert.equal(t.jobs.meta.clone_breaker.trial, null, 'a dry run claims no trial');
+});
+
+test('a trial whose claim the ledger cannot hold starts nothing and spends no attempt', async () => {
+  const t = await setup();
+  await trip(t.dispatcher);
+  const job = addJob(t, 'ai:ready', 57);
+  clock += CLONE_BREAKER_HOLD_MS + 1;
+  // A real store write failure: the ledger's parent path is a regular file, so the temporary file cannot be created.
+  const blocked = join(dir, 'blocked-ledger');
+  await writeFile(blocked, 'not a directory');
+  t.jobs.file = join(blocked, 'jobs.json');
+
+  assert.equal(await t.dispatcher.admitCloneTrial(job.id), false);
+  assert.equal(t.jobs.meta.clone_breaker.trial, null, 'the claim the ledger did not take is given back');
+  assert.equal(await t.dispatcher.startJob(job, clock), false);
+  assert.equal(starts().length, 0, 'no conversation start is sent without a durable claim');
+  assert.equal(job.attempts, 0, 'no attempt is spent');
+  assert.equal(job.status, 'queued');
+  assert.equal(t.dispatcher.cloneBreaker.state(), 'half_open');
 });

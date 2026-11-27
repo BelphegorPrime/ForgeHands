@@ -69,15 +69,17 @@ export class CloneBreaker {
     return record.state === 'half_open' && record.trial === null && (record.retry_at === null || now >= record.retry_at);
   }
 
-  // Claim the one trial for a job before its start: the claim is written to the ledger first, so a restart sees who owns it.
+  // Claim the one trial for a job before its start: the claim is written to the ledger first, so a restart sees who owns it. A claim
+  // the ledger did not take is given back, so no start leaves on a reservation that a restart cannot see.
   async admitTrial(owner: string, now = this.now()): Promise<boolean> {
     if (!SAFE_OWNER.test(owner)) return false;
     this.normalize(now);
     const record = this.record();
     if (record.state !== 'half_open' || record.trial !== null || (record.retry_at !== null && now < record.retry_at)) return false;
     record.trial = { owner, conversation: null, started: now, deadline: now + CLONE_BREAKER_TRIAL_MS };
-    await this.save(now);
-    return true;
+    if (await this.save(now)) return true;
+    record.trial = null;
+    return false;
   }
 
   // The claimed start produced its conversation: only that conversation may settle the trial from now on.
