@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseReleaseArtifact, parseReleaseFile } from '../src/release-config.ts';
+import { parseReleaseArtifact, parseReleaseDeployment, parseReleaseFile } from '../src/release-config.ts';
 
 const ctx = { source: 'RELEASE_REPOS', repository: 'acme/app', field: 'deployment.file' } as const;
 const unsafe = /must be a safe relative file path/;
@@ -173,3 +173,71 @@ test('parseReleaseArtifact rejects registry credentials without echoing them', (
   assert.match(message, /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.registry: must be an http\(s\) URL without credentials/);
   assert.ok(!message.includes('pass'));
 });
+
+const deploymentCtx = { source: 'RELEASE_REPOS', repository: 'acme/app', field: 'deployment' } as const;
+const isRepositoryKey = (key: string) => /^[a-z0-9_.-]+(?:\/[a-z0-9_.-]+)+$/.test(key);
+
+test('parseReleaseDeployment accepts a repository, file and pin pattern', () => {
+  assert.deepEqual(
+    parseReleaseDeployment(
+      { repository: 'acme/app', file: 'deploy/app.yml', pin_pattern: 'image: app:.*' },
+      deploymentCtx,
+      isRepositoryKey,
+    ),
+    { repository: 'acme/app', file: 'deploy/app.yml', pinPattern: 'image: app:.*' },
+  );
+});
+
+test('parseReleaseDeployment accepts a GitLab subgroup repository key', () => {
+  assert.deepEqual(
+    parseReleaseDeployment(
+      { repository: 'group/sub/app', file: 'deploy/app.yml', pin_pattern: 'image: app:.*' },
+      deploymentCtx,
+      isRepositoryKey,
+    ),
+    { repository: 'group/sub/app', file: 'deploy/app.yml', pinPattern: 'image: app:.*' },
+  );
+});
+
+test('parseReleaseDeployment preserves an absent deployment', () => {
+  assert.equal(parseReleaseDeployment(undefined, deploymentCtx, isRepositoryKey), undefined);
+});
+
+test('parseReleaseDeployment rejects a non-object', () => {
+  const objectError = /RELEASE_REPOS\[acme\/app\]\.deployment: must be an object/;
+  assert.throws(() => parseReleaseDeployment(null, deploymentCtx, isRepositoryKey), objectError);
+  assert.throws(() => parseReleaseDeployment([], deploymentCtx, isRepositoryKey), objectError);
+  assert.throws(() => parseReleaseDeployment('x', deploymentCtx, isRepositoryKey), objectError);
+  assert.throws(() => parseReleaseDeployment(42, deploymentCtx, isRepositoryKey), objectError);
+});
+
+test('parseReleaseDeployment rejects an invalid repository key without printing it', () => {
+  const repositoryError = /RELEASE_REPOS\[acme\/app\]\.deployment\.repository: must be a repository key such as owner\/name/;
+  assert.throws(() => parseReleaseDeployment({ file: 'deploy/app.yml', pin_pattern: 'x' }, deploymentCtx, isRepositoryKey), repositoryError);
+  assert.throws(() => parseReleaseDeployment({ repository: 'nope', file: 'deploy/app.yml', pin_pattern: 'x' }, deploymentCtx, isRepositoryKey), repositoryError);
+  assert.throws(() => parseReleaseDeployment({ repository: 'a b/c', file: 'deploy/app.yml', pin_pattern: 'x' }, deploymentCtx, isRepositoryKey), repositoryError);
+  assert.throws(() => parseReleaseDeployment({ repository: 42, file: 'deploy/app.yml', pin_pattern: 'x' }, deploymentCtx, isRepositoryKey), repositoryError);
+  let message = '';
+  try {
+    parseReleaseDeployment({ repository: 'bad key secret-9', file: 'deploy/app.yml', pin_pattern: 'x' }, deploymentCtx, isRepositoryKey);
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  assert.match(message, /RELEASE_REPOS\[acme\/app\]\.deployment\.repository: must be a repository key such as owner\/name/);
+  assert.ok(!message.includes('bad key secret-9'));
+});
+
+test('parseReleaseDeployment rejects unsafe file paths under the file field', () => {
+  const unsafeFile = /RELEASE_REPOS\[acme\/app\]\.deployment\.file: must be a safe relative file path/;
+  for (const file of ['/etc/x', 'C:file', '../x']) {
+    assert.throws(() => parseReleaseDeployment({ repository: 'acme/app', file, pin_pattern: 'x' }, deploymentCtx, isRepositoryKey), unsafeFile);
+  }
+});
+
+test('parseReleaseDeployment rejects a blank or missing pin pattern', () => {
+  const pinError = /RELEASE_REPOS\[acme\/app\]\.deployment\.pin_pattern: must be a non-empty string/;
+  assert.throws(() => parseReleaseDeployment({ repository: 'acme/app', file: 'deploy/app.yml', pin_pattern: '' }, deploymentCtx, isRepositoryKey), pinError);
+  assert.throws(() => parseReleaseDeployment({ repository: 'acme/app', file: 'deploy/app.yml', pin_pattern: '   ' }, deploymentCtx, isRepositoryKey), pinError);
+  assert.throws(() => parseReleaseDeployment({ repository: 'acme/app', file: 'deploy/app.yml' }, deploymentCtx, isRepositoryKey), pinError);
+});
+

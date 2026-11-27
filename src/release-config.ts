@@ -1,4 +1,4 @@
-import type { ReleaseArtifact, ReleaseFieldContext } from './types.ts';
+import type { ReleaseArtifact, ReleaseDeployment, ReleaseFieldContext } from './types.ts';
 
 function fail(ctx: ReleaseFieldContext, text: string): never {
   throw new Error(ctx.source + '[' + ctx.repository + '].' + ctx.field + ': ' + text);
@@ -63,3 +63,27 @@ export function parseReleaseArtifact(value: unknown, ctx: ReleaseFieldContext): 
 
   fail({ ...ctx, field: ctx.field + '.kind' }, 'must be "container" or "npm"');
 }
+
+export function parseReleaseDeployment(
+  value: unknown,
+  ctx: ReleaseFieldContext,
+  isRepositoryKey: (key: string) => boolean,
+): ReleaseDeployment | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) fail(ctx, 'must be an object');
+  // Only a plain object carries configuration; a class instance can hide behaviour behind its prototype.
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) fail(ctx, 'must be an object');
+  const input = value as Record<string, unknown>;
+  const repository = input.repository;
+  if (typeof repository !== 'string' || !isRepositoryKey(repository)) {
+    fail({ ...ctx, field: ctx.field + '.repository' }, 'must be a repository key such as owner/name');
+  }
+  const file = parseReleaseFile(input.file, { ...ctx, field: ctx.field + '.file' });
+  const pinPattern = input.pin_pattern;
+  if (typeof pinPattern !== 'string' || pinPattern.trim() === '') {
+    fail({ ...ctx, field: ctx.field + '.pin_pattern' }, 'must be a non-empty string');
+  }
+  return { repository, file, pinPattern };
+}
+
