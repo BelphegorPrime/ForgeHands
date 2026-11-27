@@ -125,6 +125,7 @@ export class RunWatcher {
     // An error ends a run for reasons that often pass (a failing model call, a restart of OpenHands): start it once more, after a pause.
     if (state === 'error' && (job.error_retry || 0) < this.host.config.errorRetries) {
       this.countTokens(job, usage);
+      if (await this.host.deliveryCheck.cloneHandback(job)) return true;
       this.host.logger.error(job.key + ' ended with an error, running it once more');
       metrics.inc('forgehands_error_retries_total');
       Object.assign(job, { status: 'queued', started: undefined, conversation_id: undefined, finished: undefined, result: undefined,

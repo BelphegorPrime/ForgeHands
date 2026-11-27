@@ -81,6 +81,18 @@ test('the same text by another author keeps the ordinary delivery flow', async (
   assert.equal(t.job.status, 'done');
 });
 
+test('delivery and clone classification share issue, pull and comment reads', async () => {
+  const t = await buildTickets({ blocks: { 26: [{ number: 4 }] }, comments: { 4: [] } });
+  const job = t.jobs.list()[0];
+  Object.assign(job, { status: 'done', finished: ctx.clock });
+  t.forgejo.calls.length = 0;
+  await t.dispatcher.deliveryCheck.checkDelivery(job);
+  for (const path of ['/issues/26', '/pulls', '/issues/26/comments', '/issues/26/blocks', '/issues/4/comments']) {
+    assert.equal(t.forgejo.calls.filter((call) => call.method === 'GET' && call.path === API + path).length, 1, path);
+  }
+  assert.equal(job.delivery_retry, 1);
+});
+
 test('with no known agent login nothing is reported', async () => {
   const comments = [];
   const t = await buildDelivery({ comments, routes: { 'GET /api/v1/user': { login: '' } } });
@@ -160,18 +172,21 @@ test('a replay of the same conversation counts once and retries again', async ()
 
 test('past CLONE_RETRY_LIMIT the ordinary delivery flow runs', async () => {
   const comments = [];
-  const t = await buildDelivery({ comments });
+  const logs = [];
+  const t = await buildDelivery({ comments, logger: { error: (...parts) => logs.push(parts.join(' ')) } });
   t.job.clone_retries = CLONE_RETRY_LIMIT;
   comments.push(comment(CLONE, 'openhands', ctx.clock));
   await t.end();
   assert.equal(failures(t.jobs).length, 1);
   assert.equal(t.job.clone_retries, CLONE_RETRY_LIMIT);
   assert.equal(t.job.status, 'done');
+  assert.equal(logs.some((line) => line.includes('the job is queued again')), false);
 });
 
-test('a failed run that reported a clone failure is queued instead of reported', async () => {
+test('a confirmed clone handback takes precedence over the default error retry', async () => {
   const comments = [];
-  const t = await buildDelivery({ comments });
+  const t = await buildDelivery({ comments, extra: { ERROR_RETRIES: undefined } });
+  assert.equal(t.dispatcher.config.errorRetries, 1);
   const started = ctx.clock;
   comments.push(comment(CLONE, 'openhands', started));
   ctx.clock += 5 * 60000;
@@ -180,6 +195,7 @@ test('a failed run that reported a clone failure is queued instead of reported',
   assert.equal(failures(t.jobs).length, 1);
   assert.equal(t.job.status, 'queued');
   assert.equal(t.job.clone_retries, 1);
+  assert.equal(t.job.error_retry ?? 0, 0);
   assert.equal(t.job.result, undefined);
   assert.equal(t.comments().some((body) => body.includes('ended with')), false);
 });

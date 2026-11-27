@@ -5,10 +5,17 @@ import { CLONE_RETRY_DELAY_MS, CLONE_RETRY_LIMIT, classifyCloneHandback } from '
 import { classifyHandback, handbackOf } from './handback.ts';
 import { metrics } from '../metrics.ts';
 import type { ForgeEvent, Job, Json } from '../types.ts';
+import type { Comment, Issue, PullRequest } from '../types/forge.ts';
 import type { Dispatcher } from './dispatch.ts';
 
 // What DeliveryCheck reaches on the dispatcher. Read through the host on every call, so that a test that swaps the config or a fake keeps working.
 export type DeliveryCheckHost = Pick<Dispatcher, 'config' | 'forge' | 'handback' | 'jobs' | 'logger' | 'markForHuman' | 'merger' | 'now' | 'operatorDependencies' | 'reportCloneFailure' | 'reportFailure' | 'tierRunEnded' | 'waitForOperator'>;
+
+type CommentReads = {
+  login: () => Promise<string | null>;
+  parents: () => Promise<Issue[]>;
+  comments: (number: number) => Promise<Comment[]>;
+};
 
 export class DeliveryCheck {
   host: DeliveryCheckHost;
@@ -36,11 +43,12 @@ export class DeliveryCheck {
       if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
       // A confirmed clone failure is no delivery to judge: the job waits for a later attempt instead of being run once more or escalated (clone-handback.ts).
       if (this.superseded(job)) return;
-      if (await this.cloneHandback(job)) return;
+      const reads = this.commentReads(event);
+      if (await this.cloneHandback(job, { pulls, reads })) return;
       // A need only the operator can meet, with an operator ticket this ticket depends on: the ticket waits, and that is no failed delivery.
       const prerequisites = await this.host.operatorDependencies(repository, event.issue.number);
       if (prerequisites.length) { await this.host.waitForOperator(job, prerequisites); return; }
-      const comments = await this.host.forge.listComments(repository, event.issue.number, 50);
+      const comments = await reads.comments(event.issue.number);
       // A comment since the run began is a delivery, unless it hands the ticket back: "done, but nothing pushed" or a blocker (see handback.ts).
       const written = comments.filter((comment) => Date.parse(comment.created_at) >= since);
       const handback = written.length ? handbackOf(written) : null;
@@ -52,7 +60,7 @@ export class DeliveryCheck {
       }
       // A comment on the parent (the issue this one blocks) is no delivery while this ticket is open: the ticket has no pull request and is not
       // closed. It is a hand-back like a comment on the ticket itself: a blocker is escalated, anything else is asked for the push first.
-      const parent = await this.parentComment(event, since);
+      const parent = await this.parentComment(event, since, reads);
       if (this.superseded(job)) return;
       if (parent) {
         this.host.logger.error(repository + '#' + event.issue.number + ': the run commented on #' + parent.number + ' and left the ticket open, a hand-back');
@@ -73,9 +81,27 @@ export class DeliveryCheck {
     }
   }
 
+  // Keep these reads local to one completion, including failures, so both checks judge the same comments.
+  private commentReads(event: ForgeEvent): CommentReads {
+    const { forge } = this.host;
+    const repository = event.repository.full_name;
+    const comments = new Map<number, Promise<Comment[]>>();
+    let login: Promise<string | null> | undefined;
+    let parents: Promise<Issue[]> | undefined;
+    return {
+      login: () => login ??= forge.agentLogin?.() ?? Promise.resolve(null),
+      parents: () => parents ??= forge.blocks(repository, event.issue.number),
+      comments: (number) => {
+        const read = comments.get(number) ?? forge.listComments(repository, number, 50);
+        comments.set(number, read);
+        return read;
+      }
+    };
+  }
+
   // A clone failure is reported back in a comment (clone-handback.ts). A fresh, attributable report counts toward the breaker once and sends the job
   // back to the queue for a later attempt, without touching its attempts, escalation or labels; when nothing confirms, the ordinary flow runs.
-  async cloneHandback(job: Job): Promise<boolean> {
+  async cloneHandback(job: Job, delivery?: { pulls: PullRequest[]; reads: CommentReads }): Promise<boolean> {
     const event = job.event;
     if (!this.host.config.forgejo || !event || !job.started) return false;
     const now = this.host.now();
@@ -83,11 +109,19 @@ export class DeliveryCheck {
     const repository = event.repository.full_name;
     const issue = event.issue.number;
     const conversation = String(job.conversation_id ?? '');
+    const reads = delivery?.reads ?? this.commentReads(event);
+    let pulls = delivery?.pulls;
     let agentLogin: string | null;
     try {
-      agentLogin = (await this.host.forge.agentLogin?.()) ?? null;
+      // A PR run already knows which request to inspect; don't look up its identity or comment history when the request cannot be read.
+      if (event.pull_request && !delivery) {
+        const pull = await this.host.forge.getPull(repository, event.pull_request.number);
+        if (pull?.number !== event.pull_request.number) return false;
+        pulls = [pull];
+      }
+      agentLogin = await reads.login();
       if (!agentLogin) return false;
-      if (!(await this.host.forge.getIssue(repository, issue))) return false;
+      if (!delivery && !(await this.host.forge.getIssue(repository, issue))) return false;
     } catch (error) {
       this.host.logger.error('could not read the identity of ' + job.key + ', no clone handback:', error.message);
       return false;
@@ -95,29 +129,29 @@ export class DeliveryCheck {
     // A comment on the parent is visible to every ticket under it: only the runs that shared the window can make an unattributed one unambiguous.
     const concurrentRuns = this.host.jobs.list(true).filter((other) => other !== job && other.started !== undefined
       && other.started <= now && (other.finished ?? Infinity) >= runStarted).length;
-    const candidates: { scope: 'ticket' | 'pull_request' | 'parent'; issue: number; concurrentRuns?: number; comments: Json[] }[] = [];
+    const candidates: { scope: 'ticket' | 'pull_request' | 'parent'; issue: number; concurrentRuns?: number; comments: Comment[] }[] = [];
     try {
-      const comments = await this.host.forge.listComments(repository, issue, 50);
+      const comments = await reads.comments(issue);
       candidates.push({ scope: 'ticket', issue, comments });
     } catch (error) {
       this.host.logger.error('could not read the comments of #' + issue + ':', error.message);
     }
     try {
       const branch = 'ai/issue-' + issue;
-      const pulls = await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
+      pulls ??= await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
       const pull = (Array.isArray(pulls) ? pulls : []).find((pr) => pullBranch(pr) === branch);
       if (pull) {
-        const comments = await this.host.forge.listComments(repository, pull.number, 50);
+        const comments = await reads.comments(pull.number);
         candidates.push({ scope: 'pull_request', issue, comments });
       }
     } catch (error) {
       this.host.logger.error('could not read the pull request of #' + issue + ':', error.message);
     }
     try {
-      const parents = await this.host.forge.blocks(repository, issue);
+      const parents = await reads.parents();
       for (const parent of Array.isArray(parents) ? parents : []) {
         try {
-          const comments = await this.host.forge.listComments(repository, parent.number, 50);
+          const comments = await reads.comments(parent.number);
           candidates.push({ scope: 'parent', issue, concurrentRuns, comments });
         } catch (error) {
           this.host.logger.error('could not read the comments of #' + parent.number + ':', error.message);
@@ -131,7 +165,6 @@ export class DeliveryCheck {
         const report = classifyCloneHandback({ comment: { login: comment.user?.login, created_at: comment.created_at, body: comment.body },
           agentLogin, runStarted, now, repository, issue, conversation, scope: candidate.scope, concurrentRuns: candidate.concurrentRuns });
         if (!report) continue;
-        this.host.logger.error(repository + '#' + issue + ': a confirmed clone failure (' + report.class + '), the job is queued again');
         try {
           await this.host.reportCloneFailure(report, repository);
         } catch (error) {
@@ -140,6 +173,7 @@ export class DeliveryCheck {
         if ((job.clone_retries ?? 0) >= CLONE_RETRY_LIMIT) return false;
         Object.assign(job, { status: 'queued', next_try: now + CLONE_RETRY_DELAY_MS, started: undefined, conversation_id: undefined,
           finished: undefined, result: undefined, clone_retries: (job.clone_retries ?? 0) + 1 });
+        this.host.logger.error(repository + '#' + issue + ': a confirmed clone failure (' + report.class + '), the job is queued again');
         return true;
       }
     }
@@ -170,20 +204,20 @@ export class DeliveryCheck {
 
   // The newest comment of the agent since the run began on a parent (an issue this one blocks), with the parent's number, or null. A read that fails
   // counts as no comment: an unknown answer never reads as delivered.
-  async parentComment(event: ForgeEvent, since: number): Promise<{ number: number; text: string } | null> {
+  async parentComment(event: ForgeEvent, since: number, reads: CommentReads): Promise<{ number: number; text: string } | null> {
     let login: string | null;
-    let parents: Json;
+    let parents: Issue[];
     try {
-      login = (await this.host.forge.agentLogin?.()) ?? null;
+      login = await reads.login();
       if (!login) return null;
-      parents = await this.host.forge.blocks(event.repository.full_name, event.issue.number);
+      parents = await reads.parents();
     } catch (error) {
       this.host.logger.error('could not read what #' + event.issue.number + ' blocks:', error.message);
       return null;
     }
     for (const parent of Array.isArray(parents) ? parents : []) {
       try {
-        const comments = await this.host.forge.listComments(event.repository.full_name, parent.number, 50);
+        const comments = await reads.comments(parent.number);
         const own = comments.filter((comment) => String(comment.user?.login || '').toLowerCase() === login && Date.parse(comment.created_at) >= since);
         if (own.length) return { number: parent.number, text: String(own.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0].body ?? '') };
       } catch (error) {
