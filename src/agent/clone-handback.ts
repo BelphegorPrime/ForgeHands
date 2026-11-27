@@ -48,6 +48,11 @@ const DOUBLED_HOST = /[^\s/:]+\/https?:\/\//;
 
 const nonEmpty = (value: unknown): value is string => typeof value === 'string' && value.trim() !== '';
 
+const REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+// A reference attributes a comment only as a complete token: a comment naming #261 must not count for ticket 26.
+const mentions = (body: string, reference: string): boolean =>
+  reference !== '' && new RegExp('(?<![0-9a-z_-])' + reference.replace(REGEX_SPECIAL, '\\$&') + '(?![0-9a-z_-])').test(body);
+
 // A comment counts only when the agent itself wrote it, it arrived inside the run's window, and its text shows a real failed clone.
 // The class is normalized here so the caller never has to parse clone output again; an unattributed comment on a parent is refused.
 export function classifyCloneHandback(input: CloneHandbackInput): CloneFailureReport | null {
@@ -72,7 +77,7 @@ export function classifyCloneHandback(input: CloneHandbackInput): CloneFailureRe
   if (input.scope === 'parent') {
     const ticket = (input.repository + '#' + input.issue).toLowerCase();
     const conversation = input.conversation.toLowerCase();
-    const attributed = body.includes(ticket) || (conversation !== '' && body.includes(conversation));
+    const attributed = mentions(body, ticket) || mentions(body, conversation);
     if (!attributed) return null;
   }
 

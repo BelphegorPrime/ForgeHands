@@ -107,6 +107,14 @@ test('accepts a parent comment attributed by repository and issue', () => {
   assert.notEqual(classifyCloneHandback(input('git clone failed: fatal: x ' + REPO + '#' + ISSUE, { scope: 'parent' })), null);
 });
 
+test('rejects a parent comment that names only a longer ticket number', () => {
+  assert.equal(classifyCloneHandback(input('git clone failed: fatal: x ' + REPO + '#' + ISSUE + '0', { scope: 'parent' })), null);
+});
+
+test('rejects a parent comment that names only a longer conversation id', () => {
+  assert.equal(classifyCloneHandback(input('git clone failed: fatal: ' + CONVERSATION + '9', { scope: 'parent' })), null);
+});
+
 test('accepts a parent comment attributed by conversation id, case-insensitively', () => {
   assert.notEqual(classifyCloneHandback(input('git clone failed: fatal: x ' + CONVERSATION.toUpperCase(), { scope: 'parent' })), null);
 });
