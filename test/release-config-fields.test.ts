@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseReleaseFile } from '../src/release-config.ts';
+import { parseReleaseArtifact, parseReleaseFile } from '../src/release-config.ts';
 
 const ctx = { source: 'RELEASE_REPOS', repository: 'acme/app', field: 'deployment.file' } as const;
 const unsafe = /must be a safe relative file path/;
@@ -64,4 +64,96 @@ test('parseReleaseFile error names the field and not the rejected input', () => 
   }
   assert.match(message, /RELEASE_REPOS\[acme\/app\]\.deployment\.file: /);
   assert.ok(!message.includes('../secret-token-123'));
+});
+
+const artifactCtx = { source: 'RELEASE_REPOS', repository: 'acme/app', field: 'deployment.artifact' } as const;
+
+test('parseReleaseArtifact accepts a container without tag_forms and omits the key', () => {
+  const result = parseReleaseArtifact({ kind: 'container', image: 'ghcr.io/acme/app:1.2.3' }, artifactCtx);
+  assert.deepEqual(result, { kind: 'container', image: 'ghcr.io/acme/app:1.2.3' });
+  assert.equal('tagForms' in (result as object), false);
+});
+
+test('parseReleaseArtifact accepts a container with tag_forms', () => {
+  assert.deepEqual(
+    parseReleaseArtifact({ kind: 'container', image: 'ghcr.io/acme/app', tag_forms: ['v1.2.3', 'sha-abc'] }, artifactCtx),
+    { kind: 'container', image: 'ghcr.io/acme/app', tagForms: ['v1.2.3', 'sha-abc'] },
+  );
+});
+
+test('parseReleaseArtifact accepts an npm package over http and https', () => {
+  assert.deepEqual(
+    parseReleaseArtifact({ kind: 'npm', package: '@acme/app', registry: 'https://registry.example' }, artifactCtx),
+    { kind: 'npm', package: '@acme/app', registry: 'https://registry.example' },
+  );
+  assert.deepEqual(
+    parseReleaseArtifact({ kind: 'npm', package: '@acme/app', registry: 'http://registry.example/' }, artifactCtx),
+    { kind: 'npm', package: '@acme/app', registry: 'http://registry.example/' },
+  );
+});
+
+test('parseReleaseArtifact preserves an absent artifact', () => {
+  assert.equal(parseReleaseArtifact(undefined, artifactCtx), undefined);
+});
+
+test('parseReleaseArtifact rejects a non-object', () => {
+  const objectError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact: must be an object/;
+  assert.throws(() => parseReleaseArtifact(null, artifactCtx), objectError);
+  assert.throws(() => parseReleaseArtifact([], artifactCtx), objectError);
+  assert.throws(() => parseReleaseArtifact('x', artifactCtx), objectError);
+  assert.throws(() => parseReleaseArtifact(42, artifactCtx), objectError);
+});
+
+test('parseReleaseArtifact rejects an unknown or missing kind without printing it', () => {
+  const kindError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.kind: must be "container" or "npm"/;
+  assert.throws(() => parseReleaseArtifact({ kind: 'deb' }, artifactCtx), kindError);
+  assert.throws(() => parseReleaseArtifact({ kind: 42 }, artifactCtx), kindError);
+  assert.throws(() => parseReleaseArtifact({}, artifactCtx), kindError);
+  let message = '';
+  try {
+    parseReleaseArtifact({ kind: 'secret-kind-123' }, artifactCtx);
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  assert.ok(!message.includes('secret-kind-123'));
+});
+
+test('parseReleaseArtifact rejects a blank or non-string container image', () => {
+  const imageError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.image: must be a non-empty string/;
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: '' }, artifactCtx), imageError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: '   ' }, artifactCtx), imageError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: 42 }, artifactCtx), imageError);
+});
+
+test('parseReleaseArtifact rejects tag_forms that are not an array of non-blank strings', () => {
+  const tagError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.tag_forms: must be an array of non-empty strings/;
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: 'img', tag_forms: 'v1' }, artifactCtx), tagError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: 'img', tag_forms: ['a', ''] }, artifactCtx), tagError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'container', image: 'img', tag_forms: ['a', 1] }, artifactCtx), tagError);
+});
+
+test('parseReleaseArtifact rejects a blank or non-string npm package', () => {
+  const packageError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.package: must be a non-empty string/;
+  const registry = 'https://registry.example';
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: '', registry }, artifactCtx), packageError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: '  ', registry }, artifactCtx), packageError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: 42, registry }, artifactCtx), packageError);
+});
+
+test('parseReleaseArtifact rejects a registry that is not an http(s) URL', () => {
+  const registryError = /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.registry: must be an http\(s\) URL without credentials/;
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: 'pkg', registry: 'ftp://r.example' }, artifactCtx), registryError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: 'pkg', registry: 'not a url' }, artifactCtx), registryError);
+  assert.throws(() => parseReleaseArtifact({ kind: 'npm', package: 'pkg', registry: 42 }, artifactCtx), registryError);
+});
+
+test('parseReleaseArtifact rejects registry credentials without echoing them', () => {
+  let message = '';
+  try {
+    parseReleaseArtifact({ kind: 'npm', package: 'pkg', registry: 'https://user:pass@r.example' }, artifactCtx);
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  assert.match(message, /RELEASE_REPOS\[acme\/app\]\.deployment\.artifact\.registry: must be an http\(s\) URL without credentials/);
+  assert.ok(!message.includes('pass'));
 });
