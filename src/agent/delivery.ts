@@ -1,13 +1,14 @@
 // What a run that ended left behind: a worker run must leave a pull request, a comment or a closed issue (else it runs once more, escalates or
 // goes to the human), and a review run must leave a verdict.
 import { pullBranch } from './bot.ts';
+import { CLONE_RETRY_DELAY_MS, CLONE_RETRY_LIMIT, classifyCloneHandback } from './clone-handback.ts';
 import { classifyHandback, handbackOf } from './handback.ts';
 import { metrics } from '../metrics.ts';
 import type { ForgeEvent, Job, Json } from '../types.ts';
 import type { Dispatcher } from './dispatch.ts';
 
 // What DeliveryCheck reaches on the dispatcher. Read through the host on every call, so that a test that swaps the config or a fake keeps working.
-export type DeliveryCheckHost = Pick<Dispatcher, 'config' | 'forge' | 'handback' | 'jobs' | 'logger' | 'markForHuman' | 'merger' | 'operatorDependencies' | 'reportFailure' | 'tierRunEnded' | 'waitForOperator'>;
+export type DeliveryCheckHost = Pick<Dispatcher, 'config' | 'forge' | 'handback' | 'jobs' | 'logger' | 'markForHuman' | 'merger' | 'now' | 'operatorDependencies' | 'reportCloneFailure' | 'reportFailure' | 'tierRunEnded' | 'waitForOperator'>;
 
 export class DeliveryCheck {
   host: DeliveryCheckHost;
@@ -33,6 +34,9 @@ export class DeliveryCheck {
       const branch = 'ai/issue-' + event.issue.number;
       const pulls = await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
       if (pulls.some((pr) => pullBranch(pr) === branch && Date.parse(pr.updated_at) >= since)) return;
+      // A confirmed clone failure is no delivery to judge: the job waits for a later attempt instead of being run once more or escalated (clone-handback.ts).
+      if (this.superseded(job)) return;
+      if (await this.cloneHandback(job)) return;
       // A need only the operator can meet, with an operator ticket this ticket depends on: the ticket waits, and that is no failed delivery.
       const prerequisites = await this.host.operatorDependencies(repository, event.issue.number);
       if (prerequisites.length) { await this.host.waitForOperator(job, prerequisites); return; }
@@ -67,6 +71,79 @@ export class DeliveryCheck {
     } catch (error) {
       this.host.logger.error('could not check what ' + job.key + ' delivered:', error.message);
     }
+  }
+
+  // A clone failure is reported back in a comment (clone-handback.ts). A fresh, attributable report counts toward the breaker once and sends the job
+  // back to the queue for a later attempt, without touching its attempts, escalation or labels; when nothing confirms, the ordinary flow runs.
+  async cloneHandback(job: Job): Promise<boolean> {
+    const event = job.event;
+    if (!this.host.config.forgejo || !event || !job.started) return false;
+    const now = this.host.now();
+    const runStarted = job.started;
+    const repository = event.repository.full_name;
+    const issue = event.issue.number;
+    const conversation = String(job.conversation_id ?? '');
+    let agentLogin: string | null;
+    try {
+      agentLogin = (await this.host.forge.agentLogin?.()) ?? null;
+      if (!agentLogin) return false;
+      if (!(await this.host.forge.getIssue(repository, issue))) return false;
+    } catch (error) {
+      this.host.logger.error('could not read the identity of ' + job.key + ', no clone handback:', error.message);
+      return false;
+    }
+    // A comment on the parent is visible to every ticket under it: only the runs that shared the window can make an unattributed one unambiguous.
+    const concurrentRuns = this.host.jobs.list(true).filter((other) => other !== job && other.started !== undefined
+      && other.started <= now && (other.finished ?? Infinity) >= runStarted).length;
+    const candidates: { scope: 'ticket' | 'pull_request' | 'parent'; issue: number; concurrentRuns?: number; comments: Json[] }[] = [];
+    try {
+      const comments = await this.host.forge.listComments(repository, issue, 50);
+      candidates.push({ scope: 'ticket', issue, comments });
+    } catch (error) {
+      this.host.logger.error('could not read the comments of #' + issue + ':', error.message);
+    }
+    try {
+      const branch = 'ai/issue-' + issue;
+      const pulls = await this.host.forge.listPulls(repository, { state: 'all', limit: 50, sort: 'recentupdate' });
+      const pull = (Array.isArray(pulls) ? pulls : []).find((pr) => pullBranch(pr) === branch);
+      if (pull) {
+        const comments = await this.host.forge.listComments(repository, pull.number, 50);
+        candidates.push({ scope: 'pull_request', issue, comments });
+      }
+    } catch (error) {
+      this.host.logger.error('could not read the pull request of #' + issue + ':', error.message);
+    }
+    try {
+      const parents = await this.host.forge.blocks(repository, issue);
+      for (const parent of Array.isArray(parents) ? parents : []) {
+        try {
+          const comments = await this.host.forge.listComments(repository, parent.number, 50);
+          candidates.push({ scope: 'parent', issue, concurrentRuns, comments });
+        } catch (error) {
+          this.host.logger.error('could not read the comments of #' + parent.number + ':', error.message);
+        }
+      }
+    } catch (error) {
+      this.host.logger.error('could not read what #' + issue + ' blocks:', error.message);
+    }
+    for (const candidate of candidates) {
+      for (const comment of Array.isArray(candidate.comments) ? candidate.comments : []) {
+        const report = classifyCloneHandback({ comment: { login: comment.user?.login, created_at: comment.created_at, body: comment.body },
+          agentLogin, runStarted, now, repository, issue, conversation, scope: candidate.scope, concurrentRuns: candidate.concurrentRuns });
+        if (!report) continue;
+        this.host.logger.error(repository + '#' + issue + ': a confirmed clone failure (' + report.class + '), the job is queued again');
+        try {
+          await this.host.reportCloneFailure(report, repository);
+        } catch (error) {
+          this.host.logger.error('could not report the clone failure of ' + job.key + ':', error.message);
+        }
+        if ((job.clone_retries ?? 0) >= CLONE_RETRY_LIMIT) return false;
+        Object.assign(job, { status: 'queued', next_try: now + CLONE_RETRY_DELAY_MS, started: undefined, conversation_id: undefined,
+          finished: undefined, result: undefined, clone_retries: (job.clone_retries ?? 0) + 1 });
+        return true;
+      }
+    }
+    return false;
   }
 
   // A label set while the ended run was being looked at (the forge reads above take a while) has queued a fresh run of the same ticket. That run

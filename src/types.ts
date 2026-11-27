@@ -575,6 +575,8 @@ export interface Job {
   synced_at?: number;
   error_retry?: number;
   delivery_retry?: number;
+  /** CLONE_RETRY_LIMIT: how many confirmed clone handbacks already sent this job back to the queue (see DeliveryCheck.cloneHandback). */
+  clone_retries?: number;
   /** A hand-back: the run was made once more because it handed the ticket back with "done, but nothing pushed" (once per job); the next run is told to push. */
   handback_retry?: boolean;
   handback_push?: boolean;

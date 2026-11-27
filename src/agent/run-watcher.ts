@@ -155,6 +155,9 @@ export class RunWatcher {
       await this.host.branchRefresher.checkBranchAfterRun(job);
       await this.host.waitKeeper.releaseFileWaits();
       const done = this.host.config.routes.get(job.label)?.kind;
+      // A run that ended because the checkout could not be cloned reports it in a comment: the job waits for a later attempt instead of being
+      // escalated or reported (see clone-handback.ts). A confirmed report beats both the escalation and the failure notice.
+      if ((done === 'pull_request' || state !== 'finished') && await this.host.deliveryCheck.cloneHandback(job)) return true;
       if (done === 'ci_success') await this.host.deliveryCheck.checkVerdict(job);
       else if (done === 'sensitive_review') { if (state === 'finished') await this.host.securityReview.checkSecurityReview(job); else await this.host.securityReview.handOverAfterSecurity(job); }
       else if (state !== 'finished') { if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state); }
@@ -303,6 +306,8 @@ export class RunWatcher {
   async failed(job: Job, state: string, now: number): Promise<boolean> {
     Object.assign(job, { status: 'failed', result: state, finished: now });
     this.runEnded(job, state, now);
+    // A failed run that was actually a clone failure is queued again instead of escalated or reported (see clone-handback.ts).
+    if (await this.host.deliveryCheck.cloneHandback(job)) return true;
     if (!(await this.escalateFailure(job, state))) await this.reportFailure(job, state);
     return true;
   }
