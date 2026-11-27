@@ -84,6 +84,8 @@ interface BaseConfig {
   /** DRY_RUN: receive and judge as usual, change nothing. With `dryRunRepos` only those repositories are dry. */
   dryRun: boolean;
   dryRunRepos: Set<string>;
+  /** RELEASE_REPOS: opt-in release settings per repository. Empty when unset; release routes stay disabled. */
+  releaseRepos: Map<string, ReleaseRepoSettings>;
 }
 
 export interface WebhookConfig extends BaseConfig {
@@ -625,3 +627,13 @@ export type ReleaseArtifact =
   | { kind: 'container'; image: string; tagForms?: string[] }
   | { kind: 'npm'; package: string; registry: string };
 export interface ReleaseDeployment { repository: string; file: string; pinPattern: string }
+/** One RELEASE_REPOS entry: the defaults are applied unless the JSON sets the field; the optional nested settings stay absent. */
+export interface ReleaseRepoSettings {
+  tagPattern: string;
+  versionFiles: string[];
+  changelogPath: string;
+  prereleaseIdentifier: string;
+  upgradeNotesPath?: string;
+  artifact?: ReleaseArtifact;
+  deployment?: ReleaseDeployment;
+}
