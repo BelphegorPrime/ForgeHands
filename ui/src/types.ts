@@ -125,6 +125,14 @@ export interface E2eStatus {
   } | null;
 }
 
+/** The global clone breaker: open holds every new start, half_open admits one trial (see src/agent/clone-breaker.ts). Timing only, no evidence. */
+export interface CloneBreakerStatus {
+  state: "closed" | "open" | "half_open";
+  since: string | null;
+  retry_at: string | null;
+  trial_until: string | null;
+}
+
 export interface DashboardStatus {
   generated: string;
   limits: {
@@ -133,6 +141,7 @@ export interface DashboardStatus {
     max_rounds: number;
     max_runs_per_hour: number;
   };
+  clone_breaker: CloneBreakerStatus;
   notify: { channels: string[]; immediate: string[]; digest: string | null };
   dry_run: { repositories: string[] | "all"; would_write: unknown[] } | null;
   summary: Record<

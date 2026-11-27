@@ -2,9 +2,10 @@
 // process (Prometheus copes with that); the gauges are read from the ledger when /metrics is asked for (see gaugeSamples).
 // Callers use one-liners: metrics.inc('forgehands_merges_total', { repository }). Label values are limited to known sets (a repository of
 // ALLOWED_REPOS, a route kind, a tier, a fixed reason) and never carry issue or pull request numbers, so the number of series stays bounded.
-import type { DirectConfig, IdleState } from './types.ts';
+import type { CloneBreakerState, DirectConfig, IdleState } from './types.ts';
 import type { JobStore } from './store/jobs.ts';
 import { revertRate } from './agent/revert-rate.ts';
+import { CloneBreaker } from './agent/clone-breaker.ts';
 
 type Labels = Record<string, string>;
 interface Sample { name: string; labels: Labels; value: number }
@@ -62,10 +63,12 @@ const GAUGES: Record<string, string> = {
   forgehands_e2e_scenario_ok: '1 when the steps of the scenario held in the last end-to-end run (E2E_REPO), 0 when a step failed; absent until a run.',
   forgehands_e2e_cleanup_ok: '1 when the cleanup of the scenario held in the last end-to-end run (E2E_REPO), 0 when it did not; absent until a run.',
   forgehands_stalled_tickets: 'Open tickets the ticket watchdog called a human for (BLOCKED_LABEL, reason stalled_ticket) that tickets may wait behind, from the ledger at the scrape.',
+  forgehands_clone_breaker_state: 'The global clone breaker at the scrape: 0 closed, 1 half open (one trial may start), 2 open (new starts are held).',
   forgehands_merges_reverted_ratio: 'Share (0 to 1) of the merges ForgeHands made in the last 30 days whose revert was merged, by repository; absent without merges in the window.'
 };
 // The reasons of forgehands_idle_jobs (`could_start` is not one: it is a job that should have started).
 const IDLE_REASONS = ['dependencies', 'files', 'quota', 'disk', 'hourly', 'concurrency', 'cycle', 'stuck'] as const;
+const CLONE_BREAKER_VALUES: Record<CloneBreakerState, number> = { closed: 0, half_open: 1, open: 2 };
 const HISTOGRAM = { name: 'forgehands_run_duration_seconds', help: 'Time from the start to the end of an agent run, by route kind.', buckets: [30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400] };
 
 export const WEBHOOK_EVENTS = ['issues', 'issue_label', 'issue_comment', 'pull_request', 'push', 'action_run_failure', 'action_run_success', 'workflow_run',
@@ -179,6 +182,7 @@ export function gaugeSamples(config: DirectConfig, jobs: JobStore, cooldowns: Ma
   for (const reason of IDLE_REASONS) samples.push({ name: 'forgehands_idle_jobs', labels: { reason }, value: idle?.reasons[reason] ?? 0 });
   samples.push({ name: 'forgehands_stuck_pull_requests', labels: {}, value: [...jobs.stuck.values()].filter((record) => record.blocked).length });
   samples.push({ name: 'forgehands_stalled_tickets', labels: {}, value: [...jobs.stalled.values()].filter((record) => record.human).length });
+  samples.push({ name: 'forgehands_clone_breaker_state', labels: {}, value: CLONE_BREAKER_VALUES[new CloneBreaker(jobs, () => now).snapshot().state] ?? 0 });
   for (const repo of [...config.allowedRepos].sort()) {
     const rate = revertRate(jobs.merges, repo, now).ratio;
     if (rate !== null) samples.push({ name: 'forgehands_merges_reverted_ratio', labels: { repository: repo }, value: rate });

@@ -189,7 +189,7 @@ export function createApp(
               config as DirectConfig,
               dispatcher.jobs,
               dispatcher.cooldowns,
-              Date.now(),
+              dispatcher.now(),
               dispatcher.workspace.enabled ? dispatcher.workspace : null,
               dispatcher.idleState(),
             ),
